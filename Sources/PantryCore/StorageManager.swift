@@ -94,6 +94,7 @@ public actor StorageManager: Sendable {
         }
 
         try fileHandle?.write(contentsOf: dataToWrite)
+        try fileHandle?.synchronize()
 
         return DatabasePage(
             pageID: newPageID,

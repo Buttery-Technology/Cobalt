@@ -4,7 +4,7 @@ import Foundation
 public protocol IndexHook: Sendable {
     func lookupRecord(id: UInt64, tableName: String) async throws -> Int?
     func updateIndexes(record: Record, row: Row, tableName: String) async throws
-    func removeFromIndexes(id: UInt64, tableName: String) async throws
+    func removeFromIndexes(id: UInt64, row: Row, tableName: String) async throws
 }
 
 /// Main storage engine coordinating pages, buffer pool, WAL, transactions, and table registry
@@ -164,13 +164,23 @@ public actor StorageEngine: Sendable {
         let pageID = try await findPageContainingRecord(id: id, tableName: tableName)
         var page = try await getPage(pageID: pageID, transactionContext: transactionContext)
 
+        // Decode the row before deletion so indexes can be updated
+        let deletedRow: Row?
+        if let record = page.records.first(where: { $0.id == id }) {
+            deletedRow = try? JSONDecoder().decode(Row.self, from: record.data)
+        } else {
+            deletedRow = nil
+        }
+
         if !page.deleteRecord(id: id) {
             throw PantryError.recordNotFound(id: id)
         }
 
         try await savePage(page, transactionContext: transactionContext)
 
-        try await indexHook?.removeFromIndexes(id: id, tableName: tableName)
+        if let row = deletedRow {
+            try await indexHook?.removeFromIndexes(id: id, row: row, tableName: tableName)
+        }
 
         // Re-read tableInfo to avoid lost-update race with concurrent operations
         guard var freshInfo = await tableRegistry.getTableInfo(name: tableName) else {

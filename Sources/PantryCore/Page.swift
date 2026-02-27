@@ -69,8 +69,16 @@ public struct DatabasePage: Sendable {
         flags = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: position, as: UInt32.self) }
         position += 4
 
+        // Cap recordCount to prevent out-of-bounds reads on corrupted pages
+        let maxSlots = (PantryConstants.PAGE_SIZE - PantryConstants.PAGE_HEADER_SIZE) / PantryConstants.SLOT_SIZE
+        if recordCount < 0 || recordCount > maxSlots {
+            recordCount = 0
+        }
+
         recordSlots = []
         for _ in 0..<recordCount {
+            guard position + PantryConstants.SLOT_SIZE <= data.count else { break }
+
             let offset = data.withUnsafeBytes { Int($0.loadUnaligned(fromByteOffset: position, as: UInt16.self)) }
             position += 2
 
