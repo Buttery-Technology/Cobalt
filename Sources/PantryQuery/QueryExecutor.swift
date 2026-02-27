@@ -102,7 +102,8 @@ public actor QueryExecutor: Sendable {
         case let .equals(column, value):
             return row.values[column] == value
         case let .notEquals(column, value):
-            return row.values[column] != value
+            guard let rowValue = row.values[column] else { return false }
+            return rowValue != value
         case let .lessThan(column, value):
             guard let rowValue = row.values[column] else { return false }
             return rowValue < value

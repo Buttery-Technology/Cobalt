@@ -72,7 +72,7 @@ public actor WriteAheadLog: Sendable {
 
     // MARK: - Transaction Logging
 
-    public func logTransactionBegin(txID: UInt64, isolationLevel: IsolationLevel) {
+    public func logTransactionBegin(txID: UInt64, isolationLevel: IsolationLevel) throws {
         let lsn = nextLSN
         nextLSN += 1
 
@@ -87,11 +87,7 @@ public actor WriteAheadLog: Sendable {
 
         cacheLogRecord(lsn: lsn, type: .transactionBegin, txID: txID, timestamp: timestamp, content: .transaction(isolationLevel))
 
-        do {
-            try writeLogRecord(logData)
-        } catch {
-            // WAL write failure during begin is non-fatal
-        }
+        try writeLogRecord(logData)
     }
 
     public func logTransactionCommit(txID: UInt64) throws {
@@ -181,7 +177,9 @@ public actor WriteAheadLog: Sendable {
 
         if let latestImage = pageImages.first {
             if case let .pageImage(_, _, pageData) = latestImage.content {
-                return DatabasePage(pageID: pageID, data: pageData)
+                var page = DatabasePage(pageID: pageID, data: pageData)
+                page.loadRecords()
+                return page
             }
         }
 

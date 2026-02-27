@@ -97,7 +97,7 @@ public actor PantryDatabase: Sendable {
     // MARK: - Transactions
 
     public func transaction<T: Sendable>(isolationLevel: IsolationLevel? = nil, body: @Sendable (PantryDatabase) async throws -> T) async throws -> T {
-        let txContext = await storageEngine.beginTransaction(isolationLevel: isolationLevel)
+        let txContext = try await storageEngine.beginTransaction(isolationLevel: isolationLevel)
         do {
             let result = try await body(self)
             try await storageEngine.commitTransaction(txContext)

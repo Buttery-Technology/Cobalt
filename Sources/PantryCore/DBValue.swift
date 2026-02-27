@@ -1,7 +1,7 @@
 import Foundation
 
 /// Represents a value that can be stored in the database
-public enum DBValue: Codable, Equatable, Comparable, Hashable, Sendable {
+public enum DBValue: Codable, Comparable, Hashable, Sendable {
     case null
     case integer(Int64)
     case double(Double)
@@ -31,6 +31,20 @@ public enum DBValue: Codable, Equatable, Comparable, Hashable, Sendable {
             return !a && b
         default:
             return lhs.typeOrder < rhs.typeOrder
+        }
+    }
+
+    public static func == (lhs: DBValue, rhs: DBValue) -> Bool {
+        switch (lhs, rhs) {
+        case (.null, .null): return true
+        case let (.integer(a), .integer(b)): return a == b
+        case let (.double(a), .double(b)): return a == b
+        case let (.integer(a), .double(b)): return Double(a) == b
+        case let (.double(a), .integer(b)): return a == Double(b)
+        case let (.string(a), .string(b)): return a == b
+        case let (.boolean(a), .boolean(b)): return a == b
+        case let (.blob(a), .blob(b)): return a == b
+        default: return false
         }
     }
 

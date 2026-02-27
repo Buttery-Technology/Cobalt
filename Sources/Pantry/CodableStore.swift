@@ -19,6 +19,9 @@ extension PantryDatabase {
             throw PantryError.schemaSerializationError
         }
 
+        // Remove existing entry with same ID to prevent duplicates
+        _ = try await delete(from: collection, where: .equals(column: "_id", value: .string(actualID)))
+
         try await insert(into: collection, values: [
             "_id": .string(actualID),
             "_data": .string(jsonString),
@@ -70,12 +73,16 @@ extension PantryDatabase {
     /// Ensure a collection table exists with the standard schema
     private func ensureCollectionTable(_ name: String) async throws {
         if await tableExists(name) { return }
-        let schema = PantryTableSchema(name: name, columns: [
-            PantryColumn(name: "_id", type: .string, isPrimaryKey: true, isNullable: false),
-            PantryColumn(name: "_data", type: .string, isNullable: false),
-            PantryColumn(name: "_type", type: .string, isNullable: false),
-            PantryColumn(name: "_timestamp", type: .double, isNullable: false),
-        ])
-        try await createTable(schema)
+        do {
+            let schema = PantryTableSchema(name: name, columns: [
+                PantryColumn(name: "_id", type: .string, isPrimaryKey: true, isNullable: false),
+                PantryColumn(name: "_data", type: .string, isNullable: false),
+                PantryColumn(name: "_type", type: .string, isNullable: false),
+                PantryColumn(name: "_timestamp", type: .double, isNullable: false),
+            ])
+            try await createTable(schema)
+        } catch PantryError.tableAlreadyExists {
+            // Another concurrent call created the table between our check and create
+        }
     }
 }

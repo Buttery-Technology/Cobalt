@@ -17,6 +17,29 @@ public final class BTreeNode: Codable, @unchecked Sendable {
         self.isLeaf = isLeaf
     }
 
+    /// Create a deep copy of this node
+    public func copy() -> BTreeNode {
+        let node = BTreeNode(isLeaf: isLeaf)
+        node.keys = keys
+        node.values = values
+        node.children = children
+        return node
+    }
+
+    // Private init that preserves nodeId (for copy via Codable round-trip is expensive)
+    private init(nodeId: UUID, isLeaf: Bool, keys: [DBValue], values: [Row], children: [UUID]?) {
+        self.nodeId = nodeId
+        self.isLeaf = isLeaf
+        self.keys = keys
+        self.values = values
+        self.children = children
+    }
+
+    /// Create a deep copy preserving the node ID
+    public func deepCopy() -> BTreeNode {
+        BTreeNode(nodeId: nodeId, isLeaf: isLeaf, keys: keys, values: values, children: children)
+    }
+
     /// Serialize to binary data for page storage
     public func serialize() throws -> Data {
         try JSONEncoder().encode(self)
