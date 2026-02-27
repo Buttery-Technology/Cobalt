@@ -190,9 +190,8 @@ public struct DatabasePage: Sendable {
         }
         records.remove(at: index)
         recordCount -= 1
-        // Recompute freeSpaceOffset from remaining records to avoid
-        // corruption when the deleted record wasn't at the boundary
-        let totalRecordSize = records.reduce(0) { $0 + $1.serialize().count }
+        // Recompute freeSpaceOffset from remaining records (12 = 8-byte id + 4-byte length header)
+        let totalRecordSize = records.reduce(0) { $0 + 12 + $1.data.count }
         freeSpaceOffset = PantryConstants.PAGE_SIZE - totalRecordSize
         return true
     }

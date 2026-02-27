@@ -37,12 +37,21 @@ public actor StorageEngine: Sendable {
             }
         }
 
-        // Ensure at least page 0 exists (DB metadata)
+        // Ensure system pages exist (page 0 = DB metadata, page 1 = table registry)
         let totalPages = try await sm.totalPageCount()
         if totalPages == 0 {
             var metaPage = try await sm.createNewPage()
             metaPage.pageFlags = [.system]
             try await sm.writePage(&metaPage)
+            // Reserve page 1 for table registry so data pages start at page 2+
+            var registryPage = try await sm.createNewPage()
+            registryPage.pageFlags = [.system, .tableRegistry]
+            try await sm.writePage(&registryPage)
+        } else if totalPages == 1 {
+            // Database has only page 0; reserve page 1 for registry
+            var registryPage = try await sm.createNewPage()
+            registryPage.pageFlags = [.system, .tableRegistry]
+            try await sm.writePage(&registryPage)
         }
 
         // Load table registry
@@ -256,7 +265,7 @@ public actor StorageEngine: Sendable {
 
         while currentPageID != 0 {
             let page = try await getPage(pageID: currentPageID)
-            if page.getFreeSpace() >= recordSize + PantryConstants.SLOT_SIZE {
+            if page.getFreeSpace() > recordSize + PantryConstants.SLOT_SIZE {
                 return currentPageID
             }
             currentPageID = page.nextPageID

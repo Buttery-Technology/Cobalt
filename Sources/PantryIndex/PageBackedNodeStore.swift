@@ -40,7 +40,7 @@ public actor PageBackedNodeStore: Sendable {
             await bufferPool.markDirty(pageID: page.pageID)
             nodePageMap[node.nodeId] = page.pageID
         }
-        nodeCache[node.nodeId] = node
+        nodeCache[node.nodeId] = node.deepCopy()
     }
 
     /// Load a B-tree node from its page

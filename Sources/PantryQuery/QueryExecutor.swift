@@ -67,10 +67,10 @@ public actor QueryExecutor: Sendable {
                 }
                 let updatedRow = Row(values: updatedValues)
 
-                // Delete old, insert new
-                try await storageEngine.deleteRecord(id: record.id, tableName: table)
+                // Encode first so a failure doesn't lose the old record
                 let rowData = try JSONEncoder().encode(updatedRow)
                 let newRecord = Record(id: record.id, data: rowData)
+                try await storageEngine.deleteRecord(id: record.id, tableName: table)
                 try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow)
                 updatedCount += 1
             }

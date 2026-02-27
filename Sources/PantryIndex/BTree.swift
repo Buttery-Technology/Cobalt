@@ -310,7 +310,11 @@ public actor BTree: Sendable {
                 try await deleteFromNode(node: rightChild, key: succKey)
             } else {
                 try await mergeWithRightSibling(parent: node, leftIndex: keyIndex)
-                try await deleteFromNode(node: leftChild, key: key)
+                // Reload left child after merge — the original reference is stale
+                guard let mergedChild = try await nodeStore.loadNode(nodeId: leftChildId) else {
+                    throw PantryError.indexCorrupted(description: "Merged child not found")
+                }
+                try await deleteFromNode(node: mergedChild, key: key)
             }
         }
     }
