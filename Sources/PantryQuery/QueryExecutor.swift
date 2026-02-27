@@ -57,6 +57,7 @@ public actor QueryExecutor: Sendable {
 
     public func executeUpdate(table: String, set values: [String: DBValue], where condition: WhereCondition?) async throws -> Int {
         let scanned = try await storageEngine.scanTable(table)
+        let encoder = JSONEncoder()
         var updatedCount = 0
 
         for (record, row) in scanned {
@@ -68,7 +69,7 @@ public actor QueryExecutor: Sendable {
                 let updatedRow = Row(values: updatedValues)
 
                 // Encode first so a failure doesn't lose the old record
-                let rowData = try JSONEncoder().encode(updatedRow)
+                let rowData = try encoder.encode(updatedRow)
                 let newRecord = Record(id: record.id, data: rowData)
                 try await storageEngine.deleteRecord(id: record.id, tableName: table)
                 try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow)

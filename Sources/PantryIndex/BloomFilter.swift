@@ -39,11 +39,21 @@ public struct BloomFilter: Sendable, Codable {
         return true
     }
 
+    /// Deterministic FNV-1a hash (safe across process restarts unlike Swift's Hasher)
     private func getHash(_ element: String, seed: Int) -> Int {
-        var hasher = Hasher()
-        hasher.combine(element)
-        hasher.combine(seed)
-        // Use bitwise AND to avoid abs(Int.min) overflow
-        return hasher.finalize() & Int.max
+        var hash: UInt64 = 14695981039346656037 // FNV offset basis
+        // Mix in the seed
+        var seedBits = UInt64(bitPattern: Int64(seed))
+        for _ in 0..<8 {
+            hash ^= seedBits & 0xFF
+            hash &*= 1099511628211 // FNV prime
+            seedBits >>= 8
+        }
+        // Hash the element bytes
+        for byte in element.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1099511628211
+        }
+        return Int(hash & UInt64(Int.max))
     }
 }

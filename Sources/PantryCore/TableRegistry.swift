@@ -72,7 +72,7 @@ public actor TableRegistry: Sendable {
         }
 
         // Write records across registry pages starting at page 1
-        var pageID = PantryConstants.SYSTEM_PAGE_TABLE_REGISTRY_START
+        let pageID = PantryConstants.SYSTEM_PAGE_TABLE_REGISTRY_START
         var page = DatabasePage(
             pageID: pageID,
             flags: PageFlags.system.rawValue | PageFlags.tableRegistry.rawValue
@@ -80,14 +80,8 @@ public actor TableRegistry: Sendable {
 
         for record in records {
             if !page.addRecord(record) {
-                // Current page is full, write it and start a new one
-                try await writePage(&page)
-                pageID += 1
-                page = DatabasePage(
-                    pageID: pageID,
-                    flags: PageFlags.system.rawValue | PageFlags.tableRegistry.rawValue
-                )
-                _ = page.addRecord(record)
+                // Guard: registry must fit in reserved pages to avoid overwriting data pages
+                throw PantryError.schemaSerializationError
             }
         }
 

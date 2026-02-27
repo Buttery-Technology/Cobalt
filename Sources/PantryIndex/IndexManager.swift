@@ -98,9 +98,14 @@ public actor IndexManager: IndexHook, Sendable {
         }
     }
 
-    public func removeFromIndexes(id: UInt64, tableName: String) async throws {
-        // In a full implementation, we'd need the row values to know which index keys to remove.
-        // For now, this is a no-op; index rebuild handles consistency.
+    public func removeFromIndexes(id: UInt64, row: Row, tableName: String) async throws {
+        guard let tableIndexes = indexes[tableName] else { return }
+
+        for (columnName, columnIndex) in tableIndexes {
+            if let value = row.values[columnName] {
+                try await columnIndex.delete(key: value)
+            }
+        }
     }
 
     /// Attempt to use indexes for a query condition
