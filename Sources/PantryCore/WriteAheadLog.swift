@@ -94,7 +94,7 @@ public actor WriteAheadLog: Sendable {
         }
     }
 
-    public func logTransactionCommit(txID: UInt64) {
+    public func logTransactionCommit(txID: UInt64) throws {
         let lsn = nextLSN
         nextLSN += 1
 
@@ -107,15 +107,11 @@ public actor WriteAheadLog: Sendable {
 
         cacheLogRecord(lsn: lsn, type: .transactionCommit, txID: txID, timestamp: timestamp, content: .transaction(.readCommitted))
 
-        do {
-            try writeLogRecord(logData)
-            try logFileHandle?.synchronize()
-        } catch {
-            // Critical: commit log write failed
-        }
+        try writeLogRecord(logData)
+        try logFileHandle?.synchronize()
     }
 
-    public func logTransactionRollback(txID: UInt64) {
+    public func logTransactionRollback(txID: UInt64) throws {
         let lsn = nextLSN
         nextLSN += 1
 
@@ -128,11 +124,7 @@ public actor WriteAheadLog: Sendable {
 
         cacheLogRecord(lsn: lsn, type: .transactionRollback, txID: txID, timestamp: timestamp, content: .transaction(.readCommitted))
 
-        do {
-            try writeLogRecord(logData)
-        } catch {
-            // WAL write failure during rollback
-        }
+        try writeLogRecord(logData)
     }
 
     // MARK: - Page Image Logging

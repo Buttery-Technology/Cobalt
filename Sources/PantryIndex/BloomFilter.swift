@@ -43,6 +43,7 @@ public struct BloomFilter: Sendable, Codable {
         var hasher = Hasher()
         hasher.combine(element)
         hasher.combine(seed)
-        return abs(hasher.finalize())
+        // Use bitwise AND to avoid abs(Int.min) overflow
+        return hasher.finalize() & Int.max
     }
 }

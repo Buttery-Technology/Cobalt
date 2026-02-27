@@ -45,7 +45,7 @@ public actor TransactionManager: Sendable {
             try await flusher(modifiedPages)
         }
 
-        await logManager.logTransactionCommit(txID: txContext.transactionID)
+        try await logManager.logTransactionCommit(txID: txContext.transactionID)
         await txContext.commit()
         activeTransactions.removeValue(forKey: txContext.transactionID)
     }
@@ -56,7 +56,7 @@ public actor TransactionManager: Sendable {
         }
 
         try await logManager.undoTransaction(txID: txContext.transactionID)
-        await logManager.logTransactionRollback(txID: txContext.transactionID)
+        try await logManager.logTransactionRollback(txID: txContext.transactionID)
         await txContext.rollback()
         activeTransactions.removeValue(forKey: txContext.transactionID)
     }
