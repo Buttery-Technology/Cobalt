@@ -63,11 +63,15 @@ extension PantryDatabase {
     /// Ensure the KV table exists
     private func ensureKVTable() async throws {
         if await tableExists(Self.kvTableName) { return }
-        let schema = PantryTableSchema(name: Self.kvTableName, columns: [
-            PantryColumn(name: "_key", type: .string, isPrimaryKey: true, isNullable: false),
-            PantryColumn(name: "_value", type: .string, isNullable: true),
-            PantryColumn(name: "_timestamp", type: .double, isNullable: false),
-        ])
-        try await createTable(schema)
+        do {
+            let schema = PantryTableSchema(name: Self.kvTableName, columns: [
+                PantryColumn(name: "_key", type: .string, isPrimaryKey: true, isNullable: false),
+                PantryColumn(name: "_value", type: .string, isNullable: true),
+                PantryColumn(name: "_timestamp", type: .double, isNullable: false),
+            ])
+            try await createTable(schema)
+        } catch PantryError.tableAlreadyExists {
+            // Another concurrent call created the table between our check and create
+        }
     }
 }

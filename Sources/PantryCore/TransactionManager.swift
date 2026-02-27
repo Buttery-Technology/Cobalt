@@ -17,7 +17,7 @@ public actor TransactionManager: Sendable {
 
     // MARK: - Transaction Management
 
-    public func beginTransaction(isolationLevel: IsolationLevel? = nil) async -> TransactionContext {
+    public func beginTransaction(isolationLevel: IsolationLevel? = nil) async throws -> TransactionContext {
         let txID = nextTransactionID
         nextTransactionID += 1
 
@@ -25,7 +25,7 @@ public actor TransactionManager: Sendable {
         let txContext = TransactionContext(transactionID: txID, isolationLevel: level)
         activeTransactions[txID] = txContext
 
-        await logManager.logTransactionBegin(txID: txID, isolationLevel: level)
+        try await logManager.logTransactionBegin(txID: txID, isolationLevel: level)
         return txContext
     }
 
@@ -39,20 +39,22 @@ public actor TransactionManager: Sendable {
             try await validateSerializableTransaction(txContext)
         }
 
-        // Flush modified pages via injected closure
+        // WAL protocol: commit record must be durable BEFORE pages are flushed
+        try await logManager.logTransactionCommit(txID: txContext.transactionID)
+
+        // Now safe to flush modified pages to disk
         let modifiedPages = await txContext.modifiedPages
         if let flusher = pageFlusher {
             try await flusher(modifiedPages)
         }
-
-        try await logManager.logTransactionCommit(txID: txContext.transactionID)
         await txContext.commit()
         activeTransactions.removeValue(forKey: txContext.transactionID)
     }
 
     public func rollbackTransaction(_ txContext: TransactionContext) async throws {
-        guard activeTransactions[txContext.transactionID] != nil else {
-            throw PantryError.transactionNotFound
+        guard let activeContext = activeTransactions[txContext.transactionID],
+              await activeContext.isActive else {
+            throw PantryError.invalidTransactionState
         }
 
         try await logManager.undoTransaction(txID: txContext.transactionID)

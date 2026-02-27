@@ -32,7 +32,9 @@ public actor PageBackedNodeStore: Sendable {
             // Allocate a new page
             var page = try await storageManager.createNewPage()
             page.pageFlags = [.indexNode]
-            _ = page.addRecord(record)
+            guard page.addRecord(record) else {
+                throw PantryError.pageOverflow
+            }
             try page.saveRecords()
             await bufferPool.cachePage(page)
             await bufferPool.markDirty(pageID: page.pageID)
@@ -42,10 +44,11 @@ public actor PageBackedNodeStore: Sendable {
     }
 
     /// Load a B-tree node from its page
+    /// Returns a deep copy to prevent aliasing with the cache
     public func loadNode(nodeId: UUID) async throws -> BTreeNode? {
         // Check in-memory cache first to avoid deserialization
         if let cached = nodeCache[nodeId] {
-            return cached
+            return cached.deepCopy()
         }
 
         guard let pageID = nodePageMap[nodeId] else {
@@ -59,7 +62,7 @@ public actor PageBackedNodeStore: Sendable {
 
         let node = try BTreeNode.deserialize(from: record.data)
         nodeCache[nodeId] = node
-        return node
+        return node.deepCopy()
     }
 
     /// Flush all dirty index pages to disk

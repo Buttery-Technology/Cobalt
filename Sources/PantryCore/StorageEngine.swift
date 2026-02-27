@@ -148,7 +148,7 @@ public actor StorageEngine: Sendable {
     }
 
     public func deleteRecord(id: UInt64, tableName: String, transactionContext: TransactionContext? = nil) async throws {
-        guard var tableInfo = await tableRegistry.getTableInfo(name: tableName) else {
+        guard await tableRegistry.getTableInfo(name: tableName) != nil else {
             throw PantryError.tableNotFound(name: tableName)
         }
 
@@ -163,8 +163,12 @@ public actor StorageEngine: Sendable {
 
         try await indexHook?.removeFromIndexes(id: id, tableName: tableName)
 
-        tableInfo.recordCount -= 1
-        await tableRegistry.updateTableInfo(tableInfo)
+        // Re-read tableInfo to avoid lost-update race with concurrent operations
+        guard var freshInfo = await tableRegistry.getTableInfo(name: tableName) else {
+            throw PantryError.tableNotFound(name: tableName)
+        }
+        freshInfo.recordCount -= 1
+        await tableRegistry.updateTableInfo(freshInfo)
     }
 
     /// Scan all records in a table
@@ -233,8 +237,8 @@ public actor StorageEngine: Sendable {
 
     // MARK: - Transaction Passthrough
 
-    public func beginTransaction(isolationLevel: IsolationLevel? = nil) async -> TransactionContext {
-        await transactionManager.beginTransaction(isolationLevel: isolationLevel)
+    public func beginTransaction(isolationLevel: IsolationLevel? = nil) async throws -> TransactionContext {
+        try await transactionManager.beginTransaction(isolationLevel: isolationLevel)
     }
 
     public func commitTransaction(_ txContext: TransactionContext) async throws {
