@@ -84,26 +84,29 @@ public actor StorageManager: Sendable {
         let currentSize = try fileHandle?.seekToEnd() ?? 0
         let newPageID = Int(currentSize) / diskPageSize
 
-        let blankData = Data(count: pageSize)
-
-        let dataToWrite: Data
-        if let provider = encryptionProvider {
-            dataToWrite = try provider.encrypt(blankData)
-        } else {
-            dataToWrite = blankData
-        }
-
-        try fileHandle?.write(contentsOf: dataToWrite)
-        try fileHandle?.synchronize()
-
-        return DatabasePage(
+        // Build the page struct and serialize its header into the data buffer
+        // so that if this page is evicted and re-read, loadRecords() sees the correct pageID
+        var page = DatabasePage(
             pageID: newPageID,
             nextPageID: 0,
             recordCount: 0,
             freeSpaceOffset: pageSize,
             flags: 0,
-            data: blankData
+            data: Data(count: pageSize)
         )
+        try page.saveRecords()
+
+        let dataToWrite: Data
+        if let provider = encryptionProvider {
+            dataToWrite = try provider.encrypt(page.data)
+        } else {
+            dataToWrite = page.data
+        }
+
+        try fileHandle?.write(contentsOf: dataToWrite)
+        try fileHandle?.synchronize()
+
+        return page
     }
 
     /// Get total number of pages in the file

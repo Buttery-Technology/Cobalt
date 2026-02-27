@@ -71,13 +71,13 @@ public actor BTree: Sendable {
 
     // MARK: - Delete
 
-    public func delete(key: DBValue) async throws {
+    public func delete(key: DBValue, row: Row? = nil) async throws {
         guard let rootId = rootId,
               let root = try await nodeStore.loadNode(nodeId: rootId) else {
             return
         }
 
-        try await deleteFromNode(node: root, key: key)
+        try await deleteFromNode(node: root, key: key, row: row)
 
         if root.keys.isEmpty && !root.isLeaf {
             if let newRootId = root.children?.first {
@@ -249,15 +249,22 @@ public actor BTree: Sendable {
 
     // MARK: - Delete Helpers
 
-    private func deleteFromNode(node: BTreeNode, key: DBValue) async throws {
+    private func deleteFromNode(node: BTreeNode, key: DBValue, row: Row? = nil) async throws {
         var keyIndex = findKeyIndex(node: node, key: key)
+
+        // When matching a specific row, skip entries with the right key but wrong value
+        if let row = row {
+            while keyIndex < node.keys.count && node.keys[keyIndex] == key && node.values[keyIndex] != row {
+                keyIndex += 1
+            }
+        }
 
         if keyIndex < node.keys.count && node.keys[keyIndex] == key {
             if node.isLeaf {
                 removeFromLeaf(node: node, index: keyIndex)
                 try await nodeStore.saveNode(node)
             } else {
-                try await deleteFromInternalNode(node: node, keyIndex: keyIndex)
+                try await deleteFromInternalNode(node: node, keyIndex: keyIndex, row: row)
             }
         } else if !node.isLeaf {
             let isInLastChild = (keyIndex == node.keys.count)
@@ -275,14 +282,14 @@ public actor BTree: Sendable {
                       let newChild = try await nodeStore.loadNode(nodeId: newChildId) else {
                     throw PantryError.indexCorrupted(description: "Child node not found after filling")
                 }
-                try await deleteFromNode(node: newChild, key: key)
+                try await deleteFromNode(node: newChild, key: key, row: row)
             } else {
-                try await deleteFromNode(node: child, key: key)
+                try await deleteFromNode(node: child, key: key, row: row)
             }
         }
     }
 
-    private func deleteFromInternalNode(node: BTreeNode, keyIndex: Int) async throws {
+    private func deleteFromInternalNode(node: BTreeNode, keyIndex: Int, row: Row? = nil) async throws {
         let key = node.keys[keyIndex]
 
         guard let leftChildId = node.children?[keyIndex],
@@ -295,7 +302,8 @@ public actor BTree: Sendable {
             node.keys[keyIndex] = predKey
             node.values[keyIndex] = predValue
             try await nodeStore.saveNode(node)
-            try await deleteFromNode(node: leftChild, key: predKey)
+            // Delete the specific predecessor entry
+            try await deleteFromNode(node: leftChild, key: predKey, row: predValue)
         } else {
             guard let rightChildId = node.children?[keyIndex + 1],
                   let rightChild = try await nodeStore.loadNode(nodeId: rightChildId) else {
@@ -307,14 +315,15 @@ public actor BTree: Sendable {
                 node.keys[keyIndex] = succKey
                 node.values[keyIndex] = succValue
                 try await nodeStore.saveNode(node)
-                try await deleteFromNode(node: rightChild, key: succKey)
+                // Delete the specific successor entry
+                try await deleteFromNode(node: rightChild, key: succKey, row: succValue)
             } else {
                 try await mergeWithRightSibling(parent: node, leftIndex: keyIndex)
                 // Reload left child after merge — the original reference is stale
                 guard let mergedChild = try await nodeStore.loadNode(nodeId: leftChildId) else {
                     throw PantryError.indexCorrupted(description: "Merged child not found")
                 }
-                try await deleteFromNode(node: mergedChild, key: key)
+                try await deleteFromNode(node: mergedChild, key: key, row: row)
             }
         }
     }

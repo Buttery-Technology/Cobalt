@@ -29,6 +29,8 @@ public enum DBValue: Codable, Comparable, Hashable, Sendable {
             return a < b
         case let (.boolean(a), .boolean(b)):
             return !a && b
+        case let (.blob(a), .blob(b)):
+            return a.lexicographicallyPrecedes(b)
         default:
             return lhs.typeOrder < rhs.typeOrder
         }
