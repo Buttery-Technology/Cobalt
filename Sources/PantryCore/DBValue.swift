@@ -48,6 +48,28 @@ public enum DBValue: Codable, Comparable, Hashable, Sendable {
         }
     }
 
+    public func hash(into hasher: inout Hasher) {
+        switch self {
+        case .null:
+            hasher.combine(0)
+        case .integer(let v):
+            hasher.combine(2)
+            hasher.combine(Double(v))
+        case .double(let v):
+            hasher.combine(2)
+            hasher.combine(v)
+        case .string(let v):
+            hasher.combine(4)
+            hasher.combine(v)
+        case .boolean(let v):
+            hasher.combine(1)
+            hasher.combine(v)
+        case .blob(let v):
+            hasher.combine(5)
+            hasher.combine(v)
+        }
+    }
+
     private var typeOrder: Int {
         switch self {
         case .null: return 0

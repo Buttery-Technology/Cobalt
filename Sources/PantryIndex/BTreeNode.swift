@@ -17,15 +17,6 @@ public final class BTreeNode: Codable, @unchecked Sendable {
         self.isLeaf = isLeaf
     }
 
-    /// Create a deep copy of this node
-    public func copy() -> BTreeNode {
-        let node = BTreeNode(isLeaf: isLeaf)
-        node.keys = keys
-        node.values = values
-        node.children = children
-        return node
-    }
-
     // Private init that preserves nodeId (for copy via Codable round-trip is expensive)
     private init(nodeId: UUID, isLeaf: Bool, keys: [DBValue], values: [Row], children: [UUID]?) {
         self.nodeId = nodeId

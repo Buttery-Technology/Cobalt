@@ -15,15 +15,11 @@ public struct PantryConfiguration: Sendable {
     /// Default transaction isolation level
     public let isolationLevel: IsolationLevel
 
-    /// Whether to enable write-ahead logging
-    public let walEnabled: Bool
-
     public init(
         path: String,
         encryptionKey: Data? = nil,
         bufferPoolCapacity: Int = 1000,
-        isolationLevel: IsolationLevel = .readCommitted,
-        walEnabled: Bool = true
+        isolationLevel: IsolationLevel = .readCommitted
     ) {
         precondition(!path.isEmpty, "Database path must not be empty")
         precondition(bufferPoolCapacity > 0, "Buffer pool capacity must be positive")
@@ -34,6 +30,5 @@ public struct PantryConfiguration: Sendable {
         self.encryptionKey = encryptionKey
         self.bufferPoolCapacity = bufferPoolCapacity
         self.isolationLevel = isolationLevel
-        self.walEnabled = walEnabled
     }
 }
