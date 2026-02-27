@@ -104,7 +104,7 @@ public struct DatabasePage: Sendable {
             let recordLength = recordData.count
 
             let nextSlotEnd = headerSize + (newSlots.count + 1) * slotSize
-            if nextSlotEnd > (dataPosition - recordLength) {
+            if nextSlotEnd >= (dataPosition - recordLength) {
                 throw PantryError.pageOverflow
             }
 
@@ -173,7 +173,7 @@ public struct DatabasePage: Sendable {
         let headerEnd = PantryConstants.PAGE_HEADER_SIZE + ((recordCount + 1) * slotSize)
         let newFreeOffset = freeSpaceOffset - recordSize
 
-        if headerEnd > newFreeOffset {
+        if headerEnd >= newFreeOffset {
             return false
         }
 
@@ -188,8 +188,10 @@ public struct DatabasePage: Sendable {
         guard let index = records.firstIndex(where: { $0.id == id }) else {
             return false
         }
+        let removedSize = records[index].serialize().count
         records.remove(at: index)
         recordCount -= 1
+        freeSpaceOffset += removedSize
         return true
     }
 

@@ -76,7 +76,12 @@ public actor BufferPoolManager: Sendable {
     }
 
     private func selectPagesForEviction(count: Int = 1) -> [Int] {
-        Array(accessOrder.sorted { $0.value < $1.value }.prefix(count).map { $0.key })
+        if count == 1 {
+            // O(n) minimum scan instead of O(n log n) sort
+            guard let oldest = accessOrder.min(by: { $0.value < $1.value }) else { return [] }
+            return [oldest.key]
+        }
+        return Array(accessOrder.sorted { $0.value < $1.value }.prefix(count).map { $0.key })
     }
 
     public func evictPages(count: Int = 1) async throws {

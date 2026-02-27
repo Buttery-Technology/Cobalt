@@ -216,11 +216,15 @@ public actor StorageEngine: Sendable {
             throw PantryError.tableNotFound(name: name)
         }
 
-        // Walk the page chain and clear pages
+        // Walk the page chain and clear each page
         var currentPageID = tableInfo.firstPageID
         while currentPageID != 0 {
             let page = try await getPage(pageID: currentPageID)
-            currentPageID = page.nextPageID
+            let nextID = page.nextPageID
+            // Clear the page to reclaim space
+            let clearedPage = DatabasePage(pageID: currentPageID)
+            try await savePage(clearedPage)
+            currentPageID = nextID
         }
 
         await tableRegistry.removeTable(name: name)

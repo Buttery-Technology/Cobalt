@@ -25,6 +25,11 @@ public struct PantryConfiguration: Sendable {
         isolationLevel: IsolationLevel = .readCommitted,
         walEnabled: Bool = true
     ) {
+        precondition(!path.isEmpty, "Database path must not be empty")
+        precondition(bufferPoolCapacity > 0, "Buffer pool capacity must be positive")
+        if let key = encryptionKey {
+            precondition(key.count == 32, "Encryption key must be exactly 32 bytes for AES-256")
+        }
         self.path = path
         self.encryptionKey = encryptionKey
         self.bufferPoolCapacity = bufferPoolCapacity

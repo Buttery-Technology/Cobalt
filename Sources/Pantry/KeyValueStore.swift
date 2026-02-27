@@ -5,6 +5,8 @@ import PantryQuery
 /// Key-value convenience methods for PantryDatabase
 extension PantryDatabase {
     private static let kvTableName = "_pantry_kv"
+    private static let kvEncoder = JSONEncoder()
+    private static let kvDecoder = JSONDecoder()
 
     /// Set a key-value pair
     public func set(_ key: String, value: DBValue) async throws {
@@ -35,8 +37,10 @@ extension PantryDatabase {
 
     /// Set a Codable value for a key
     public func set<T: Codable & Sendable>(_ key: String, codableValue: T) async throws {
-        let data = try JSONEncoder().encode(codableValue)
-        let jsonString = String(data: data, encoding: .utf8) ?? ""
+        let data = try Self.kvEncoder.encode(codableValue)
+        guard let jsonString = String(data: data, encoding: .utf8) else {
+            throw PantryError.schemaSerializationError
+        }
         try await set(key, value: .string(jsonString))
     }
 
@@ -47,7 +51,7 @@ extension PantryDatabase {
               let data = jsonString.data(using: .utf8) else {
             return nil
         }
-        return try JSONDecoder().decode(T.self, from: data)
+        return try Self.kvDecoder.decode(T.self, from: data)
     }
 
     /// Delete a key

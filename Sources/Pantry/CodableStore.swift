@@ -4,6 +4,9 @@ import PantryQuery
 
 /// Codable convenience methods for PantryDatabase
 extension PantryDatabase {
+    private static let codableEncoder = JSONEncoder()
+    private static let codableDecoder = JSONDecoder()
+
     /// Store a Codable value in a collection with an optional ID
     public func store<T: Codable & Sendable>(_ value: T, id: String? = nil, in collection: String) async throws -> String {
         let actualID = id ?? UUID().uuidString
@@ -11,9 +14,10 @@ extension PantryDatabase {
         // Ensure the collection table exists
         try await ensureCollectionTable(collection)
 
-        let encoder = JSONEncoder()
-        let jsonData = try encoder.encode(value)
-        let jsonString = String(data: jsonData, encoding: .utf8) ?? ""
+        let jsonData = try Self.codableEncoder.encode(value)
+        guard let jsonString = String(data: jsonData, encoding: .utf8) else {
+            throw PantryError.schemaSerializationError
+        }
 
         try await insert(into: collection, values: [
             "_id": .string(actualID),
@@ -38,18 +42,19 @@ extension PantryDatabase {
             return nil
         }
 
-        return try JSONDecoder().decode(T.self, from: jsonData)
+        return try Self.codableDecoder.decode(T.self, from: jsonData)
     }
 
     /// Retrieve all values of a type from a collection
     public func retrieveAll<T: Codable & Sendable>(_ type: T.Type, from collection: String) async throws -> [T] {
         let rows = try await select(from: collection)
+        let decoder = Self.codableDecoder
         var results: [T] = []
 
         for row in rows {
             if case .string(let jsonString) = row.values["_data"],
                let jsonData = jsonString.data(using: .utf8),
-               let value = try? JSONDecoder().decode(T.self, from: jsonData) {
+               let value = try? decoder.decode(T.self, from: jsonData) {
                 results.append(value)
             }
         }

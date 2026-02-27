@@ -21,6 +21,10 @@ public enum DBValue: Codable, Equatable, Comparable, Hashable, Sendable {
             return a < b
         case let (.double(a), .double(b)):
             return a < b
+        case let (.integer(a), .double(b)):
+            return Double(a) < b
+        case let (.double(a), .integer(b)):
+            return a < Double(b)
         case let (.string(a), .string(b)):
             return a < b
         case let (.boolean(a), .boolean(b)):

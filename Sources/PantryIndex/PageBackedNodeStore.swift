@@ -5,6 +5,7 @@ import PantryCore
 /// Each B-tree node is serialized and stored in a PantryCore page.
 public actor PageBackedNodeStore: Sendable {
     private var nodePageMap: [UUID: Int] = [:]
+    private var nodeCache: [UUID: BTreeNode] = [:]
     private let bufferPool: BufferPoolManager
     private let storageManager: StorageManager
 
@@ -37,10 +38,16 @@ public actor PageBackedNodeStore: Sendable {
             await bufferPool.markDirty(pageID: page.pageID)
             nodePageMap[node.nodeId] = page.pageID
         }
+        nodeCache[node.nodeId] = node
     }
 
     /// Load a B-tree node from its page
     public func loadNode(nodeId: UUID) async throws -> BTreeNode? {
+        // Check in-memory cache first to avoid deserialization
+        if let cached = nodeCache[nodeId] {
+            return cached
+        }
+
         guard let pageID = nodePageMap[nodeId] else {
             return nil
         }
@@ -50,7 +57,9 @@ public actor PageBackedNodeStore: Sendable {
             return nil
         }
 
-        return try BTreeNode.deserialize(from: record.data)
+        let node = try BTreeNode.deserialize(from: record.data)
+        nodeCache[nodeId] = node
+        return node
     }
 
     /// Flush all dirty index pages to disk
