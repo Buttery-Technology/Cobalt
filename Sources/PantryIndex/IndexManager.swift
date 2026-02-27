@@ -34,9 +34,9 @@ public actor ColumnIndex: Sendable {
         try await btree.searchRange(from: startKey, to: endKey)
     }
 
-    /// Delete a key from this index
-    public func delete(key: DBValue) async throws {
-        try await btree.delete(key: key)
+    /// Delete a specific (key, row) entry from this index
+    public func delete(key: DBValue, row: Row? = nil) async throws {
+        try await btree.delete(key: key, row: row)
     }
 }
 
@@ -103,7 +103,7 @@ public actor IndexManager: IndexHook, Sendable {
 
         for (columnName, columnIndex) in tableIndexes {
             if let value = row.values[columnName] {
-                try await columnIndex.delete(key: value)
+                try await columnIndex.delete(key: value, row: row)
             }
         }
     }
@@ -165,8 +165,8 @@ extension DBValue {
     var indexKey: String {
         switch self {
         case .null: return "__null__"
-        case .integer(let v): return "i:\(v)"
-        case .double(let v): return "d:\(v)"
+        case .integer(let v): return "n:\(Double(v))"
+        case .double(let v): return "n:\(v)"
         case .string(let v): return "s:\(v)"
         case .boolean(let v): return "b:\(v)"
         case .blob(let v): return "x:\(v.base64EncodedString())"

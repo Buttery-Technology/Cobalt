@@ -328,6 +328,7 @@ public actor WriteAheadLog: Sendable {
             return LogRecord(lsn: lsn, type: type, transactionID: txID, timestamp: timestamp, content: .pageImage(pageID, timestamp, pageData))
 
         case .checkpoint:
+            guard pos + 8 <= data.count else { return nil }
             let timestamp = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: pos, as: UInt64.self) }
             return LogRecord(lsn: lsn, type: type, transactionID: 0, timestamp: timestamp, content: .checkpoint([]))
         }

@@ -114,15 +114,13 @@ public actor StorageEngine: Sendable {
             guard var freshInfo = await tableRegistry.getTableInfo(name: tableName) else {
                 throw PantryError.tableNotFound(name: tableName)
             }
+            // createNewPageForTable links the new page at the tail of the chain;
+            // do NOT splice it after `page` or it creates an infinite cycle
             var newPage = try await createNewPageForTable(tableInfo: &freshInfo)
             if !newPage.addRecord(record) {
                 throw PantryError.recordTooLarge(size: recordSize)
             }
 
-            newPage.nextPageID = page.nextPageID
-            page.nextPageID = newPage.pageID
-
-            try await savePage(page, transactionContext: transactionContext)
             try await savePage(newPage, transactionContext: transactionContext)
             await tableRegistry.updateTableInfo(freshInfo)
         } else {
@@ -186,7 +184,9 @@ public actor StorageEngine: Sendable {
         guard var freshInfo = await tableRegistry.getTableInfo(name: tableName) else {
             throw PantryError.tableNotFound(name: tableName)
         }
-        freshInfo.recordCount -= 1
+        if freshInfo.recordCount > 0 {
+            freshInfo.recordCount -= 1
+        }
         await tableRegistry.updateTableInfo(freshInfo)
     }
 
@@ -239,19 +239,20 @@ public actor StorageEngine: Sendable {
             throw PantryError.tableNotFound(name: name)
         }
 
-        // Walk the page chain and clear each page
+        // Remove from registry first so a crash won't leave a dangling reference
+        // to zeroed pages (orphaned pages are a space leak, not data corruption)
+        await tableRegistry.removeTable(name: name)
+        try await tableRegistry.save()
+
+        // Then clear the data pages
         var currentPageID = tableInfo.firstPageID
         while currentPageID != 0 {
             let page = try await getPage(pageID: currentPageID)
             let nextID = page.nextPageID
-            // Clear the page to reclaim space
             let clearedPage = DatabasePage(pageID: currentPageID)
             try await savePage(clearedPage)
             currentPageID = nextID
         }
-
-        await tableRegistry.removeTable(name: name)
-        try await tableRegistry.save()
     }
 
     // MARK: - Transaction Passthrough
