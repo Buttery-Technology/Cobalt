@@ -101,21 +101,26 @@ public actor QueryExecutor: Sendable {
     private func evaluateCondition(_ condition: WhereCondition, row: Row) -> Bool {
         switch condition {
         case let .equals(column, value):
-            return row.values[column] == value
+            // SQL: NULL = anything is false; use isNull for NULL checks
+            if value == .null { return false }
+            guard let rowValue = row.values[column], rowValue != .null else { return false }
+            return rowValue == value
         case let .notEquals(column, value):
-            guard let rowValue = row.values[column] else { return false }
+            // SQL: NULL != anything is false; use isNotNull for NULL checks
+            if value == .null { return false }
+            guard let rowValue = row.values[column], rowValue != .null else { return false }
             return rowValue != value
         case let .lessThan(column, value):
-            guard let rowValue = row.values[column] else { return false }
+            guard let rowValue = row.values[column], rowValue != .null, value != .null else { return false }
             return rowValue < value
         case let .greaterThan(column, value):
-            guard let rowValue = row.values[column] else { return false }
+            guard let rowValue = row.values[column], rowValue != .null, value != .null else { return false }
             return rowValue > value
         case let .lessThanOrEqual(column, value):
-            guard let rowValue = row.values[column] else { return false }
+            guard let rowValue = row.values[column], rowValue != .null, value != .null else { return false }
             return rowValue <= value
         case let .greaterThanOrEqual(column, value):
-            guard let rowValue = row.values[column] else { return false }
+            guard let rowValue = row.values[column], rowValue != .null, value != .null else { return false }
             return rowValue >= value
         case let .isNull(column):
             return row.values[column] == nil || row.values[column] == .null

@@ -121,13 +121,17 @@ public actor IndexManager: IndexHook, Sendable {
 
         case .greaterThan(let column, let value):
             if let index = tableIndexes[column] {
-                return try await index.searchRange(from: value, to: nil)
+                // searchRange uses closed-interval; exclude boundary for strict >
+                let rows = try await index.searchRange(from: value, to: nil)
+                return rows.filter { $0.values[column] != value }
             }
             return nil
 
         case .lessThan(let column, let value):
             if let index = tableIndexes[column] {
-                return try await index.searchRange(from: nil, to: value)
+                // searchRange uses closed-interval; exclude boundary for strict <
+                let rows = try await index.searchRange(from: nil, to: value)
+                return rows.filter { $0.values[column] != value }
             }
             return nil
 
