@@ -85,6 +85,16 @@ extension PantryDatabase {
         return results
     }
 
+    /// Retrieve a Codable value by ID (type inferred from return context)
+    public func retrieve<T: Codable & Sendable>(id: String, from collection: String) async throws -> T? {
+        try await retrieve(T.self, id: id, from: collection)
+    }
+
+    /// Retrieve all values (type inferred from return context)
+    public func retrieveAll<T: Codable & Sendable>(from collection: String) async throws -> [T] {
+        try await retrieveAll(T.self, from: collection)
+    }
+
     /// Remove a value by ID from a collection
     public func remove(id: String, from collection: String) async throws {
         guard await tableExists(collection) else { return }
