@@ -47,7 +47,7 @@ public actor TransactionManager: Sendable {
         }
 
         // WAL protocol: commit record must be durable BEFORE pages are flushed
-        try await logManager.logTransactionCommit(txID: txContext.transactionID)
+        try await logManager.logTransactionCommit(txID: txContext.transactionID, isolationLevel: txContext.isolationLevel)
 
         // Transaction is committed in WAL — mark it committed and remove from active
         // BEFORE flushing pages, so a pageFlusher failure doesn't leave it in limbo
@@ -68,7 +68,7 @@ public actor TransactionManager: Sendable {
         }
 
         try await logManager.undoTransaction(txID: txContext.transactionID)
-        try await logManager.logTransactionRollback(txID: txContext.transactionID)
+        try await logManager.logTransactionRollback(txID: txContext.transactionID, isolationLevel: txContext.isolationLevel)
         await txContext.rollback()
         activeTransactions.removeValue(forKey: txContext.transactionID)
     }

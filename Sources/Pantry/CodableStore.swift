@@ -43,10 +43,15 @@ extension PantryDatabase {
     /// Retrieve a Codable value by ID from a collection
     public func retrieve<T: Codable & Sendable>(_ type: T.Type, id: String, from collection: String) async throws -> T? {
         guard await tableExists(collection) else { return nil }
-        let rows = try await select(
-            from: collection,
-            where: .equals(column: "_id", value: .string(id))
-        )
+        let rows: [Row]
+        do {
+            rows = try await select(
+                from: collection,
+                where: .equals(column: "_id", value: .string(id))
+            )
+        } catch PantryError.tableNotFound {
+            return nil // Table dropped between exists check and select
+        }
 
         guard let row = rows.first,
               case .string(let jsonString) = row.values["_data"],
@@ -60,7 +65,12 @@ extension PantryDatabase {
     /// Retrieve all values of a type from a collection
     public func retrieveAll<T: Codable & Sendable>(_ type: T.Type, from collection: String) async throws -> [T] {
         guard await tableExists(collection) else { return [] }
-        let rows = try await select(from: collection)
+        let rows: [Row]
+        do {
+            rows = try await select(from: collection)
+        } catch PantryError.tableNotFound {
+            return [] // Table dropped between exists check and select
+        }
         let decoder = Self.codableDecoder
         var results: [T] = []
 
@@ -78,7 +88,11 @@ extension PantryDatabase {
     /// Remove a value by ID from a collection
     public func remove(id: String, from collection: String) async throws {
         guard await tableExists(collection) else { return }
-        _ = try await delete(from: collection, where: .equals(column: "_id", value: .string(id)))
+        do {
+            _ = try await delete(from: collection, where: .equals(column: "_id", value: .string(id)))
+        } catch PantryError.tableNotFound {
+            return // Table dropped between exists check and delete
+        }
     }
 
     /// Ensure a collection table exists with the standard schema

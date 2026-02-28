@@ -93,7 +93,7 @@ public actor WriteAheadLog: Sendable {
         try writeLogRecord(logData)
     }
 
-    public func logTransactionCommit(txID: UInt64) throws {
+    public func logTransactionCommit(txID: UInt64, isolationLevel: IsolationLevel = .readCommitted) throws {
         let lsn = nextLSN
         nextLSN += 1
 
@@ -104,13 +104,13 @@ public actor WriteAheadLog: Sendable {
         let timestamp = UInt64(Date().timeIntervalSince1970)
         withUnsafeBytes(of: timestamp) { logData.append(contentsOf: $0) }
 
-        cacheLogRecord(lsn: lsn, type: .transactionCommit, txID: txID, timestamp: timestamp, content: .transaction(.readCommitted))
+        cacheLogRecord(lsn: lsn, type: .transactionCommit, txID: txID, timestamp: timestamp, content: .transaction(isolationLevel))
 
         try writeLogRecord(logData)
         try logFileHandle?.synchronize()
     }
 
-    public func logTransactionRollback(txID: UInt64) throws {
+    public func logTransactionRollback(txID: UInt64, isolationLevel: IsolationLevel = .readCommitted) throws {
         let lsn = nextLSN
         nextLSN += 1
 
@@ -121,7 +121,7 @@ public actor WriteAheadLog: Sendable {
         let timestamp = UInt64(Date().timeIntervalSince1970)
         withUnsafeBytes(of: timestamp) { logData.append(contentsOf: $0) }
 
-        cacheLogRecord(lsn: lsn, type: .transactionRollback, txID: txID, timestamp: timestamp, content: .transaction(.readCommitted))
+        cacheLogRecord(lsn: lsn, type: .transactionRollback, txID: txID, timestamp: timestamp, content: .transaction(isolationLevel))
 
         try writeLogRecord(logData)
     }
