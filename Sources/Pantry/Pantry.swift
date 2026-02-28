@@ -103,7 +103,11 @@ public actor PantryDatabase: Sendable {
             try await storageEngine.commitTransaction(txContext)
             return result
         } catch {
-            try await storageEngine.rollbackTransaction(txContext)
+            do {
+                try await storageEngine.rollbackTransaction(txContext)
+            } catch {
+                // Rollback failure must not mask the original error
+            }
             throw error
         }
     }

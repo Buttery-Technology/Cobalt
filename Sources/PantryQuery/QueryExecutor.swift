@@ -7,10 +7,18 @@ import PantryIndex
 public actor QueryExecutor: Sendable {
     private let storageEngine: StorageEngine
     private let indexManager: IndexManager
+    private let encoder: JSONEncoder
+    private let decoder: JSONDecoder
 
     public init(storageEngine: StorageEngine, indexManager: IndexManager) {
         self.storageEngine = storageEngine
         self.indexManager = indexManager
+        let enc = JSONEncoder()
+        enc.nonConformingFloatEncodingStrategy = .convertToString(positiveInfinity: "+inf", negativeInfinity: "-inf", nan: "nan")
+        self.encoder = enc
+        let dec = JSONDecoder()
+        dec.nonConformingFloatDecodingStrategy = .convertFromString(positiveInfinity: "+inf", negativeInfinity: "-inf", nan: "nan")
+        self.decoder = dec
     }
 
     // MARK: - SELECT
@@ -46,7 +54,6 @@ public actor QueryExecutor: Sendable {
     // MARK: - INSERT
 
     public func executeInsert(into table: String, row: Row) async throws {
-        let encoder = JSONEncoder()
         let rowData = try encoder.encode(row)
         let recordID = generateRecordID()
         let record = Record(id: recordID, data: rowData)
@@ -57,7 +64,6 @@ public actor QueryExecutor: Sendable {
 
     public func executeUpdate(table: String, set values: [String: DBValue], where condition: WhereCondition?) async throws -> Int {
         let scanned = try await storageEngine.scanTable(table)
-        let encoder = JSONEncoder()
         var updatedCount = 0
 
         for (record, row) in scanned {
