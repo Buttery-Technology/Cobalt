@@ -107,9 +107,10 @@ public actor BufferPoolManager: Sendable {
         for pageID in dirtyPagesCopy {
             if var page = pageCache[pageID] {
                 try await storageManager.writePage(&page)
-                dirtyPages.remove(pageID)
                 stats.flushCount += 1
             }
+            // Always clear dirty flag — if page is not in cache, it's an orphaned entry
+            dirtyPages.remove(pageID)
         }
     }
 

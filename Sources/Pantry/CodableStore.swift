@@ -34,6 +34,7 @@ extension PantryDatabase {
 
     /// Retrieve a Codable value by ID from a collection
     public func retrieve<T: Codable & Sendable>(_ type: T.Type, id: String, from collection: String) async throws -> T? {
+        guard await tableExists(collection) else { return nil }
         let rows = try await select(
             from: collection,
             where: .equals(column: "_id", value: .string(id))
@@ -50,6 +51,7 @@ extension PantryDatabase {
 
     /// Retrieve all values of a type from a collection
     public func retrieveAll<T: Codable & Sendable>(_ type: T.Type, from collection: String) async throws -> [T] {
+        guard await tableExists(collection) else { return [] }
         let rows = try await select(from: collection)
         let decoder = Self.codableDecoder
         var results: [T] = []
@@ -67,6 +69,7 @@ extension PantryDatabase {
 
     /// Remove a value by ID from a collection
     public func remove(id: String, from collection: String) async throws {
+        guard await tableExists(collection) else { return }
         _ = try await delete(from: collection, where: .equals(column: "_id", value: .string(id)))
     }
 

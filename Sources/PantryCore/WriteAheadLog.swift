@@ -225,6 +225,10 @@ public actor WriteAheadLog: Sendable {
     // MARK: - Log Record I/O
 
     private func writeLogRecord(_ data: Data) throws {
+        guard let fh = logFileHandle else {
+            throw PantryError.walWriteError(description: "WAL file handle is closed")
+        }
+
         let crc = CRC32.checksum(data)
 
         var headerData = Data()
@@ -232,9 +236,9 @@ public actor WriteAheadLog: Sendable {
         withUnsafeBytes(of: totalLength) { headerData.append(contentsOf: $0) }
         withUnsafeBytes(of: crc) { headerData.append(contentsOf: $0) }
 
-        try logFileHandle?.seek(toOffset: currentLogPosition)
-        try logFileHandle?.write(contentsOf: headerData)
-        try logFileHandle?.write(contentsOf: data)
+        try fh.seek(toOffset: currentLogPosition)
+        try fh.write(contentsOf: headerData)
+        try fh.write(contentsOf: data)
 
         currentLogPosition += UInt64(headerData.count + data.count)
     }

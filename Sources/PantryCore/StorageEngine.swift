@@ -165,7 +165,9 @@ public actor StorageEngine: Sendable {
         // Decode the row before deletion so indexes can be updated
         let deletedRow: Row?
         if let record = page.records.first(where: { $0.id == id }) {
-            deletedRow = try? JSONDecoder().decode(Row.self, from: record.data)
+            let dec = JSONDecoder()
+            dec.nonConformingFloatDecodingStrategy = .convertFromString(positiveInfinity: "+inf", negativeInfinity: "-inf", nan: "nan")
+            deletedRow = try? dec.decode(Row.self, from: record.data)
         } else {
             deletedRow = nil
         }
@@ -200,6 +202,7 @@ public actor StorageEngine: Sendable {
         var currentPageID = tableInfo.firstPageID
         var visited: Set<Int> = []
         let decoder = JSONDecoder()
+        decoder.nonConformingFloatDecodingStrategy = .convertFromString(positiveInfinity: "+inf", negativeInfinity: "-inf", nan: "nan")
 
         while currentPageID != 0 {
             guard visited.insert(currentPageID).inserted else {

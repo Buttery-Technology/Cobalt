@@ -268,15 +268,22 @@ public actor BTree: Sendable {
                 // Key and row both match (or no row filter) — standard internal node delete
                 try await deleteFromInternalNode(node: node, keyIndex: keyIndex, row: row)
             } else {
-                // Key matches but row doesn't — the target entry is in a subtree, not here.
-                // Descend into the left child subtree where keys <= this key live.
+                // Key matches but row doesn't — check consecutive duplicate keys at this node
+                var scanIdx = keyIndex + 1
+                while scanIdx < node.keys.count && node.keys[scanIdx] == key {
+                    if node.values[scanIdx] == row {
+                        try await deleteFromInternalNode(node: node, keyIndex: scanIdx, row: row)
+                        return
+                    }
+                    scanIdx += 1
+                }
+                // Not found at this node — descend into subtree via re-search
                 guard let childId = node.children?[keyIndex],
                       let child = try await nodeStore.loadNode(nodeId: childId) else {
                     throw PantryError.indexCorrupted(description: "Child node not found during row-filtered delete")
                 }
                 if child.keys.count == order - 1 {
                     try await fillChild(parent: node, childIndex: keyIndex)
-                    // After fill/merge, re-search from this node
                     try await deleteFromNode(node: node, key: key, row: row)
                 } else {
                     try await deleteFromNode(node: child, key: key, row: row)
@@ -284,8 +291,6 @@ public actor BTree: Sendable {
                 return
             }
         } else if !node.isLeaf {
-            let isInLastChild = (keyIndex == node.keys.count)
-
             guard let childId = node.children?[keyIndex],
                   let child = try await nodeStore.loadNode(nodeId: childId) else {
                 throw PantryError.indexCorrupted(description: "Child node not found during deletion")
@@ -293,13 +298,8 @@ public actor BTree: Sendable {
 
             if child.keys.count == order - 1 {
                 try await fillChild(parent: node, childIndex: keyIndex)
-                keyIndex = findKeyIndex(node: node, key: key)
-                let newChildIndex = isInLastChild && keyIndex >= node.keys.count ? keyIndex - 1 : keyIndex
-                guard let newChildId = node.children?[newChildIndex],
-                      let newChild = try await nodeStore.loadNode(nodeId: newChildId) else {
-                    throw PantryError.indexCorrupted(description: "Child node not found after filling")
-                }
-                try await deleteFromNode(node: newChild, key: key, row: row)
+                // After fill/merge, structure may have changed — re-search from this node
+                try await deleteFromNode(node: node, key: key, row: row)
             } else {
                 try await deleteFromNode(node: child, key: key, row: row)
             }
