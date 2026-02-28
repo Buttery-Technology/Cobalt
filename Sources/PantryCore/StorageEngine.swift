@@ -23,7 +23,7 @@ public actor StorageEngine: Sendable {
         self.storageManager = sm
         self.bufferPoolManager = BufferPoolManager(capacity: bufferPoolCapacity, storageManager: sm)
         self.logManager = try await WriteAheadLog(databasePath: databasePath, storageManager: sm)
-        self.transactionManager = TransactionManager(logManager: logManager)
+        self.transactionManager = try await TransactionManager(logManager: logManager)
         self.tableRegistry = TableRegistry(storageManager: sm, bufferPool: bufferPoolManager)
 
         // Wire page flusher to break circular reference
@@ -380,10 +380,14 @@ public actor StorageEngine: Sendable {
     // MARK: - Lifecycle
 
     public func close() async throws {
-        try await bufferPoolManager.flushAllDirtyPages()
-        try await tableRegistry.save()
-        try await logManager.close()
-        try await storageManager.close()
+        var firstError: Error?
+
+        do { try await bufferPoolManager.flushAllDirtyPages() } catch { if firstError == nil { firstError = error } }
+        do { try await tableRegistry.save() } catch { if firstError == nil { firstError = error } }
+        do { try await logManager.close() } catch { if firstError == nil { firstError = error } }
+        do { try await storageManager.close() } catch { if firstError == nil { firstError = error } }
+
+        if let error = firstError { throw error }
     }
 
     public func getBufferPoolStats() async -> BufferPoolStats {

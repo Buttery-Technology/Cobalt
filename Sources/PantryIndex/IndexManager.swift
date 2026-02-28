@@ -114,6 +114,8 @@ public actor IndexManager: IndexHook, Sendable {
 
         switch condition {
         case .equals(let column, let value):
+            // SQL NULL: NULL = NULL is false, so .equals with .null always returns empty
+            if value == .null { return [] }
             if let index = tableIndexes[column] {
                 return try await index.search(key: value)
             }

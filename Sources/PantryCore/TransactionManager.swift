@@ -10,9 +10,15 @@ public actor TransactionManager: Sendable {
     /// Closure injected by StorageEngine to flush modified pages
     public var pageFlusher: (@Sendable (Set<Int>) async throws -> Void)?
 
-    public init(logManager: WriteAheadLog, defaultIsolationLevel: IsolationLevel = .readCommitted) {
+    public init(logManager: WriteAheadLog, defaultIsolationLevel: IsolationLevel = .readCommitted) async throws {
         self.logManager = logManager
         self.defaultIsolationLevel = defaultIsolationLevel
+
+        // Recover nextTransactionID from WAL to prevent txID collisions after restart
+        let maxTxID = try await logManager.recoverMaxTransactionID()
+        if maxTxID > 0 {
+            self.nextTransactionID = maxTxID + 1
+        }
     }
 
     // MARK: - Transaction Management
@@ -43,13 +49,16 @@ public actor TransactionManager: Sendable {
         // WAL protocol: commit record must be durable BEFORE pages are flushed
         try await logManager.logTransactionCommit(txID: txContext.transactionID)
 
+        // Transaction is committed in WAL — mark it committed and remove from active
+        // BEFORE flushing pages, so a pageFlusher failure doesn't leave it in limbo
+        await txContext.commit()
+        activeTransactions.removeValue(forKey: txContext.transactionID)
+
         // Now safe to flush modified pages to disk
         let modifiedPages = await txContext.modifiedPages
         if let flusher = pageFlusher {
             try await flusher(modifiedPages)
         }
-        await txContext.commit()
-        activeTransactions.removeValue(forKey: txContext.transactionID)
     }
 
     public func rollbackTransaction(_ txContext: TransactionContext) async throws {

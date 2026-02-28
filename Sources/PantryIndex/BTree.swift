@@ -442,6 +442,9 @@ public actor BTree: Sendable {
 
         try await nodeStore.saveNode(leftChild)
         try await nodeStore.saveNode(parent)
+
+        // Clean up the absorbed right child from cache/page map
+        await nodeStore.removeNode(nodeId: rightChildId)
     }
 
     // MARK: - Helpers
