@@ -166,7 +166,10 @@ extension DBValue {
         switch self {
         case .null: return "__null__"
         case .integer(let v): return "n:\(Double(v))"
-        case .double(let v): return "n:\(v)"
+        case .double(let v):
+            // Normalize -0.0 to 0.0 and canonicalize NaN
+            let normalized = v.isNaN ? Double.nan : (v == 0.0 ? 0.0 : v)
+            return "n:\(normalized)"
         case .string(let v): return "s:\(v)"
         case .boolean(let v): return "b:\(v)"
         case .blob(let v): return "x:\(v.base64EncodedString())"

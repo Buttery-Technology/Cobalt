@@ -8,6 +8,7 @@ public enum PantryError: Error, Sendable {
     case unrecoverablePage(pageID: Int)
     case invalidDatabasePath(description: String? = nil)
     case databaseFileCorrupt
+    case databaseClosed
 
     // Record errors
     case recordNotFound(id: UInt64)

@@ -40,7 +40,10 @@ public enum DBValue: Codable, Comparable, Hashable, Sendable {
         switch (lhs, rhs) {
         case (.null, .null): return true
         case let (.integer(a), .integer(b)): return a == b
-        case let (.double(a), .double(b)): return a == b
+        case let (.double(a), .double(b)):
+            // NaN == NaN must hold for Equatable reflexivity
+            if a.isNaN && b.isNaN { return true }
+            return a == b
         case let (.integer(a), .double(b)): return Double(a) == b
         case let (.double(a), .integer(b)): return a == Double(b)
         case let (.string(a), .string(b)): return a == b
@@ -59,7 +62,8 @@ public enum DBValue: Codable, Comparable, Hashable, Sendable {
             hasher.combine(Double(v))
         case .double(let v):
             hasher.combine(2)
-            hasher.combine(v)
+            // Canonical NaN so all NaN bit patterns hash identically
+            hasher.combine(v.isNaN ? Double.nan : v)
         case .string(let v):
             hasher.combine(4)
             hasher.combine(v)

@@ -198,9 +198,13 @@ public actor StorageEngine: Sendable {
 
         var results: [(Record, Row)] = []
         var currentPageID = tableInfo.firstPageID
+        var visited: Set<Int> = []
         let decoder = JSONDecoder()
 
         while currentPageID != 0 {
+            guard visited.insert(currentPageID).inserted else {
+                throw PantryError.corruptPage(pageID: currentPageID)
+            }
             let page = try await getPage(pageID: currentPageID, transactionContext: transactionContext)
             for record in page.records {
                 if let row = try? decoder.decode(Row.self, from: record.data) {
@@ -246,7 +250,9 @@ public actor StorageEngine: Sendable {
 
         // Then clear the data pages
         var currentPageID = tableInfo.firstPageID
+        var visited: Set<Int> = []
         while currentPageID != 0 {
+            guard visited.insert(currentPageID).inserted else { break }
             let page = try await getPage(pageID: currentPageID)
             let nextID = page.nextPageID
             let clearedPage = DatabasePage(pageID: currentPageID)
@@ -273,8 +279,12 @@ public actor StorageEngine: Sendable {
 
     private func findTargetPageForInsert(tableInfo: TableInfo, recordSize: Int) async throws -> Int {
         var currentPageID = tableInfo.firstPageID
+        var visited: Set<Int> = []
 
         while currentPageID != 0 {
+            guard visited.insert(currentPageID).inserted else {
+                throw PantryError.corruptPage(pageID: currentPageID)
+            }
             let page = try await getPage(pageID: currentPageID)
             if page.getFreeSpace() > recordSize + PantryConstants.SLOT_SIZE {
                 return currentPageID
@@ -312,7 +322,11 @@ public actor StorageEngine: Sendable {
         }
 
         var currentPageID = tableInfo.firstPageID
+        var visited: Set<Int> = []
         while currentPageID != 0 {
+            guard visited.insert(currentPageID).inserted else {
+                throw PantryError.corruptPage(pageID: currentPageID)
+            }
             let page = try await getPage(pageID: currentPageID, transactionContext: transactionContext)
             if let record = page.records.first(where: { $0.id == id }) {
                 return record
@@ -329,7 +343,11 @@ public actor StorageEngine: Sendable {
         }
 
         var currentPageID = tableInfo.firstPageID
+        var visited: Set<Int> = []
         while currentPageID != 0 {
+            guard visited.insert(currentPageID).inserted else {
+                throw PantryError.corruptPage(pageID: currentPageID)
+            }
             let page = try await getPage(pageID: currentPageID)
             if page.records.contains(where: { $0.id == id }) {
                 return currentPageID

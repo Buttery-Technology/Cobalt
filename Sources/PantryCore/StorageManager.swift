@@ -32,8 +32,16 @@ public actor StorageManager: Sendable {
         fileHandle = try FileHandle(forUpdating: fileURL)
     }
 
+    private func requireHandle() throws -> FileHandle {
+        guard let fh = fileHandle else {
+            throw PantryError.databaseClosed
+        }
+        return fh
+    }
+
     /// Write a page to disk, encrypting if configured
     public func writePage(_ page: inout DatabasePage) throws {
+        let fh = try requireHandle()
         try page.saveRecords()
 
         let offset = UInt64(page.pageID) * UInt64(diskPageSize)
@@ -45,17 +53,18 @@ public actor StorageManager: Sendable {
             dataToWrite = page.data
         }
 
-        try fileHandle?.seek(toOffset: offset)
-        try fileHandle?.write(contentsOf: dataToWrite)
-        try fileHandle?.synchronize()
+        try fh.seek(toOffset: offset)
+        try fh.write(contentsOf: dataToWrite)
+        try fh.synchronize()
     }
 
     /// Read a page from disk, decrypting if configured
     public func readPage(pageID: Int) throws -> DatabasePage {
+        let fh = try requireHandle()
         let offset = UInt64(pageID) * UInt64(diskPageSize)
 
-        try fileHandle?.seek(toOffset: offset)
-        guard let rawData = try fileHandle?.read(upToCount: diskPageSize),
+        try fh.seek(toOffset: offset)
+        guard let rawData = try fh.read(upToCount: diskPageSize),
               rawData.count == diskPageSize else {
             throw PantryError.pageReadError(description: "Failed to read page \(pageID)")
         }
@@ -81,7 +90,8 @@ public actor StorageManager: Sendable {
 
     /// Create a new blank page and extend the database file
     public func createNewPage() throws -> DatabasePage {
-        let currentSize = try fileHandle?.seekToEnd() ?? 0
+        let fh = try requireHandle()
+        let currentSize = try fh.seekToEnd()
         let newPageID = Int(currentSize) / diskPageSize
 
         // Build the page struct and serialize its header into the data buffer
@@ -103,15 +113,16 @@ public actor StorageManager: Sendable {
             dataToWrite = page.data
         }
 
-        try fileHandle?.write(contentsOf: dataToWrite)
-        try fileHandle?.synchronize()
+        try fh.write(contentsOf: dataToWrite)
+        try fh.synchronize()
 
         return page
     }
 
     /// Get total number of pages in the file
     public func totalPageCount() throws -> Int {
-        let size = try fileHandle?.seekToEnd() ?? 0
+        let fh = try requireHandle()
+        let size = try fh.seekToEnd()
         return Int(size) / diskPageSize
     }
 

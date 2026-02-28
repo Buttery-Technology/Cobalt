@@ -252,8 +252,9 @@ public actor BTree: Sendable {
     private func deleteFromNode(node: BTreeNode, key: DBValue, row: Row? = nil) async throws {
         var keyIndex = findKeyIndex(node: node, key: key)
 
-        // When matching a specific row, skip entries with the right key but wrong value
-        if let row = row {
+        // Row-matching only at leaf level — at internal nodes, advancing past matching keys
+        // with a different row value would cause descent into the wrong child subtree
+        if node.isLeaf, let row = row {
             while keyIndex < node.keys.count && node.keys[keyIndex] == key && node.values[keyIndex] != row {
                 keyIndex += 1
             }

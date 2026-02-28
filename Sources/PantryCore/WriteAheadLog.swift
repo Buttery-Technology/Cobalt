@@ -128,17 +128,18 @@ public actor WriteAheadLog: Sendable {
     public func logPageBeforeImage(txID: UInt64, page: DatabasePage) throws {
         let lsn = nextLSN
         nextLSN += 1
+        let timestamp = UInt64(Date().timeIntervalSince1970)
 
         var logData = Data()
         logData.append(LogRecordType.pageBeforeUpdate.rawValue)
         withUnsafeBytes(of: lsn) { logData.append(contentsOf: $0) }
         withUnsafeBytes(of: txID) { logData.append(contentsOf: $0) }
+        withUnsafeBytes(of: timestamp) { logData.append(contentsOf: $0) }
         withUnsafeBytes(of: page.pageID) { logData.append(contentsOf: $0) }
         let dataLength = UInt32(page.data.count)
         withUnsafeBytes(of: dataLength) { logData.append(contentsOf: $0) }
         logData.append(page.data)
 
-        let timestamp = UInt64(Date().timeIntervalSince1970)
         cacheLogRecord(lsn: lsn, type: .pageBeforeUpdate, txID: txID, timestamp: timestamp, content: .pageImage(page.pageID, timestamp, page.data))
 
         try writeLogRecord(logData)
@@ -147,17 +148,18 @@ public actor WriteAheadLog: Sendable {
     public func logPageAfterImage(txID: UInt64, page: DatabasePage) throws {
         let lsn = nextLSN
         nextLSN += 1
+        let timestamp = UInt64(Date().timeIntervalSince1970)
 
         var logData = Data()
         logData.append(LogRecordType.pageAfterUpdate.rawValue)
         withUnsafeBytes(of: lsn) { logData.append(contentsOf: $0) }
         withUnsafeBytes(of: txID) { logData.append(contentsOf: $0) }
+        withUnsafeBytes(of: timestamp) { logData.append(contentsOf: $0) }
         withUnsafeBytes(of: page.pageID) { logData.append(contentsOf: $0) }
         let dataLength = UInt32(page.data.count)
         withUnsafeBytes(of: dataLength) { logData.append(contentsOf: $0) }
         logData.append(page.data)
 
-        let timestamp = UInt64(Date().timeIntervalSince1970)
         cacheLogRecord(lsn: lsn, type: .pageAfterUpdate, txID: txID, timestamp: timestamp, content: .pageImage(page.pageID, timestamp, page.data))
 
         try writeLogRecord(logData)
@@ -315,8 +317,10 @@ public actor WriteAheadLog: Sendable {
             return LogRecord(lsn: lsn, type: type, transactionID: txID, timestamp: timestamp, content: .transaction(.readCommitted))
 
         case .pageBeforeUpdate, .pageAfterUpdate:
-            guard pos + 8 + 8 + 4 <= data.count else { return nil }
+            guard pos + 8 + 8 + 8 + 4 <= data.count else { return nil }
             let txID = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: pos, as: UInt64.self) }
+            pos += 8
+            let timestamp = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: pos, as: UInt64.self) }
             pos += 8
             let pageID = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: pos, as: Int.self) }
             pos += 8
@@ -324,7 +328,6 @@ public actor WriteAheadLog: Sendable {
             pos += 4
             guard pos + dataLength <= data.count else { return nil }
             let pageData = data.subdata(in: pos..<(pos + dataLength))
-            let timestamp = UInt64(Date().timeIntervalSince1970)
             return LogRecord(lsn: lsn, type: type, transactionID: txID, timestamp: timestamp, content: .pageImage(pageID, timestamp, pageData))
 
         case .checkpoint:
