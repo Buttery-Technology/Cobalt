@@ -58,8 +58,8 @@ extension PantryDatabase {
 
         for row in rows {
             if case .string(let jsonString) = row.values["_data"],
-               let jsonData = jsonString.data(using: .utf8),
-               let value = try? decoder.decode(T.self, from: jsonData) {
+               let jsonData = jsonString.data(using: .utf8) {
+                let value = try decoder.decode(T.self, from: jsonData)
                 results.append(value)
             }
         }

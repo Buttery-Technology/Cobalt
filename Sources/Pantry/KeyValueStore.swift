@@ -24,7 +24,7 @@ extension PantryDatabase {
 
     /// Get a value by key
     public func get(_ key: String) async throws -> DBValue? {
-        try await ensureKVTable()
+        guard await tableExists(Self.kvTableName) else { return nil }
 
         let rows = try await select(
             from: Self.kvTableName,
@@ -56,7 +56,7 @@ extension PantryDatabase {
 
     /// Delete a key
     public func delete(key: String) async throws {
-        try await ensureKVTable()
+        guard await tableExists(Self.kvTableName) else { return }
         _ = try await delete(from: Self.kvTableName, where: .equals(column: "_key", value: .string(key)))
     }
 

@@ -23,9 +23,10 @@ public actor TransactionManager: Sendable {
 
         let level = isolationLevel ?? defaultIsolationLevel
         let txContext = TransactionContext(transactionID: txID, isolationLevel: level)
-        activeTransactions[txID] = txContext
 
+        // WAL write first — if it fails, no phantom transaction is registered
         try await logManager.logTransactionBegin(txID: txID, isolationLevel: level)
+        activeTransactions[txID] = txContext
         return txContext
     }
 

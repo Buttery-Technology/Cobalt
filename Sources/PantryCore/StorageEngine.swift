@@ -83,12 +83,15 @@ public actor StorageEngine: Sendable {
             await txContext.recordAccess(pageID: page.pageID, isWrite: true)
         }
 
-        await bufferPoolManager.updatePage(page)
+        // Serialize before caching so the data buffer is current
+        var serializedPage = page
+        try serializedPage.saveRecords()
+
+        await bufferPoolManager.updatePage(serializedPage)
         await bufferPoolManager.markDirty(pageID: page.pageID)
 
         if transactionContext == nil {
-            var pageToWrite = page
-            try await storageManager.writePage(&pageToWrite)
+            try await storageManager.writePage(&serializedPage)
             await bufferPoolManager.clearDirtyFlag(pageID: page.pageID)
         }
     }
