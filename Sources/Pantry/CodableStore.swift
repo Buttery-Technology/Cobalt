@@ -4,8 +4,16 @@ import PantryQuery
 
 /// Codable convenience methods for PantryDatabase
 extension PantryDatabase {
-    private static let codableEncoder = JSONEncoder()
-    private static let codableDecoder = JSONDecoder()
+    private static let codableEncoder: JSONEncoder = {
+        let enc = JSONEncoder()
+        enc.nonConformingFloatEncodingStrategy = .convertToString(positiveInfinity: "+inf", negativeInfinity: "-inf", nan: "nan")
+        return enc
+    }()
+    private static let codableDecoder: JSONDecoder = {
+        let dec = JSONDecoder()
+        dec.nonConformingFloatDecodingStrategy = .convertFromString(positiveInfinity: "+inf", negativeInfinity: "-inf", nan: "nan")
+        return dec
+    }()
 
     /// Store a Codable value in a collection with an optional ID
     public func store<T: Codable & Sendable>(_ value: T, id: String? = nil, in collection: String) async throws -> String {

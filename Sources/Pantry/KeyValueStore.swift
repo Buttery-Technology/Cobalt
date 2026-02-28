@@ -5,8 +5,16 @@ import PantryQuery
 /// Key-value convenience methods for PantryDatabase
 extension PantryDatabase {
     private static let kvTableName = "_pantry_kv"
-    private static let kvEncoder = JSONEncoder()
-    private static let kvDecoder = JSONDecoder()
+    private static let kvEncoder: JSONEncoder = {
+        let enc = JSONEncoder()
+        enc.nonConformingFloatEncodingStrategy = .convertToString(positiveInfinity: "+inf", negativeInfinity: "-inf", nan: "nan")
+        return enc
+    }()
+    private static let kvDecoder: JSONDecoder = {
+        let dec = JSONDecoder()
+        dec.nonConformingFloatDecodingStrategy = .convertFromString(positiveInfinity: "+inf", negativeInfinity: "-inf", nan: "nan")
+        return dec
+    }()
 
     /// Set a key-value pair
     public func set(_ key: String, value: DBValue) async throws {
