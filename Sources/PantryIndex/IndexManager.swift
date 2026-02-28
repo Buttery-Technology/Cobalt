@@ -149,6 +149,12 @@ public actor IndexManager: IndexHook, Sendable {
             }
             return nil
 
+        case .between(let column, let min, let max):
+            if let index = tableIndexes[column] {
+                return try await index.searchRange(from: min, to: max)
+            }
+            return nil
+
         case .and(let conditions):
             // Try index on first indexable condition
             for sub in conditions {

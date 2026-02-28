@@ -463,7 +463,10 @@ public actor BTree: Sendable {
             }
             current = lastChild
         }
-        return (current.keys.last!, current.values.last!)
+        guard let key = current.keys.last, let value = current.values.last else {
+            throw PantryError.indexCorrupted(description: "Predecessor leaf node is empty")
+        }
+        return (key, value)
     }
 
     private func getSuccessor(node: BTreeNode) async throws -> (DBValue, Row) {
@@ -475,7 +478,10 @@ public actor BTree: Sendable {
             }
             current = firstChild
         }
-        return (current.keys.first!, current.values.first!)
+        guard let key = current.keys.first, let value = current.values.first else {
+            throw PantryError.indexCorrupted(description: "Successor leaf node is empty")
+        }
+        return (key, value)
     }
 
     private func removeFromLeaf(node: BTreeNode, index: Int) {

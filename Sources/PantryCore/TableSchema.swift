@@ -44,3 +44,37 @@ public enum PantryColumnType: String, Codable, Sendable {
     case blob
     case boolean
 }
+
+// MARK: - Column Factory Methods
+
+extension PantryColumn {
+    /// Primary key string column (non-nullable)
+    public static func id(_ name: String = "_id") -> PantryColumn {
+        PantryColumn(name: name, type: .string, isPrimaryKey: true, isNullable: false)
+    }
+
+    /// String column
+    public static func string(_ name: String, nullable: Bool = true, defaultValue: String? = nil) -> PantryColumn {
+        PantryColumn(name: name, type: .string, isNullable: nullable, defaultValue: defaultValue.map { .string($0) })
+    }
+
+    /// Integer column
+    public static func integer(_ name: String, nullable: Bool = true, defaultValue: Int64? = nil) -> PantryColumn {
+        PantryColumn(name: name, type: .integer, isNullable: nullable, defaultValue: defaultValue.map { .integer($0) })
+    }
+
+    /// Double column
+    public static func double(_ name: String, nullable: Bool = true, defaultValue: Double? = nil) -> PantryColumn {
+        PantryColumn(name: name, type: .double, isNullable: nullable, defaultValue: defaultValue.map { .double($0) })
+    }
+
+    /// Boolean column
+    public static func boolean(_ name: String, nullable: Bool = true, defaultValue: Bool? = nil) -> PantryColumn {
+        PantryColumn(name: name, type: .boolean, isNullable: nullable, defaultValue: defaultValue.map { .boolean($0) })
+    }
+
+    /// Blob column
+    public static func blob(_ name: String, nullable: Bool = true) -> PantryColumn {
+        PantryColumn(name: name, type: .blob, isNullable: nullable)
+    }
+}

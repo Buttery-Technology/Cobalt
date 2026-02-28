@@ -128,6 +128,15 @@ public actor QueryExecutor: Sendable {
         case let .greaterThanOrEqual(column, value):
             guard let rowValue = row.values[column], rowValue != .null, value != .null else { return false }
             return rowValue >= value
+        case let .in(column, values):
+            guard let rowValue = row.values[column], rowValue != .null else { return false }
+            return values.contains(rowValue)
+        case let .between(column, min, max):
+            guard let rowValue = row.values[column], rowValue != .null, min != .null, max != .null else { return false }
+            return rowValue >= min && rowValue <= max
+        case let .like(column, pattern):
+            guard let rowValue = row.values[column], case .string(let str) = rowValue else { return false }
+            return matchLikePattern(str, pattern: pattern)
         case let .isNull(column):
             return row.values[column] == nil || row.values[column] == .null
         case let .isNotNull(column):
@@ -147,5 +156,36 @@ public actor QueryExecutor: Sendable {
         let id = nextRecordID
         nextRecordID &+= 1
         return id
+    }
+
+    /// SQL LIKE pattern matching: % matches any sequence, _ matches any single character
+    private func matchLikePattern(_ string: String, pattern: String) -> Bool {
+        let s = Array(string)
+        let p = Array(pattern)
+        var si = 0, pi = 0
+        var starSi = -1, starPi = -1
+
+        while si < s.count {
+            if pi < p.count && p[pi] == "%" {
+                starPi = pi
+                starSi = si
+                pi += 1
+            } else if pi < p.count && (p[pi] == "_" || p[pi] == s[si]) {
+                si += 1
+                pi += 1
+            } else if starPi >= 0 {
+                pi = starPi + 1
+                starSi += 1
+                si = starSi
+            } else {
+                return false
+            }
+        }
+
+        while pi < p.count && p[pi] == "%" {
+            pi += 1
+        }
+
+        return pi == p.count
     }
 }
