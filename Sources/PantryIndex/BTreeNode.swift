@@ -33,11 +33,15 @@ public final class BTreeNode: Codable, @unchecked Sendable {
 
     /// Serialize to binary data for page storage
     public func serialize() throws -> Data {
-        try JSONEncoder().encode(self)
+        let encoder = JSONEncoder()
+        encoder.nonConformingFloatEncodingStrategy = .convertToString(positiveInfinity: "+inf", negativeInfinity: "-inf", nan: "nan")
+        return try encoder.encode(self)
     }
 
     /// Deserialize from binary data
     public static func deserialize(from data: Data) throws -> BTreeNode {
-        try JSONDecoder().decode(BTreeNode.self, from: data)
+        let decoder = JSONDecoder()
+        decoder.nonConformingFloatDecodingStrategy = .convertFromString(positiveInfinity: "+inf", negativeInfinity: "-inf", nan: "nan")
+        return try decoder.decode(BTreeNode.self, from: data)
     }
 }

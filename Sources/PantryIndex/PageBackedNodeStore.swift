@@ -70,6 +70,12 @@ public actor PageBackedNodeStore: Sendable {
         return node.deepCopy()
     }
 
+    /// Remove a node from cache and page map (e.g. after merge absorbs it)
+    public func removeNode(nodeId: UUID) {
+        nodeCache.removeValue(forKey: nodeId)
+        nodePageMap.removeValue(forKey: nodeId)
+    }
+
     /// Flush all dirty index pages to disk
     public func flush() async throws {
         try await bufferPool.flushAllDirtyPages()

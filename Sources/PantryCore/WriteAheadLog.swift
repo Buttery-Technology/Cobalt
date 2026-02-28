@@ -50,6 +50,9 @@ public actor WriteAheadLog: Sendable {
 
         if currentLogPosition == 0 {
             try writeLogHeader()
+        } else {
+            // Recover nextLSN from existing WAL to prevent LSN collisions after restart
+            try recoverNextLSN()
         }
     }
 
@@ -352,6 +355,22 @@ public actor WriteAheadLog: Sendable {
                 logCache.removeValue(forKey: key)
             }
         }
+    }
+
+    // MARK: - Recovery Helpers
+
+    /// Scan WAL file to recover nextLSN after restart (prevents LSN collisions)
+    private func recoverNextLSN() throws {
+        let records = try getAllLogRecords()
+        if let maxLSN = records.map({ $0.lsn }).max() {
+            nextLSN = maxLSN + 1
+        }
+    }
+
+    /// Return the maximum transaction ID found in the WAL (for TransactionManager recovery)
+    public func recoverMaxTransactionID() throws -> UInt64 {
+        let records = try getAllLogRecords()
+        return records.map { $0.transactionID }.max() ?? 0
     }
 
     // MARK: - Cleanup
