@@ -20,10 +20,15 @@ public enum DBValue: Codable, Comparable, Hashable, Sendable {
         case let (.integer(a), .integer(b)):
             return a < b
         case let (.double(a), .double(b)):
+            // NaN sorts after all non-NaN doubles for total ordering
+            if a.isNaN { return false }
+            if b.isNaN { return true }
             return a < b
         case let (.integer(a), .double(b)):
+            if b.isNaN { return true }
             return Double(a) < b
         case let (.double(a), .integer(b)):
+            if a.isNaN { return false }
             return a < Double(b)
         case let (.string(a), .string(b)):
             return a < b

@@ -307,9 +307,22 @@ public actor StorageEngine: Sendable {
             tableInfo.firstPageID = newPage.pageID
             tableInfo.lastPageID = newPage.pageID
         } else {
-            var lastPage = try await getPage(pageID: tableInfo.lastPageID)
-            lastPage.nextPageID = newPage.pageID
-            try await savePage(lastPage)
+            // Walk the chain to find the true last page — the cached lastPageID may be
+            // stale after a crash (registry not persisted on every page allocation)
+            var currentPageID = tableInfo.lastPageID
+            var visited: Set<Int> = []
+            while true {
+                guard visited.insert(currentPageID).inserted else { break }
+                let page = try await getPage(pageID: currentPageID)
+                if page.nextPageID == 0 {
+                    // Found the real tail
+                    var tailPage = page
+                    tailPage.nextPageID = newPage.pageID
+                    try await savePage(tailPage)
+                    break
+                }
+                currentPageID = page.nextPageID
+            }
             tableInfo.lastPageID = newPage.pageID
         }
 
