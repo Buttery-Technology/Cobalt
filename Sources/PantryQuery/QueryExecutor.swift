@@ -39,7 +39,7 @@ public actor QueryExecutor: Sendable {
         }
 
         // Project only requested columns
-        if let columns = columns {
+        if let columns = columns, !columns.isEmpty {
             return rows.map { row in
                 let projectedValues = columns.reduce(into: [String: DBValue]()) { result, column in
                     result[column] = row.values[column] ?? .null

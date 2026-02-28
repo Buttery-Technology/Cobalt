@@ -20,7 +20,12 @@ public actor PageBackedNodeStore: Sendable {
         let record = Record(id: nodeId(node.nodeId), data: data)
 
         if let existingPageID = nodePageMap[node.nodeId] {
-            // Update existing page
+            // Update existing page — validate serialized node fits
+            let recordSize = record.serialize().count
+            let maxRecordSize = PantryConstants.PAGE_SIZE - PantryConstants.PAGE_HEADER_SIZE - PantryConstants.SLOT_SIZE
+            guard recordSize <= maxRecordSize else {
+                throw PantryError.pageOverflow
+            }
             var page = try await bufferPool.getPage(pageID: existingPageID)
             page.records = [record]
             page.recordCount = 1
