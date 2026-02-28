@@ -34,11 +34,16 @@ extension PantryDatabase {
     public func get(_ key: String) async throws -> DBValue? {
         guard await tableExists(Self.kvTableName) else { return nil }
 
-        let rows = try await select(
-            from: Self.kvTableName,
-            columns: ["_value"],
-            where: .equals(column: "_key", value: .string(key))
-        )
+        let rows: [Row]
+        do {
+            rows = try await select(
+                from: Self.kvTableName,
+                columns: ["_value"],
+                where: .equals(column: "_key", value: .string(key))
+            )
+        } catch PantryError.tableNotFound {
+            return nil // Table dropped between exists check and select
+        }
 
         return rows.first?.values["_value"]
     }
@@ -65,7 +70,11 @@ extension PantryDatabase {
     /// Delete a key
     public func delete(key: String) async throws {
         guard await tableExists(Self.kvTableName) else { return }
-        _ = try await delete(from: Self.kvTableName, where: .equals(column: "_key", value: .string(key)))
+        do {
+            _ = try await delete(from: Self.kvTableName, where: .equals(column: "_key", value: .string(key)))
+        } catch PantryError.tableNotFound {
+            return // Table dropped between exists check and delete
+        }
     }
 
     /// Ensure the KV table exists

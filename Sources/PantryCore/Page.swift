@@ -75,6 +75,12 @@ public struct DatabasePage: Sendable {
             recordCount = 0
         }
 
+        // Validate freeSpaceOffset bounds — corrupted values can cause out-of-bounds access
+        if freeSpaceOffset < PantryConstants.PAGE_HEADER_SIZE || freeSpaceOffset > PantryConstants.PAGE_SIZE {
+            freeSpaceOffset = PantryConstants.PAGE_SIZE
+            recordCount = 0
+        }
+
         recordSlots = []
         for _ in 0..<recordCount {
             guard position + PantryConstants.SLOT_SIZE <= data.count else { break }
