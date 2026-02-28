@@ -79,9 +79,14 @@ public actor BTree: Sendable {
 
         try await deleteFromNode(node: root, key: key, row: row)
 
-        if root.keys.isEmpty && !root.isLeaf {
-            if let newRootId = root.children?.first {
+        if root.keys.isEmpty {
+            if root.isLeaf {
+                // Tree is now empty — reset rootId
+                self.rootId = nil
+                await nodeStore.removeNode(nodeId: rootId)
+            } else if let newRootId = root.children?.first {
                 self.rootId = newRootId
+                await nodeStore.removeNode(nodeId: rootId)
             }
         } else {
             try await nodeStore.saveNode(root)

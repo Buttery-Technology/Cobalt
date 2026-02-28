@@ -41,22 +41,23 @@ public actor TableRegistry: Sendable {
 
         // Read registry pages starting from page 1
         for pageID in PantryConstants.SYSTEM_PAGE_TABLE_REGISTRY_START..<totalPages {
+            let page: DatabasePage
             do {
-                let page = try await storageManager.readPage(pageID: pageID)
-                guard PageFlags(rawValue: page.flags).contains(.tableRegistry) else {
-                    break
-                }
-                // Each record on a registry page is a JSON-encoded TableInfo
-                for record in page.records {
-                    if let info = try? JSONDecoder().decode(TableInfo.self, from: record.data) {
-                        tables[info.name] = info
-                        if info.tableID >= nextTableID {
-                            nextTableID = info.tableID + 1
-                        }
+                page = try await storageManager.readPage(pageID: pageID)
+            } catch {
+                continue // Skip corrupted pages; salvage what we can
+            }
+            guard PageFlags(rawValue: page.flags).contains(.tableRegistry) else {
+                break
+            }
+            // Each record on a registry page is a JSON-encoded TableInfo
+            for record in page.records {
+                if let info = try? JSONDecoder().decode(TableInfo.self, from: record.data) {
+                    tables[info.name] = info
+                    if info.tableID >= nextTableID {
+                        nextTableID = info.tableID + 1
                     }
                 }
-            } catch {
-                break
             }
         }
     }

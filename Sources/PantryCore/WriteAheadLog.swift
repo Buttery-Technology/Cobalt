@@ -359,18 +359,60 @@ public actor WriteAheadLog: Sendable {
 
     // MARK: - Recovery Helpers
 
-    /// Scan WAL file to recover nextLSN after restart (prevents LSN collisions)
+    /// Scan only the persisted WAL file to recover nextLSN (ignores logCache to avoid stale entries)
     private func recoverNextLSN() throws {
-        let records = try getAllLogRecords()
+        let records = try parsePersistedRecords()
         if let maxLSN = records.map({ $0.lsn }).max() {
             nextLSN = maxLSN + 1
         }
     }
 
-    /// Return the maximum transaction ID found in the WAL (for TransactionManager recovery)
+    /// Return the maximum transaction ID found in the persisted WAL (for TransactionManager recovery)
     public func recoverMaxTransactionID() throws -> UInt64 {
-        let records = try getAllLogRecords()
+        let records = try parsePersistedRecords()
         return records.map { $0.transactionID }.max() ?? 0
+    }
+
+    /// Parse only the on-disk WAL records without merging logCache
+    private func parsePersistedRecords() throws -> [LogRecord] {
+        guard let handle = logFileHandle else {
+            throw PantryError.logReadError
+        }
+
+        try handle.seek(toOffset: 0)
+        guard let allData = try handle.availableData() else {
+            return []
+        }
+
+        if allData.count <= 64 {
+            return []
+        }
+
+        var records: [LogRecord] = []
+        var pos = 64
+
+        while pos + 8 <= allData.count {
+            let totalLength = allData.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: pos, as: UInt32.self) }
+            let storedCRC = allData.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: pos + 4, as: UInt32.self) }
+            pos += 8
+
+            let dataLength = Int(totalLength) - 8
+            guard dataLength > 0, pos + dataLength <= allData.count else { break }
+
+            let recordData = allData.subdata(in: pos..<(pos + dataLength))
+            let computedCRC = CRC32.checksum(recordData)
+            guard computedCRC == storedCRC else {
+                pos += dataLength
+                continue
+            }
+
+            if let record = parseLogRecord(recordData) {
+                records.append(record)
+            }
+            pos += dataLength
+        }
+
+        return records
     }
 
     // MARK: - Cleanup
