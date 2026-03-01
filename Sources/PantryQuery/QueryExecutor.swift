@@ -24,8 +24,8 @@ public actor QueryExecutor: Sendable {
 
     // MARK: - SELECT
 
-    public func executeSelect(from table: String, columns: [String]? = nil, where condition: WhereCondition? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {
-        let rows: [Row]
+    public func executeSelect(from table: String, columns: [String]? = nil, where condition: WhereCondition? = nil, modifiers: QueryModifiers? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {
+        var rows: [Row]
 
         // Attempt index lookup — skip if selectivity is too low (>30% of table)
         if let condition = condition,
@@ -90,6 +90,38 @@ public actor QueryExecutor: Sendable {
             }
         }
 
+        // Apply query modifiers: DISTINCT, ORDER BY, OFFSET, LIMIT
+        if let mods = modifiers {
+            // DISTINCT — deduplicate before sorting
+            if mods.distinct {
+                rows = deduplicateRows(rows, columns: columns)
+            }
+
+            // ORDER BY
+            if let orderBy = mods.orderBy, !orderBy.isEmpty {
+                rows.sort { a, b in
+                    for clause in orderBy {
+                        let aVal = a.values[clause.column] ?? .null
+                        let bVal = b.values[clause.column] ?? .null
+                        if aVal == bVal { continue }
+                        let less = aVal < bVal
+                        return clause.direction == .ascending ? less : !less
+                    }
+                    return false
+                }
+            }
+
+            // OFFSET
+            if let offset = mods.offset, offset > 0 {
+                rows = Array(rows.dropFirst(offset))
+            }
+
+            // LIMIT
+            if let limit = mods.limit, limit >= 0 {
+                rows = Array(rows.prefix(limit))
+            }
+        }
+
         // Project only requested columns
         if let columns = columns, !columns.isEmpty {
             return rows.map { row in
@@ -103,9 +135,202 @@ public actor QueryExecutor: Sendable {
         return rows
     }
 
+    // MARK: - JOIN
+
+    public func executeJoin(from table: String, joins: [JoinClause], columns: [String]? = nil, where condition: WhereCondition? = nil, modifiers: QueryModifiers? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {
+        // Start with rows from the left (primary) table
+        let leftRows = try await scanAllRows(table: table, transactionContext: transactionContext)
+
+        var result = leftRows.map { row in
+            // Prefix left table columns with "tableName."
+            var prefixed = [String: DBValue]()
+            for (k, v) in row.values { prefixed["\(table).\(k)"] = v; prefixed[k] = v }
+            return Row(values: prefixed)
+        }
+
+        // Process each join in sequence
+        for join in joins {
+            let rightRows = try await scanAllRows(table: join.table, transactionContext: transactionContext)
+
+            switch join.type {
+            case .inner:
+                result = innerJoin(left: result, right: rightRows, join: join)
+            case .left:
+                result = leftJoin(left: result, right: rightRows, join: join)
+            case .right:
+                result = rightJoin(left: result, right: rightRows, join: join)
+            case .cross:
+                result = crossJoin(left: result, right: rightRows, join: join)
+            }
+        }
+
+        // Apply WHERE filter
+        if let condition = condition {
+            result = result.filter { evaluateCondition(condition, row: $0) }
+        }
+
+        // Apply modifiers (DISTINCT, ORDER BY, OFFSET, LIMIT)
+        if let mods = modifiers {
+            if mods.distinct { result = deduplicateRows(result, columns: columns) }
+            if let orderBy = mods.orderBy, !orderBy.isEmpty {
+                result.sort { a, b in
+                    for clause in orderBy {
+                        let aVal = a.values[clause.column] ?? .null
+                        let bVal = b.values[clause.column] ?? .null
+                        if aVal == bVal { continue }
+                        let less = aVal < bVal
+                        return clause.direction == .ascending ? less : !less
+                    }
+                    return false
+                }
+            }
+            if let offset = mods.offset, offset > 0 { result = Array(result.dropFirst(offset)) }
+            if let limit = mods.limit, limit >= 0 { result = Array(result.prefix(limit)) }
+        }
+
+        // Project columns
+        if let columns = columns, !columns.isEmpty {
+            return result.map { row in
+                let projected = columns.reduce(into: [String: DBValue]()) { r, c in r[c] = row.values[c] ?? .null }
+                return Row(values: projected)
+            }
+        }
+
+        return result
+    }
+
+    // MARK: - GROUP BY
+
+    public func executeGroupBy(from table: String, select expressions: [SelectExpression], where condition: WhereCondition? = nil, groupBy: GroupByClause, modifiers: QueryModifiers? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {
+        // Get filtered rows
+        let baseRows = try await executeSelect(from: table, where: condition, transactionContext: transactionContext)
+
+        // Group rows by the specified columns
+        var groups = [[DBValue]: [Row]]()
+        for row in baseRows {
+            let key = groupBy.columns.map { row.values[$0] ?? .null }
+            groups[key, default: []].append(row)
+        }
+
+        // Compute aggregates per group
+        var resultRows = [Row]()
+        for (key, groupRows) in groups {
+            var values = [String: DBValue]()
+
+            // Add group key columns
+            for (i, col) in groupBy.columns.enumerated() {
+                values[col] = key[i]
+            }
+
+            // Compute each select expression
+            for expr in expressions {
+                switch expr {
+                case .column(let name):
+                    // Use value from first row in group (same for all grouped rows)
+                    values[name] = groupRows.first?.values[name] ?? .null
+
+                case .count(let col):
+                    let alias = col.map { "COUNT(\($0))" } ?? "COUNT(*)"
+                    if let col = col {
+                        let count = groupRows.filter { $0.values[col] != nil && $0.values[col] != .null }.count
+                        values[alias] = .integer(Int64(count))
+                    } else {
+                        values[alias] = .integer(Int64(groupRows.count))
+                    }
+
+                case .sum(let col):
+                    let alias = "SUM(\(col))"
+                    var sum: Double = 0
+                    var hasValue = false
+                    for row in groupRows {
+                        if let v = numericValue(row.values[col]) { sum += v; hasValue = true }
+                    }
+                    values[alias] = hasValue ? .double(sum) : .null
+
+                case .avg(let col):
+                    let alias = "AVG(\(col))"
+                    var sum: Double = 0; var count = 0
+                    for row in groupRows {
+                        if let v = numericValue(row.values[col]) { sum += v; count += 1 }
+                    }
+                    values[alias] = count > 0 ? .double(sum / Double(count)) : .null
+
+                case .min(let col):
+                    let alias = "MIN(\(col))"
+                    var result: DBValue = .null
+                    for row in groupRows {
+                        if let v = row.values[col], v != .null, result == .null || v < result { result = v }
+                    }
+                    values[alias] = result
+
+                case .max(let col):
+                    let alias = "MAX(\(col))"
+                    var result: DBValue = .null
+                    for row in groupRows {
+                        if let v = row.values[col], v != .null, result == .null || v > result { result = v }
+                    }
+                    values[alias] = result
+                }
+            }
+
+            let groupRow = Row(values: values)
+
+            // Apply HAVING filter
+            if let having = groupBy.having {
+                if evaluateCondition(having, row: groupRow) {
+                    resultRows.append(groupRow)
+                }
+            } else {
+                resultRows.append(groupRow)
+            }
+        }
+
+        // Apply modifiers
+        if let mods = modifiers {
+            if mods.distinct { resultRows = deduplicateRows(resultRows, columns: nil) }
+            if let orderBy = mods.orderBy, !orderBy.isEmpty {
+                resultRows.sort { a, b in
+                    for clause in orderBy {
+                        let aVal = a.values[clause.column] ?? .null
+                        let bVal = b.values[clause.column] ?? .null
+                        if aVal == bVal { continue }
+                        return clause.direction == .ascending ? (aVal < bVal) : !(aVal < bVal)
+                    }
+                    return false
+                }
+            }
+            if let offset = mods.offset, offset > 0 { resultRows = Array(resultRows.dropFirst(offset)) }
+            if let limit = mods.limit, limit >= 0 { resultRows = Array(resultRows.prefix(limit)) }
+        }
+
+        return resultRows
+    }
+
     // MARK: - INSERT
 
     public func executeInsert(into table: String, row: Row, transactionContext: TransactionContext? = nil) async throws {
+        // Enforce primary key uniqueness if schema defines one
+        if let schema = await storageEngine.getTableSchema(table),
+           let pkColumn = schema.primaryKeyColumn {
+            if let pkValue = row.values[pkColumn.name], pkValue != .null {
+                // Check index first if available, otherwise scan
+                if let indexed = try await indexManager.attemptIndexLookup(
+                    tableName: table,
+                    condition: .equals(column: pkColumn.name, value: pkValue)
+                ), !indexed.isEmpty {
+                    throw PantryError.primaryKeyViolation
+                } else if !(await indexManager.hasIndex(tableName: table, columnName: pkColumn.name)) {
+                    // No index — fall back to scan
+                    let existing = try await executeSelect(from: table, columns: [pkColumn.name], where: .equals(column: pkColumn.name, value: pkValue), transactionContext: transactionContext)
+                    if !existing.isEmpty {
+                        throw PantryError.primaryKeyViolation
+                    }
+                }
+            } else if !pkColumn.isNullable {
+                throw PantryError.notNullConstraintViolation(column: pkColumn.name)
+            }
+        }
+
         let rowData = row.toBytes()
         let recordID = generateRecordID()
         let record = Record(id: recordID, data: rowData)
@@ -115,6 +340,17 @@ public actor QueryExecutor: Sendable {
     // MARK: - UPDATE
 
     public func executeUpdate(table: String, set values: [String: DBValue], where condition: WhereCondition?, transactionContext: TransactionContext? = nil) async throws -> Int {
+        // If updating PK column, validate uniqueness of new PK value
+        if let schema = await storageEngine.getTableSchema(table),
+           let pkColumn = schema.primaryKeyColumn,
+           let newPKValue = values[pkColumn.name], newPKValue != .null {
+            let existing = try await executeSelect(from: table, columns: [pkColumn.name], where: .equals(column: pkColumn.name, value: newPKValue), transactionContext: transactionContext)
+            // Allow if the only match is the row being updated (checked below per-row)
+            if existing.count > 1 {
+                throw PantryError.primaryKeyViolation
+            }
+        }
+
         // Try index-accelerated path: index returns slim rows with __rid, batch-fetch full records
         if let condition = condition,
            let indexedRows = try await indexManager.attemptIndexLookup(tableName: table, condition: condition) {
@@ -418,6 +654,145 @@ public actor QueryExecutor: Sendable {
         default:
             return true // For range queries, between, etc. — always use index
         }
+    }
+
+    // MARK: - JOIN Helpers
+
+    private func scanAllRows(table: String, transactionContext: TransactionContext? = nil) async throws -> [Row] {
+        let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
+        return try await withThrowingTaskGroup(of: (Int, [Row]).self) { group in
+            for (index, pageID) in pageIDs.enumerated() {
+                group.addTask { [storageEngine] in
+                    let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+                    return (index, page.records.compactMap { Row.fromBytes($0.data) })
+                }
+            }
+            var indexed: [(Int, [Row])] = []
+            for try await result in group { indexed.append(result) }
+            return indexed.sorted { $0.0 < $1.0 }.flatMap { $0.1 }
+        }
+    }
+
+    private nonisolated func prefixRow(_ row: Row, table: String) -> [String: DBValue] {
+        var values = [String: DBValue]()
+        for (k, v) in row.values {
+            values["\(table).\(k)"] = v
+            values[k] = v
+        }
+        return values
+    }
+
+    private nonisolated func innerJoin(left: [Row], right: [Row], join: JoinClause) -> [Row] {
+        // Build hash table on right side for O(n+m) join
+        var hashTable = [DBValue: [Row]]()
+        for row in right {
+            let key = row.values[join.rightColumn] ?? .null
+            if key != .null { hashTable[key, default: []].append(row) }
+        }
+
+        var result = [Row]()
+        for leftRow in left {
+            let leftKey = leftRow.values[join.leftColumn] ?? .null
+            guard leftKey != .null, let matches = hashTable[leftKey] else { continue }
+            for rightRow in matches {
+                var combined = leftRow.values
+                for (k, v) in rightRow.values { combined["\(join.table).\(k)"] = v; combined[k] = v }
+                result.append(Row(values: combined))
+            }
+        }
+        return result
+    }
+
+    private nonisolated func leftJoin(left: [Row], right: [Row], join: JoinClause) -> [Row] {
+        var hashTable = [DBValue: [Row]]()
+        var rightColumns = Set<String>()
+        for row in right {
+            let key = row.values[join.rightColumn] ?? .null
+            if key != .null { hashTable[key, default: []].append(row) }
+            rightColumns.formUnion(row.values.keys)
+        }
+
+        var result = [Row]()
+        for leftRow in left {
+            let leftKey = leftRow.values[join.leftColumn] ?? .null
+            if leftKey != .null, let matches = hashTable[leftKey] {
+                for rightRow in matches {
+                    var combined = leftRow.values
+                    for (k, v) in rightRow.values { combined["\(join.table).\(k)"] = v; combined[k] = v }
+                    result.append(Row(values: combined))
+                }
+            } else {
+                // No match — fill right columns with NULL
+                var combined = leftRow.values
+                for col in rightColumns { combined["\(join.table).\(col)"] = .null }
+                result.append(Row(values: combined))
+            }
+        }
+        return result
+    }
+
+    private nonisolated func rightJoin(left: [Row], right: [Row], join: JoinClause) -> [Row] {
+        // Right join = reverse left join
+        var hashTable = [DBValue: [Row]]()
+        var leftColumns = Set<String>()
+        for leftRow in left {
+            let key = leftRow.values[join.leftColumn] ?? .null
+            if key != .null { hashTable[key, default: []].append(leftRow) }
+            leftColumns.formUnion(leftRow.values.keys)
+        }
+
+        var result = [Row]()
+        for rightRow in right {
+            var rightPrefixed = [String: DBValue]()
+            for (k, v) in rightRow.values { rightPrefixed["\(join.table).\(k)"] = v; rightPrefixed[k] = v }
+
+            let rightKey = rightRow.values[join.rightColumn] ?? .null
+            if rightKey != .null, let matches = hashTable[rightKey] {
+                for leftRow in matches {
+                    var combined = leftRow.values
+                    combined.merge(rightPrefixed) { _, new in new }
+                    result.append(Row(values: combined))
+                }
+            } else {
+                var combined = rightPrefixed
+                for col in leftColumns { if combined[col] == nil { combined[col] = .null } }
+                result.append(Row(values: combined))
+            }
+        }
+        return result
+    }
+
+    private nonisolated func crossJoin(left: [Row], right: [Row], join: JoinClause) -> [Row] {
+        var result = [Row]()
+        result.reserveCapacity(left.count * right.count)
+        for leftRow in left {
+            for rightRow in right {
+                var combined = leftRow.values
+                for (k, v) in rightRow.values { combined["\(join.table).\(k)"] = v; combined[k] = v }
+                result.append(Row(values: combined))
+            }
+        }
+        return result
+    }
+
+    // MARK: - DISTINCT Helper
+
+    private nonisolated func deduplicateRows(_ rows: [Row], columns: [String]?) -> [Row] {
+        var seen = Set<Row>()
+        var unique = [Row]()
+        for row in rows {
+            let key: Row
+            if let columns = columns, !columns.isEmpty {
+                let projected = columns.reduce(into: [String: DBValue]()) { r, c in r[c] = row.values[c] ?? .null }
+                key = Row(values: projected)
+            } else {
+                key = row
+            }
+            if seen.insert(key).inserted {
+                unique.append(row)
+            }
+        }
+        return unique
     }
 
     // MARK: - Helpers

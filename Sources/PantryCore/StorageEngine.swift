@@ -37,7 +37,7 @@ public actor StorageEngine: Sendable {
         let sm = try StorageManager(databasePath: databasePath, encryptionProvider: encryptionProvider)
         self.storageManager = sm
         self.bufferPoolManager = BufferPoolManager(capacity: bufferPoolCapacity, storageManager: sm)
-        self.logManager = try await WriteAheadLog(databasePath: databasePath, storageManager: sm)
+        self.logManager = try await WriteAheadLog(databasePath: databasePath, storageManager: sm, encryptionProvider: encryptionProvider)
         self.transactionManager = try await TransactionManager(logManager: logManager)
         self.tableRegistry = TableRegistry(storageManager: sm, bufferPool: bufferPoolManager)
 

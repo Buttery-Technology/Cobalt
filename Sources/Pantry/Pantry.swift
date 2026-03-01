@@ -55,6 +55,11 @@ public actor PantryDatabase: Sendable {
 
     public func createTable(_ schema: PantryTableSchema) async throws {
         try await storageEngine.createTable(schema)
+
+        // Auto-create index on primary key column for fast uniqueness checks
+        if let pkColumn = schema.primaryKeyColumn {
+            try await createIndex(table: schema.name, column: pkColumn.name)
+        }
     }
 
     public func dropTable(_ name: String) async throws {
@@ -130,8 +135,56 @@ public actor PantryDatabase: Sendable {
 
     // MARK: - Queries
 
-    public func select(from table: String, columns: [String]? = nil, where condition: WhereCondition? = nil) async throws -> [Row] {
-        try await queryExecutor.executeSelect(from: table, columns: columns, where: condition, transactionContext: currentTransactionContext)
+    public func select(
+        from table: String,
+        columns: [String]? = nil,
+        where condition: WhereCondition? = nil,
+        orderBy: [OrderBy]? = nil,
+        limit: Int? = nil,
+        offset: Int? = nil,
+        distinct: Bool = false
+    ) async throws -> [Row] {
+        let mods: QueryModifiers? = (orderBy != nil || limit != nil || offset != nil || distinct)
+            ? QueryModifiers(orderBy: orderBy, limit: limit, offset: offset, distinct: distinct)
+            : nil
+        return try await queryExecutor.executeSelect(from: table, columns: columns, where: condition, modifiers: mods, transactionContext: currentTransactionContext)
+    }
+
+    // MARK: - JOIN Queries
+
+    public func select(
+        from table: String,
+        join joins: [JoinClause],
+        columns: [String]? = nil,
+        where condition: WhereCondition? = nil,
+        orderBy: [OrderBy]? = nil,
+        limit: Int? = nil,
+        offset: Int? = nil,
+        distinct: Bool = false
+    ) async throws -> [Row] {
+        let mods: QueryModifiers? = (orderBy != nil || limit != nil || offset != nil || distinct)
+            ? QueryModifiers(orderBy: orderBy, limit: limit, offset: offset, distinct: distinct)
+            : nil
+        return try await queryExecutor.executeJoin(from: table, joins: joins, columns: columns, where: condition, modifiers: mods, transactionContext: currentTransactionContext)
+    }
+
+    // MARK: - GROUP BY Queries
+
+    public func select(
+        from table: String,
+        select expressions: [SelectExpression],
+        where condition: WhereCondition? = nil,
+        groupBy columns: [String],
+        having: WhereCondition? = nil,
+        orderBy: [OrderBy]? = nil,
+        limit: Int? = nil,
+        offset: Int? = nil
+    ) async throws -> [Row] {
+        let groupByClause = GroupByClause(columns: columns, having: having)
+        let mods: QueryModifiers? = (orderBy != nil || limit != nil || offset != nil)
+            ? QueryModifiers(orderBy: orderBy, limit: limit, offset: offset)
+            : nil
+        return try await queryExecutor.executeGroupBy(from: table, select: expressions, where: condition, groupBy: groupByClause, modifiers: mods, transactionContext: currentTransactionContext)
     }
 
     public func insert(into table: String, values: [String: DBValue]) async throws {
