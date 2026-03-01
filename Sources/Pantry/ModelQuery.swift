@@ -141,6 +141,7 @@ public struct ModelQuery<M: PantryModel>: Sendable {
 
 extension PantryDatabase {
     /// Save a model instance (upsert). Auto-creates the table on first use.
+    /// Detects schema drift and auto-migrates new optional columns.
     public func save<M: PantryModel>(_ model: M) async throws {
         // Encode model to [String: DBValue]
         let values = try DBValueEncoder.encode(model)
@@ -153,6 +154,9 @@ extension PantryDatabase {
             } catch PantryError.tableAlreadyExists {
                 // Race condition: another call created it
             }
+        } else {
+            // Table exists — check for schema drift and auto-migrate additive changes
+            try await autoMigrate(for: model)
         }
 
         // Atomic upsert: delete + insert in a transaction so failure doesn't lose data
