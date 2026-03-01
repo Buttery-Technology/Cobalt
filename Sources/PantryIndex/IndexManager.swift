@@ -110,6 +110,17 @@ public actor IndexManager: IndexHook, Sendable {
         indexes.removeValue(forKey: tableName)
     }
 
+    /// List all indexes on a table as (column, isCompound) pairs
+    public func listIndexes(tableName: String) -> [(column: String, isCompound: Bool)] {
+        guard let tableIndexes = indexes[tableName] else { return [] }
+        return tableIndexes.map { (column: $0.key, isCompound: $0.value.compoundColumns != nil) }
+    }
+
+    /// Drop a single index by table and column name
+    public func dropIndex(tableName: String, columnName: String) {
+        indexes[tableName]?.removeValue(forKey: columnName)
+    }
+
     // MARK: - Persistence
 
     /// Save all index metadata to a registry page

@@ -107,6 +107,14 @@ public actor PantryDatabase: Sendable {
         }
     }
 
+    public func listIndexes(on table: String) async -> [(column: String, isCompound: Bool)] {
+        await indexManager.listIndexes(tableName: table)
+    }
+
+    public func dropIndex(table: String, column: String) async {
+        await indexManager.dropIndex(tableName: table, columnName: column)
+    }
+
     // MARK: - Queries
 
     public func select(from table: String, columns: [String]? = nil, where condition: WhereCondition? = nil) async throws -> [Row] {
@@ -128,6 +136,20 @@ public actor PantryDatabase: Sendable {
 
     public func aggregate(from table: String, _ function: AggregateFunction, where condition: WhereCondition? = nil) async throws -> DBValue {
         try await queryExecutor.executeAggregate(from: table, function, where: condition, transactionContext: currentTransactionContext)
+    }
+
+    public func count(from table: String, where condition: WhereCondition? = nil) async throws -> Int {
+        let result = try await queryExecutor.executeAggregate(from: table, .count(column: nil), where: condition, transactionContext: currentTransactionContext)
+        if case .integer(let v) = result { return Int(v) }
+        return 0
+    }
+
+    public func insertAll(into table: String, rows: [[String: DBValue]]) async throws {
+        try await transaction { db in
+            for row in rows {
+                try await db.insert(into: table, values: row)
+            }
+        }
     }
 
     /// Stream rows from a table, yielding one row at a time for memory-efficient processing.
