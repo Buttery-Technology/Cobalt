@@ -1068,6 +1068,273 @@ import Foundation
     try await db.close()
 }
 
+// MARK: - WAL Rollback Tests
+
+@Test func testRollbackRestoresOriginalData() async throws {
+    let path = NSTemporaryDirectory() + "pantry_rollback_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    try await db.createTable(PantryTableSchema(name: "data", columns: [
+        .id(), .integer("value"),
+    ]))
+    try await db.insert(into: "data", values: ["_id": .string("k1"), "value": .integer(42)])
+
+    struct TestError: Error {}
+
+    // Transaction that modifies data then throws — should rollback
+    do {
+        try await db.transaction { tx in
+            _ = try await tx.update(table: "data", set: ["value": .integer(999)],
+                where: .equals(column: "_id", value: .string("k1")))
+            throw TestError()
+        }
+    } catch is TestError {}
+
+    // Value should be restored to original after rollback
+    let rows = try await db.select(from: "data",
+        where: .equals(column: "_id", value: .string("k1")))
+    #expect(rows.count == 1)
+    #expect(rows[0]["value"] == .integer(42))
+
+    try await db.close()
+}
+
+@Test func testRollbackAfterMultiPageModifications() async throws {
+    let path = NSTemporaryDirectory() + "pantry_rollback_multi_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    try await db.createTable(PantryTableSchema(name: "items", columns: [
+        .id(), .integer("value"),
+    ]))
+
+    // Insert enough records to span multiple pages
+    for i in 0..<20 {
+        try await db.insert(into: "items", values: [
+            "_id": .string("item_\(i)"), "value": .integer(Int64(i)),
+        ])
+    }
+
+    struct TestError: Error {}
+
+    // Transaction that modifies multiple records then fails
+    do {
+        try await db.transaction { tx in
+            _ = try await tx.update(table: "items",
+                set: ["value": .integer(999)])
+            throw TestError()
+        }
+    } catch is TestError {}
+
+    // All values should be restored
+    let rows = try await db.select(from: "items")
+    #expect(rows.count == 20)
+    for row in rows {
+        #expect(row["value"] != .integer(999))
+    }
+
+    try await db.close()
+}
+
+// MARK: - WAL Checkpoint Tests
+
+@Test func testWALCheckpointShrinks() async throws {
+    let path = NSTemporaryDirectory() + "pantry_ckpt_\(UUID().uuidString).pantry"
+    let walPath = path + ".wal"
+    defer {
+        try? FileManager.default.removeItem(atPath: path)
+        try? FileManager.default.removeItem(atPath: walPath)
+    }
+
+    let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    try await db.createTable(PantryTableSchema(name: "data", columns: [
+        .id(), .string("value"),
+    ]))
+
+    // Insert data to grow the WAL
+    for i in 0..<50 {
+        try await db.insert(into: "data", values: [
+            "_id": .string("k\(i)"), "value": .string("val_\(i)"),
+        ])
+    }
+
+    try await db.close()
+
+    // WAL should be small (header only = 64 bytes) after checkpoint on close
+    let walData = try Data(contentsOf: URL(fileURLWithPath: walPath))
+    #expect(walData.count == 64, "WAL should be truncated to header-only after checkpoint")
+}
+
+@Test func testDataIntactAfterCheckpointAndReopen() async throws {
+    let path = NSTemporaryDirectory() + "pantry_ckpt_reopen_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db1 = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    try await db1.createTable(PantryTableSchema(name: "items", columns: [
+        .id(), .integer("value"),
+    ]))
+    for i in 0..<20 {
+        try await db1.insert(into: "items", values: [
+            "_id": .string("item_\(i)"), "value": .integer(Int64(i)),
+        ])
+    }
+    try await db1.close() // Triggers checkpoint
+
+    // Reopen and verify all data survived
+    let db2 = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    let rows = try await db2.select(from: "items")
+    #expect(rows.count == 20)
+    try await db2.close()
+}
+
+// MARK: - Index Persistence Tests
+
+@Test func testIndexPersistsAcrossRestart() async throws {
+    let path = NSTemporaryDirectory() + "pantry_idx_persist_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    // Session 1: create table, insert data, create index
+    let db1 = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    try await db1.createTable(PantryTableSchema(name: "products", columns: [
+        .integer("id", nullable: false),
+        .string("category"),
+        .double("price"),
+    ]))
+    for i in 0..<100 {
+        try await db1.insert(into: "products", values: [
+            "id": .integer(Int64(i)),
+            "category": .string(["electronics", "books", "food"][i % 3]),
+            "price": .double(Double(i) * 1.5),
+        ])
+    }
+    try await db1.createIndex(table: "products", column: "category")
+    // Verify index works
+    let elec1 = try await db1.select(from: "products",
+        where: .equals(column: "category", value: .string("electronics")))
+    #expect(elec1.count == 34) // 0,3,6,...,99 = ceil(100/3) = 34
+    try await db1.close()
+
+    // Session 2: reopen — index should work without createIndex
+    let db2 = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    let elec2 = try await db2.select(from: "products",
+        where: .equals(column: "category", value: .string("electronics")))
+    #expect(elec2.count == 34)
+    try await db2.close()
+}
+
+// MARK: - Multi-Page Registry Tests
+
+@Test func testManyTablesExceedOnePage() async throws {
+    let path = NSTemporaryDirectory() + "pantry_many_tables_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db1 = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+
+    // Create enough tables to exceed one 8KB page (each TableInfo JSON ~100-200 bytes, so ~50+ tables)
+    let tableCount = 60
+    for i in 0..<tableCount {
+        try await db1.createTable(PantryTableSchema(name: "table_\(String(format: "%03d", i))", columns: [
+            .integer("id", nullable: false),
+            .string("data_column_with_a_longer_name_\(i)"),
+        ]))
+        try await db1.insert(into: "table_\(String(format: "%03d", i))", values: [
+            "id": .integer(1),
+            "data_column_with_a_longer_name_\(i)": .string("value_\(i)"),
+        ])
+    }
+    try await db1.close()
+
+    // Reopen and verify all tables survived
+    let db2 = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    let tables = await db2.listTables()
+    #expect(tables.count == tableCount)
+    for i in 0..<tableCount {
+        let rows = try await db2.select(from: "table_\(String(format: "%03d", i))")
+        #expect(rows.count == 1, "table_\(i) should have 1 row")
+    }
+    try await db2.close()
+}
+
+// MARK: - Free List Tests
+
+@Test func testFreeListPageReuse() async throws {
+    let path = NSTemporaryDirectory() + "pantry_freelist_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    try await db.createTable(PantryTableSchema(name: "temp", columns: [
+        .integer("id", nullable: false), .string("data"),
+    ]))
+
+    // Insert enough data to allocate several pages
+    let payload = String(repeating: "x", count: 500)
+    for i in 0..<30 {
+        try await db.insert(into: "temp", values: [
+            "id": .integer(Int64(i)), "data": .string(payload),
+        ])
+    }
+
+    // Get file size before drop
+    try await db.close()
+    let sizeBeforeDrop = try FileManager.default.attributesOfItem(atPath: path)[.size] as! UInt64
+
+    // Reopen, drop table, create new one
+    let db2 = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    try await db2.dropTable("temp")
+
+    try await db2.createTable(PantryTableSchema(name: "reused", columns: [
+        .integer("id", nullable: false), .string("data"),
+    ]))
+    for i in 0..<30 {
+        try await db2.insert(into: "reused", values: [
+            "id": .integer(Int64(i)), "data": .string(payload),
+        ])
+    }
+    try await db2.close()
+
+    // File should not grow (or grow minimally) because freed pages are reused
+    let sizeAfterReuse = try FileManager.default.attributesOfItem(atPath: path)[.size] as! UInt64
+    #expect(sizeAfterReuse <= sizeBeforeDrop + 8192 * 2, "File should reuse freed pages, not grow significantly")
+
+    // Verify data integrity
+    let db3 = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    let rows = try await db3.select(from: "reused")
+    #expect(rows.count == 30)
+    try await db3.close()
+}
+
+@Test func testFreeListSurvivesRestart() async throws {
+    let path = NSTemporaryDirectory() + "pantry_freelist_restart_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    // Session 1: create, populate, drop
+    let db1 = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    try await db1.createTable(PantryTableSchema(name: "temp", columns: [
+        .integer("id", nullable: false),
+    ]))
+    for i in 0..<20 {
+        try await db1.insert(into: "temp", values: ["id": .integer(Int64(i))])
+    }
+    try await db1.dropTable("temp")
+    try await db1.close()
+
+    let sizeAfterDrop = try FileManager.default.attributesOfItem(atPath: path)[.size] as! UInt64
+
+    // Session 2: reopen, create new table — should reuse freed pages
+    let db2 = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    try await db2.createTable(PantryTableSchema(name: "new_table", columns: [
+        .integer("id", nullable: false),
+    ]))
+    for i in 0..<20 {
+        try await db2.insert(into: "new_table", values: ["id": .integer(Int64(i))])
+    }
+    try await db2.close()
+
+    let sizeAfterReuse = try FileManager.default.attributesOfItem(atPath: path)[.size] as! UInt64
+    #expect(sizeAfterReuse <= sizeAfterDrop + 8192 * 2)
+}
+
 // MARK: - Schema Factory Methods
 
 @Test func testSchemaFactoryMethods() async throws {
@@ -1099,4 +1366,214 @@ import Foundation
     #expect(rows[0]["name"] == .string("Alice"))
 
     try await db.close()
+}
+
+// MARK: - Aggregate Queries
+
+@Test func testAggregateQueries() async throws {
+    let path = NSTemporaryDirectory() + "pantry_agg_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+
+    try await db.createTable(PantryTableSchema(name: "scores", columns: [
+        .string("name"), .integer("score"), .double("rating"),
+    ]))
+
+    try await db.insert(into: "scores", values: ["name": .string("Alice"), "score": .integer(80), "rating": .double(4.5)])
+    try await db.insert(into: "scores", values: ["name": .string("Bob"), "score": .integer(90), "rating": .double(3.8)])
+    try await db.insert(into: "scores", values: ["name": .string("Charlie"), "score": .integer(70), "rating": .double(4.2)])
+    try await db.insert(into: "scores", values: ["name": .string("Diana"), "score": .null, "rating": .double(4.9)])
+
+    // COUNT
+    let countAll = try await db.aggregate(from: "scores", .count(column: nil))
+    #expect(countAll == .integer(4))
+
+    let countScores = try await db.aggregate(from: "scores", .count(column: "score"))
+    #expect(countScores == .integer(3)) // Diana's null excluded
+
+    // SUM
+    let sumScores = try await db.aggregate(from: "scores", .sum(column: "score"))
+    #expect(sumScores == .double(240.0))
+
+    // AVG
+    let avgScores = try await db.aggregate(from: "scores", .avg(column: "score"))
+    #expect(avgScores == .double(80.0))
+
+    let avgRating = try await db.aggregate(from: "scores", .avg(column: "rating"))
+    if case .double(let v) = avgRating {
+        #expect(abs(v - 4.35) < 0.001)
+    } else {
+        Issue.record("Expected double for avg rating")
+    }
+
+    // MIN
+    let minScore = try await db.aggregate(from: "scores", .min(column: "score"))
+    #expect(minScore == .integer(70))
+
+    // MAX
+    let maxScore = try await db.aggregate(from: "scores", .max(column: "score"))
+    #expect(maxScore == .integer(90))
+
+    // MIN/MAX on strings
+    let minName = try await db.aggregate(from: "scores", .min(column: "name"))
+    #expect(minName == .string("Alice"))
+    let maxName = try await db.aggregate(from: "scores", .max(column: "name"))
+    #expect(maxName == .string("Diana"))
+
+    // Aggregate with WHERE
+    let sumHigh = try await db.aggregate(from: "scores", .sum(column: "score"),
+        where: .greaterThan(column: "score", value: .integer(75)))
+    #expect(sumHigh == .double(170.0)) // 80 + 90
+
+    // Aggregate on empty result set
+    let sumNone = try await db.aggregate(from: "scores", .sum(column: "score"),
+        where: .greaterThan(column: "score", value: .integer(1000)))
+    #expect(sumNone == .null)
+
+    let avgNone = try await db.aggregate(from: "scores", .avg(column: "score"),
+        where: .greaterThan(column: "score", value: .integer(1000)))
+    #expect(avgNone == .null)
+
+    try await db.close()
+}
+
+// MARK: - AsyncSequence Streaming
+
+@Test func testStreamResults() async throws {
+    let path = NSTemporaryDirectory() + "pantry_stream_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+
+    try await db.createTable(PantryTableSchema(name: "items", columns: [
+        .integer("id"), .string("name"),
+    ]))
+
+    let rowCount = 100
+    for i in 0..<rowCount {
+        try await db.insert(into: "items", values: [
+            "id": .integer(Int64(i)),
+            "name": .string("item_\(i)"),
+        ])
+    }
+
+    // Stream all rows
+    var count = 0
+    let stream = try await db.stream(from: "items")
+    for await row in stream {
+        #expect(row.values["id"] != nil)
+        #expect(row.values["name"] != nil)
+        count += 1
+    }
+    #expect(count == rowCount)
+
+    // Stream empty table
+    try await db.createTable(PantryTableSchema(name: "empty", columns: [
+        .integer("x"),
+    ]))
+    var emptyCount = 0
+    let emptyStream = try await db.stream(from: "empty")
+    for await _ in emptyStream {
+        emptyCount += 1
+    }
+    #expect(emptyCount == 0)
+
+    try await db.close()
+}
+
+@Test func testCompoundIndex() async throws {
+    let path = NSTemporaryDirectory() + "pantry_compound_idx_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+
+    // Create a products table
+    let schema = PantryTableSchema(name: "products", columns: [
+        PantryColumn(name: "category", type: .string),
+        PantryColumn(name: "price", type: .double),
+        PantryColumn(name: "name", type: .string),
+    ])
+    try await db.createTable(schema)
+
+    // Insert test data
+    try await db.insert(into: "products", values: ["category": "electronics", "price": .double(999.99), "name": "Laptop"])
+    try await db.insert(into: "products", values: ["category": "electronics", "price": .double(499.99), "name": "Tablet"])
+    try await db.insert(into: "products", values: ["category": "electronics", "price": .double(199.99), "name": "Headphones"])
+    try await db.insert(into: "products", values: ["category": "books", "price": .double(29.99), "name": "Swift Programming"])
+    try await db.insert(into: "products", values: ["category": "books", "price": .double(19.99), "name": "Design Patterns"])
+    try await db.insert(into: "products", values: ["category": "clothing", "price": .double(49.99), "name": "T-Shirt"])
+
+    // Create compound index on (category, price)
+    try await db.createCompoundIndex(table: "products", columns: ["category", "price"])
+
+    // Test full compound key match: category=electronics AND price=499.99
+    let tablets = try await db.select(from: "products", where: .and([
+        .equals(column: "category", value: "electronics"),
+        .equals(column: "price", value: .double(499.99))
+    ]))
+    #expect(tablets.count == 1)
+    #expect(tablets[0].values["name"] == "Tablet")
+
+    // Test prefix query: only category column matches (prefix of compound index)
+    let books = try await db.select(from: "products", where: .and([
+        .equals(column: "category", value: "books"),
+        .greaterThan(column: "price", value: .double(0))
+    ]))
+    #expect(books.count == 2)
+
+    // Test that non-matching compound query returns empty
+    let empty = try await db.select(from: "products", where: .and([
+        .equals(column: "category", value: "electronics"),
+        .equals(column: "price", value: .double(1.0))
+    ]))
+    #expect(empty.isEmpty)
+
+    // Test DBValue.compound ordering
+    let a = DBValue.compound(["electronics", .double(100)])
+    let b = DBValue.compound(["electronics", .double(200)])
+    let c = DBValue.compound(["food", .double(5)])
+    #expect(a < b)
+    #expect(b < c) // "electronics" < "food"
+    #expect(a == a)
+
+    try await db.close()
+}
+
+@Test func testCompoundIndexPersistence() async throws {
+    let path = NSTemporaryDirectory() + "pantry_compound_persist_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    // Create database, insert data, create compound index
+    do {
+        let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+        let schema = PantryTableSchema(name: "orders", columns: [
+            PantryColumn(name: "customer", type: .string),
+            PantryColumn(name: "status", type: .string),
+            PantryColumn(name: "amount", type: .double),
+        ])
+        try await db.createTable(schema)
+        try await db.createCompoundIndex(table: "orders", columns: ["customer", "status"])
+
+        try await db.insert(into: "orders", values: ["customer": "Alice", "status": "shipped", "amount": .double(100)])
+        try await db.insert(into: "orders", values: ["customer": "Alice", "status": "pending", "amount": .double(50)])
+        try await db.insert(into: "orders", values: ["customer": "Bob", "status": "shipped", "amount": .double(200)])
+
+        try await db.close()
+    }
+
+    // Reopen and verify compound index was persisted
+    do {
+        let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+
+        // Query using compound index — should use persisted index
+        let aliceShipped = try await db.select(from: "orders", where: .and([
+            .equals(column: "customer", value: "Alice"),
+            .equals(column: "status", value: "shipped")
+        ]))
+        #expect(aliceShipped.count == 1)
+        #expect(aliceShipped[0].values["amount"] == .double(100))
+
+        try await db.close()
+    }
 }

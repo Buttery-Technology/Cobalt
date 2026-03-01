@@ -11,6 +11,7 @@ public actor TransactionContext: Sendable {
     public private(set) var heldLocks = [ResourceLock]()
     public private(set) var readPages = Set<Int>()
     public private(set) var writePages = Set<Int>()
+    public private(set) var beforeImagePages = Set<Int>()
 
     public init(transactionID: UInt64, isolationLevel: IsolationLevel = .readCommitted) {
         self.transactionID = transactionID
@@ -28,6 +29,10 @@ public actor TransactionContext: Sendable {
 
     public func markModified(pageID: Int) {
         modifiedPages.insert(pageID)
+    }
+
+    public func recordBeforeImage(pageID: Int) {
+        beforeImagePages.insert(pageID)
     }
 
     public func addLock(_ lock: ResourceLock) {

@@ -81,6 +81,16 @@ public actor PageBackedNodeStore: Sendable {
         try await bufferPool.flushAllDirtyPages()
     }
 
+    /// Get the current node→page mapping (for persistence)
+    public func getNodePageMap() -> [UUID: Int] {
+        nodePageMap
+    }
+
+    /// Restore the node→page mapping (from persisted index registry)
+    public func restoreNodePageMap(_ map: [UUID: Int]) {
+        nodePageMap = map
+    }
+
     // Convert UUID to a stable UInt64 ID using all 16 bytes
     private func nodeId(_ uuid: UUID) -> UInt64 {
         let u = uuid.uuid
@@ -104,5 +114,28 @@ public struct IndexMetadata: Codable, Sendable {
         self.tableName = tableName
         self.columnName = columnName
         self.nodeCount = nodeCount
+    }
+}
+
+/// Persisted index registry entry — stores everything needed to restore an index
+public struct IndexRegistryEntry: Codable, Sendable {
+    public var tableName: String
+    public var columnName: String
+    public var compoundColumns: [String]?
+    public var rootNodeId: UUID?
+    public var nodePageMap: [String: Int] // UUID string → page ID
+
+    public init(tableName: String, columnName: String, compoundColumns: [String]? = nil, rootNodeId: UUID?, nodePageMap: [UUID: Int]) {
+        self.tableName = tableName
+        self.columnName = columnName
+        self.compoundColumns = compoundColumns
+        self.rootNodeId = rootNodeId
+        self.nodePageMap = Dictionary(uniqueKeysWithValues: nodePageMap.map { ($0.key.uuidString, $0.value) })
+    }
+
+    public var decodedNodePageMap: [UUID: Int] {
+        Dictionary(uniqueKeysWithValues: nodePageMap.compactMap { key, value in
+            UUID(uuidString: key).map { ($0, value) }
+        })
     }
 }

@@ -9,3 +9,14 @@ public enum PantryConstants {
     public static let SYSTEM_PAGE_TABLE_REGISTRY_START: Int = 1
     public static let ENCRYPTION_KEY_SIZE: Int = 32 // AES-256
 }
+
+/// Metadata stored as a JSON record on page 0
+public struct DBMetadata: Codable, Sendable {
+    public var freeListHead: Int
+    public var indexRegistryPageID: Int
+
+    public init(freeListHead: Int = 0, indexRegistryPageID: Int = 0) {
+        self.freeListHead = freeListHead
+        self.indexRegistryPageID = indexRegistryPageID
+    }
+}

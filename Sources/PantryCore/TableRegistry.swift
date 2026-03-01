@@ -32,24 +32,30 @@ public actor TableRegistry: Sendable {
         self.bufferPool = bufferPool
     }
 
-    /// Load the table registry from system pages
+    /// Load the table registry from system pages (follows overflow chain)
     public func load() async throws {
         let totalPages = try await storageManager.totalPageCount()
         guard totalPages > PantryConstants.SYSTEM_PAGE_TABLE_REGISTRY_START else {
             return
         }
 
-        // Read registry pages starting from page 1
-        for pageID in PantryConstants.SYSTEM_PAGE_TABLE_REGISTRY_START..<totalPages {
+        // Follow the registry page chain starting from page 1
+        var currentPageID = PantryConstants.SYSTEM_PAGE_TABLE_REGISTRY_START
+        var visited: Set<Int> = []
+
+        while currentPageID != 0 && currentPageID < totalPages {
+            guard visited.insert(currentPageID).inserted else { break }
+
             let page: DatabasePage
             do {
-                page = try await storageManager.readPage(pageID: pageID)
+                page = try await storageManager.readPage(pageID: currentPageID)
             } catch {
-                continue // Skip corrupted pages; salvage what we can
+                break
             }
             guard PageFlags(rawValue: page.flags).contains(.tableRegistry) else {
                 break
             }
+
             // Each record on a registry page is a JSON-encoded TableInfo
             for record in page.records {
                 if let info = try? JSONDecoder().decode(TableInfo.self, from: record.data) {
@@ -59,10 +65,12 @@ public actor TableRegistry: Sendable {
                     }
                 }
             }
+
+            currentPageID = page.nextPageID
         }
     }
 
-    /// Persist the entire table registry to system pages
+    /// Persist the entire table registry to system pages, chaining overflow pages
     public func save() async throws {
         let encoder = JSONEncoder()
         var records: [Record] = []
@@ -72,25 +80,40 @@ public actor TableRegistry: Sendable {
             records.append(Record(id: UInt64(info.tableID), data: data))
         }
 
-        // Write records across registry pages starting at page 1
-        let pageID = PantryConstants.SYSTEM_PAGE_TABLE_REGISTRY_START
+        // Write records across registry pages starting at page 1, chaining overflow pages
+        var currentPageID = PantryConstants.SYSTEM_PAGE_TABLE_REGISTRY_START
         var page = DatabasePage(
-            pageID: pageID,
+            pageID: currentPageID,
             flags: PageFlags.system.rawValue | PageFlags.tableRegistry.rawValue
         )
+        var writtenPageIDs: [Int] = []
 
         for record in records {
             if !page.addRecord(record) {
-                // Guard: registry must fit in reserved pages to avoid overwriting data pages
-                throw PantryError.schemaSerializationError
+                // Current page is full — allocate overflow page and chain
+                let overflowPage = try await storageManager.createNewPage()
+                page.nextPageID = overflowPage.pageID
+                try await writePage(&page)
+                writtenPageIDs.append(currentPageID)
+
+                currentPageID = overflowPage.pageID
+                page = DatabasePage(
+                    pageID: currentPageID,
+                    flags: PageFlags.system.rawValue | PageFlags.tableRegistry.rawValue
+                )
+                if !page.addRecord(record) {
+                    throw PantryError.schemaSerializationError
+                }
             }
         }
 
-        // Write the last page
+        // Write the last page (no next pointer)
+        page.nextPageID = 0
         try await writePage(&page)
+        writtenPageIDs.append(currentPageID)
 
         // Clear any remaining old registry pages to prevent stale data on reload
-        let lastWrittenPageID = pageID
+        let lastWrittenPageID = writtenPageIDs.last ?? PantryConstants.SYSTEM_PAGE_TABLE_REGISTRY_START
         let totalPages = try await storageManager.totalPageCount()
         var nextPage = lastWrittenPageID + 1
         while nextPage < totalPages {

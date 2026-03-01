@@ -155,9 +155,11 @@ extension PantryDatabase {
             }
         }
 
-        // Upsert: delete existing row with same id, then insert
-        _ = try await delete(from: M.tableName, where: .equals(column: "id", value: .string(model.id)))
-        try await insert(into: M.tableName, values: values)
+        // Atomic upsert: delete + insert in a transaction so failure doesn't lose data
+        try await transaction { tx in
+            _ = try await tx.delete(from: M.tableName, where: .equals(column: "id", value: .string(model.id)))
+            try await tx.insert(into: M.tableName, values: values)
+        }
     }
 
     /// Find a single model by its ID.
@@ -182,10 +184,27 @@ extension PantryDatabase {
         return try await delete(from: M.tableName, where: .equals(column: "id", value: .string(model.id)))
     }
 
-    /// Save multiple model instances at once (upsert each).
+    /// Save multiple model instances at once (upsert each). Batched in a single transaction.
     public func saveAll<M: PantryModel>(_ models: [M]) async throws {
-        for model in models {
-            try await save(model)
+        guard !models.isEmpty else { return }
+
+        // Single table existence check
+        if !(await tableExists(M.tableName)) {
+            let schema = try DBValueEncoder.deriveSchema(from: models[0])
+            do {
+                try await createTable(schema)
+            } catch PantryError.tableAlreadyExists {
+                // Race condition: another call created it
+            }
+        }
+
+        // Batch all upserts in one transaction
+        try await transaction { tx in
+            for model in models {
+                let values = try DBValueEncoder.encode(model)
+                _ = try await tx.delete(from: M.tableName, where: .equals(column: "id", value: .string(model.id)))
+                try await tx.insert(into: M.tableName, values: values)
+            }
         }
     }
 
