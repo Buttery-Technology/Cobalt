@@ -5,6 +5,8 @@ import PantryCore
 /// Each B-tree node is serialized and stored in a PantryCore page.
 public actor PageBackedNodeStore: Sendable {
     private var nodePageMap: [UUID: Int] = [:]
+    /// Node object cache — returns references directly without deep copying.
+    /// Safe because BTree and PageBackedNodeStore are both actors (serialized access).
     private var nodeCache: [UUID: BTreeNode] = [:]
     private let bufferPool: BufferPoolManager
     private let storageManager: StorageManager
@@ -45,15 +47,15 @@ public actor PageBackedNodeStore: Sendable {
             bufferPool.markDirty(pageID: page.pageID)
             nodePageMap[node.nodeId] = page.pageID
         }
-        nodeCache[node.nodeId] = node.deepCopy()
+        // Cache the node directly — no copy needed (actor serializes access)
+        nodeCache[node.nodeId] = node
     }
 
-    /// Load a B-tree node from its page
-    /// Returns a deep copy to prevent aliasing with the cache
+    /// Load a B-tree node from its page.
+    /// Returns cached reference directly (no deep copy) — safe under actor isolation.
     public func loadNode(nodeId: UUID) async throws -> BTreeNode? {
-        // Check in-memory cache first to avoid deserialization
         if let cached = nodeCache[nodeId] {
-            return cached.deepCopy()
+            return cached
         }
 
         guard let pageID = nodePageMap[nodeId] else {
@@ -67,13 +69,13 @@ public actor PageBackedNodeStore: Sendable {
 
         let node = try BTreeNode.deserialize(from: record.data)
         nodeCache[nodeId] = node
-        return node.deepCopy()
+        return node
     }
 
-    /// Remove a node from cache and page map (e.g. after merge absorbs it)
+    /// Remove a node from the page map and cache (e.g. after merge absorbs it)
     public func removeNode(nodeId: UUID) {
-        nodeCache.removeValue(forKey: nodeId)
         nodePageMap.removeValue(forKey: nodeId)
+        nodeCache.removeValue(forKey: nodeId)
     }
 
     /// Flush all dirty index pages to disk

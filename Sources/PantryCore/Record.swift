@@ -1,24 +1,47 @@
 import Foundation
 
 /// A database record storing an ID and raw binary data.
-/// Callers are responsible for encoding/decoding the data payload.
+/// Supports overflow for records larger than a single page.
+///
+/// Normal record data format: `[0x00 flag][raw data bytes]`
+/// Overflow record data format: `[0x01 flag][4B total length][4B first overflow pageID][inline data bytes]`
 public struct Record: Sendable {
     public var id: UInt64
     public var data: Data
 
-    public init(id: UInt64, data: Data) {
+    /// If set, the record's full data spans overflow pages starting at this page ID
+    public var overflowPageID: Int?
+
+    public init(id: UInt64, data: Data, overflowPageID: Int? = nil) {
         self.id = id
         self.data = data
+        self.overflowPageID = overflowPageID
     }
 
     /// Serialize the record into binary format: [id: 8 bytes][length: 4 bytes][data]
+    /// For overflow records, data is prefixed with overflow header.
     public func serialize() -> Data {
-        var recordData = Data(capacity: 12 + data.count)
+        let payload: Data
+        if let overflowPage = overflowPageID {
+            // Overflow record: [0x01][4B total length][4B overflow pageID][inline data]
+            var buf = Data(capacity: 9 + data.count)
+            buf.append(0x01)
+            var totalLen = UInt32(data.count)
+            withUnsafeBytes(of: &totalLen) { buf.append(contentsOf: $0) }
+            var opid = Int32(overflowPage)
+            withUnsafeBytes(of: &opid) { buf.append(contentsOf: $0) }
+            buf.append(data)
+            payload = buf
+        } else {
+            payload = data
+        }
+
+        var recordData = Data(capacity: 12 + payload.count)
         var idCopy = id
         withUnsafeBytes(of: &idCopy) { recordData.append(contentsOf: $0) }
-        var dataLength = UInt32(data.count)
+        var dataLength = UInt32(payload.count)
         withUnsafeBytes(of: &dataLength) { recordData.append(contentsOf: $0) }
-        recordData.append(data)
+        recordData.append(payload)
         return recordData
     }
 
@@ -37,6 +60,24 @@ public struct Record: Sendable {
         guard rawData.count >= position + dataLength else { return nil }
         let payload = rawData.subdata(in: position..<(position + dataLength))
 
+        // Check for overflow flag
+        if !payload.isEmpty && payload[payload.startIndex] == 0x01 && payload.count >= 9 {
+            // Overflow record
+            var off = 1
+            let totalLen = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: off, as: UInt32.self) }
+            off += 4
+            let overflowPageID = Int(payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: off, as: Int32.self) })
+            off += 4
+            let inlineData = payload.subdata(in: (payload.startIndex + off)..<payload.endIndex)
+            _ = totalLen  // totalLen includes inline + overflow data; used during reassembly
+            return Record(id: id, data: inlineData, overflowPageID: overflowPageID)
+        }
+
         return Record(id: id, data: payload)
+    }
+
+    /// Whether this record has overflow pages that need to be followed
+    public var isOverflow: Bool {
+        overflowPageID != nil
     }
 }

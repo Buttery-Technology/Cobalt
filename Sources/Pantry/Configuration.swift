@@ -18,11 +18,19 @@ public struct PantryConfiguration: Sendable {
     /// Default transaction isolation level
     public let isolationLevel: IsolationLevel
 
+    /// Group commit: maximum delay in microseconds before flushing a batch (default 1000 = 1ms)
+    public let groupCommitDelay: Int
+
+    /// Group commit: maximum batch size before flushing immediately (default 32)
+    public let groupCommitBatchSize: Int
+
     public init(
         path: String,
         encryptionKey: Data? = nil,
         bufferPoolCapacity: Int = 1000,
-        isolationLevel: IsolationLevel = .readCommitted
+        isolationLevel: IsolationLevel = .readCommitted,
+        groupCommitDelay: Int = 1000,
+        groupCommitBatchSize: Int = 32
     ) {
         precondition(!path.isEmpty, "Database path must not be empty")
         precondition(bufferPoolCapacity > 0, "Buffer pool capacity must be positive")
@@ -33,6 +41,8 @@ public struct PantryConfiguration: Sendable {
         self.encryptionKey = encryptionKey
         self.bufferPoolCapacity = bufferPoolCapacity
         self.isolationLevel = isolationLevel
+        self.groupCommitDelay = groupCommitDelay
+        self.groupCommitBatchSize = groupCommitBatchSize
     }
 
     // MARK: - Default Path Helpers

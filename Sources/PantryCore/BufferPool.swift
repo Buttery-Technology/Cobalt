@@ -1,37 +1,51 @@
 import Foundation
-import Synchronization
-
-/// Mutable state protected by Mutex
-private struct BufferPoolState: ~Copyable {
+/// Per-stripe mutable state
+private struct StripeState {
     var pageCache: [Int: DatabasePage] = [:]
     var dirtyPages = Set<Int>()
     var accessOrder: [Int: UInt64] = [:]
     var nextAccessCounter: UInt64 = 0
-    var stats = BufferPoolStats()
+    var hitCount: Int = 0
+    var missCount: Int = 0
+    var evictionCount: Int = 0
+    var flushCount: Int = 0
 }
 
-/// Manages an in-memory cache of database pages to minimize disk I/O
+/// Manages an in-memory cache of database pages to minimize disk I/O.
+/// Uses stripe-based partitioning (pageID % stripeCount) to reduce mutex contention.
 public final class BufferPoolManager: Sendable {
     private let capacity: Int
     private let storageManager: StorageManager
-    private let state = Mutex(BufferPoolState())
+    private let stripes: [PantryLock<StripeState>]
+    private let stripeCount: Int
 
-    public init(capacity: Int, storageManager: StorageManager) {
+    public init(capacity: Int, storageManager: StorageManager, stripeCount: Int = 8) {
         self.capacity = capacity
         self.storageManager = storageManager
+        self.stripeCount = max(1, stripeCount)
+        self.stripes = (0..<max(1, stripeCount)).map { _ in PantryLock(StripeState()) }
+    }
+
+    private func stripe(for pageID: Int) -> PantryLock<StripeState> {
+        stripes[pageID % stripeCount]
+    }
+
+    private var capacityPerStripe: Int {
+        max(1, capacity / stripeCount)
     }
 
     // MARK: - Core Page Management
 
     public func getPage(pageID: Int) async throws -> DatabasePage {
-        let cached: DatabasePage? = state.withLock { s in
-            if let page = s.pageCache[pageID] {
-                s.accessOrder[pageID] = s.nextAccessCounter
-                s.nextAccessCounter += 1
-                s.stats.hitCount += 1
+        let s = stripe(for: pageID)
+        let cached: DatabasePage? = s.withLock { st in
+            if let page = st.pageCache[pageID] {
+                st.accessOrder[pageID] = st.nextAccessCounter
+                st.nextAccessCounter += 1
+                st.hitCount += 1
                 return page
             }
-            s.stats.missCount += 1
+            st.missCount += 1
             return nil
         }
         if let cached { return cached }
@@ -42,15 +56,15 @@ public final class BufferPoolManager: Sendable {
     }
 
     public func isPageCached(pageID: Int) -> Bool {
-        state.withLock { $0.pageCache[pageID] != nil }
+        stripe(for: pageID).withLock { $0.pageCache[pageID] != nil }
     }
 
     public func getCachedPage(pageID: Int) -> DatabasePage? {
-        state.withLock { s in
-            if let page = s.pageCache[pageID] {
-                s.accessOrder[pageID] = s.nextAccessCounter
-                s.nextAccessCounter += 1
-                s.stats.hitCount += 1
+        stripe(for: pageID).withLock { st in
+            if let page = st.pageCache[pageID] {
+                st.accessOrder[pageID] = st.nextAccessCounter
+                st.nextAccessCounter += 1
+                st.hitCount += 1
                 return page
             }
             return nil
@@ -58,117 +72,126 @@ public final class BufferPoolManager: Sendable {
     }
 
     public func updatePage(_ page: DatabasePage) {
-        state.withLock { s in
-            s.pageCache[page.pageID] = page
-            s.accessOrder[page.pageID] = s.nextAccessCounter
-            s.nextAccessCounter += 1
+        stripe(for: page.pageID).withLock { st in
+            st.pageCache[page.pageID] = page
+            st.accessOrder[page.pageID] = st.nextAccessCounter
+            st.nextAccessCounter += 1
         }
     }
 
     public func markDirty(pageID: Int) {
-        _ = state.withLock { $0.dirtyPages.insert(pageID) }
+        _ = stripe(for: pageID).withLock { $0.dirtyPages.insert(pageID) }
     }
 
     public func isDirty(pageID: Int) -> Bool {
-        state.withLock { $0.dirtyPages.contains(pageID) }
+        stripe(for: pageID).withLock { $0.dirtyPages.contains(pageID) }
     }
 
     public func clearDirtyFlag(pageID: Int) {
-        _ = state.withLock { $0.dirtyPages.remove(pageID) }
+        _ = stripe(for: pageID).withLock { $0.dirtyPages.remove(pageID) }
     }
 
     // MARK: - Cache Management
 
     private func addToCache(_ page: DatabasePage) async throws {
-        let needsEviction = state.withLock { $0.pageCache.count >= capacity }
+        let idx = page.pageID % stripeCount
+        let needsEviction = stripes[idx].withLock { $0.pageCache.count >= capacityPerStripe }
         if needsEviction {
-            try await evictPages(count: 1)
+            try await evictFromStripe(index: idx)
         }
-        state.withLock { s in
-            s.pageCache[page.pageID] = page
-            s.accessOrder[page.pageID] = s.nextAccessCounter
-            s.nextAccessCounter += 1
+        stripes[idx].withLock { st in
+            st.pageCache[page.pageID] = page
+            st.accessOrder[page.pageID] = st.nextAccessCounter
+            st.nextAccessCounter += 1
         }
     }
 
-    private func selectPagesForEviction(count: Int = 1) -> [Int] {
-        state.withLock { s in
-            if count == 1 {
-                guard let oldest = s.accessOrder.min(by: { $0.value < $1.value }) else { return [] }
-                return [oldest.key]
-            }
-            return Array(s.accessOrder.sorted { $0.value < $1.value }.prefix(count).map { $0.key })
+    /// Evict the LRU page from a specific stripe by index
+    private func evictFromStripe(index idx: Int) async throws {
+        let victim: (Int, DatabasePage?)? = stripes[idx].withLock { st in
+            guard let oldest = st.accessOrder.min(by: { $0.value < $1.value }) else { return nil }
+            let pageID = oldest.key
+            let dirtyPage: DatabasePage? = st.dirtyPages.contains(pageID) ? st.pageCache[pageID] : nil
+            return (pageID, dirtyPage)
+        }
+        guard let (pageID, dirtyPage) = victim else { return }
+
+        if var page = dirtyPage {
+            try await storageManager.writePage(&page)
+        }
+        stripes[idx].withLock { st in
+            st.dirtyPages.remove(pageID)
+            st.pageCache.removeValue(forKey: pageID)
+            st.accessOrder.removeValue(forKey: pageID)
+            st.evictionCount += 1
         }
     }
 
     public func evictPages(count: Int = 1) async throws {
-        let pagesToEvict = selectPagesForEviction(count: count)
-
-        for pageID in pagesToEvict {
-            // Snapshot the dirty page under lock, then do I/O outside
-            let dirtyPage: DatabasePage? = state.withLock { s in
-                if s.dirtyPages.contains(pageID), let page = s.pageCache[pageID] {
-                    return page
+        // Evict from the fullest stripes first
+        for _ in 0..<count {
+            var fullestIdx = 0
+            var maxCount = 0
+            for (i, s) in stripes.enumerated() {
+                let c = s.withLock { $0.pageCache.count }
+                if c > maxCount {
+                    maxCount = c
+                    fullestIdx = i
                 }
-                return nil
             }
-            if var page = dirtyPage {
-                try await storageManager.writePage(&page)
-            }
-            state.withLock { s in
-                s.dirtyPages.remove(pageID)
-                s.pageCache.removeValue(forKey: pageID)
-                s.accessOrder.removeValue(forKey: pageID)
-                s.stats.evictionCount += 1
+            if maxCount > 0 {
+                try await evictFromStripe(index: fullestIdx)
             }
         }
     }
 
     /// Evict a specific page from cache (used after rollback to discard stale data)
     public func evictPage(pageID: Int) {
-        state.withLock { s in
-            s.pageCache.removeValue(forKey: pageID)
-            s.accessOrder.removeValue(forKey: pageID)
-            s.dirtyPages.remove(pageID)
+        stripe(for: pageID).withLock { st in
+            st.pageCache.removeValue(forKey: pageID)
+            st.accessOrder.removeValue(forKey: pageID)
+            st.dirtyPages.remove(pageID)
         }
     }
 
     // MARK: - Flushing
 
     public func flushAllDirtyPages() async throws {
-        // Snapshot dirty pages and their data under lock
-        let pagesToFlush: [(Int, DatabasePage)] = state.withLock { s in
-            s.dirtyPages.compactMap { pageID in
-                guard let page = s.pageCache[pageID] else {
-                    s.dirtyPages.remove(pageID)
-                    return nil
+        for s in stripes {
+            let pagesToFlush: [(Int, DatabasePage)] = s.withLock { st in
+                st.dirtyPages.compactMap { pageID in
+                    guard let page = st.pageCache[pageID] else {
+                        st.dirtyPages.remove(pageID)
+                        return nil
+                    }
+                    return (pageID, page)
                 }
-                return (pageID, page)
             }
-        }
 
-        for (pageID, var page) in pagesToFlush {
-            try await storageManager.writePage(&page)
-            state.withLock { s in
-                s.stats.flushCount += 1
-                s.dirtyPages.remove(pageID)
+            for (pageID, var page) in pagesToFlush {
+                try await storageManager.writePage(&page)
+                s.withLock { st in
+                    st.flushCount += 1
+                    st.dirtyPages.remove(pageID)
+                }
             }
         }
         try await storageManager.sync()
     }
 
     public func flushPage(pageID: Int) async throws {
-        let pageToFlush: DatabasePage? = state.withLock { s in
-            if s.dirtyPages.contains(pageID), let page = s.pageCache[pageID] {
+        let s = stripe(for: pageID)
+        let pageToFlush: DatabasePage? = s.withLock { st in
+            if st.dirtyPages.contains(pageID), let page = st.pageCache[pageID] {
                 return page
             }
             return nil
         }
         if var page = pageToFlush {
             try await storageManager.writePage(&page)
-            state.withLock { s in
-                s.dirtyPages.remove(pageID)
-                s.stats.flushCount += 1
+            s.withLock { st in
+                st.dirtyPages.remove(pageID)
+                st.flushCount += 1
             }
         }
     }
@@ -176,35 +199,38 @@ public final class BufferPoolManager: Sendable {
     // MARK: - Maintenance
 
     public func performMaintenance() async throws {
-        let pagesToFlush: [Int] = state.withLock { s in
-            let dirtyPageCount = s.dirtyPages.count
-            guard dirtyPageCount > s.pageCache.count / 4 || dirtyPageCount > capacity / 4 else { return [] }
-            let sorted = s.dirtyPages.sorted { pageID1, pageID2 in
-                let order1 = s.accessOrder[pageID1] ?? 0
-                let order2 = s.accessOrder[pageID2] ?? 0
-                return order1 < order2
+        for s in stripes {
+            let pagesToFlush: [Int] = s.withLock { st in
+                let dirtyPageCount = st.dirtyPages.count
+                guard dirtyPageCount > st.pageCache.count / 4 || dirtyPageCount > capacityPerStripe / 4 else { return [] }
+                let sorted = st.dirtyPages.sorted { pageID1, pageID2 in
+                    let order1 = st.accessOrder[pageID1] ?? 0
+                    let order2 = st.accessOrder[pageID2] ?? 0
+                    return order1 < order2
+                }
+                return Array(sorted.prefix(max(1, dirtyPageCount / 4)))
             }
-            return Array(sorted.prefix(max(1, dirtyPageCount / 4)))
-        }
 
-        for pageID in pagesToFlush {
-            try await flushPage(pageID: pageID)
-        }
+            for pageID in pagesToFlush {
+                try await flushPage(pageID: pageID)
+            }
 
-        // Evict clean pages if cache is >90% full
-        state.withLock { s in
-            if s.pageCache.count > Int(Double(capacity) * 0.9) {
-                let targetCount = Int(Double(capacity) * 0.8)
-                let evictionCount = s.pageCache.count - targetCount
-                if evictionCount > 0 {
-                    let cleanPages = s.accessOrder
-                        .filter { !s.dirtyPages.contains($0.key) }
-                        .sorted { $0.value < $1.value }
-                        .prefix(evictionCount)
-                    for (pageID, _) in cleanPages {
-                        s.pageCache.removeValue(forKey: pageID)
-                        s.accessOrder.removeValue(forKey: pageID)
-                        s.stats.evictionCount += 1
+            // Evict clean pages if stripe is >90% full
+            s.withLock { st in
+                let cap = capacityPerStripe
+                if st.pageCache.count > Int(Double(cap) * 0.9) {
+                    let targetCount = Int(Double(cap) * 0.8)
+                    let evictionCount = st.pageCache.count - targetCount
+                    if evictionCount > 0 {
+                        let cleanPages = st.accessOrder
+                            .filter { !st.dirtyPages.contains($0.key) }
+                            .sorted { $0.value < $1.value }
+                            .prefix(evictionCount)
+                        for (pageID, _) in cleanPages {
+                            st.pageCache.removeValue(forKey: pageID)
+                            st.accessOrder.removeValue(forKey: pageID)
+                            st.evictionCount += 1
+                        }
                     }
                 }
             }
@@ -212,29 +238,70 @@ public final class BufferPoolManager: Sendable {
     }
 
     public func cachePage(_ page: DatabasePage) async {
-        let needsEviction = state.withLock { s in
-            s.pageCache[page.pageID] = page
-            s.accessOrder[page.pageID] = s.nextAccessCounter
-            s.nextAccessCounter += 1
-            return s.pageCache.count > capacity
+        let s = stripe(for: page.pageID)
+        let needsEviction = s.withLock { st in
+            st.pageCache[page.pageID] = page
+            st.accessOrder[page.pageID] = st.nextAccessCounter
+            st.nextAccessCounter += 1
+            return st.pageCache.count > capacityPerStripe
         }
         if needsEviction {
-            try? await evictPages(count: 1)
+            try? await evictFromStripe(index: page.pageID % stripeCount)
+        }
+    }
+
+    // MARK: - Prefetching
+
+    /// Prefetch pages into the buffer pool asynchronously.
+    /// Non-critical — failures are silently ignored.
+    public func prefetchPages(_ pageIDs: [Int]) async {
+        for pageID in pageIDs {
+            let alreadyCached = stripe(for: pageID).withLock { $0.pageCache[pageID] != nil }
+            if alreadyCached { continue }
+            do {
+                let page = try await storageManager.readPage(pageID: pageID)
+                try await addToCache(page)
+                stripe(for: pageID).withLock { st in
+                    st.hitCount += 0 // Don't count as miss or hit — it's a prefetch
+                }
+            } catch {
+                // Prefetch failures are non-critical
+            }
         }
     }
 
     // MARK: - Statistics
 
     public func getStats() -> BufferPoolStats {
-        state.withLock { $0.stats }
+        var stats = BufferPoolStats()
+        for s in stripes {
+            s.withLock { st in
+                stats.hitCount += st.hitCount
+                stats.missCount += st.missCount
+                stats.evictionCount += st.evictionCount
+                stats.flushCount += st.flushCount
+            }
+        }
+        return stats
     }
 
     public func resetStats() {
-        state.withLock { $0.stats = BufferPoolStats() }
+        for s in stripes {
+            s.withLock { st in
+                st.hitCount = 0
+                st.missCount = 0
+                st.evictionCount = 0
+                st.flushCount = 0
+            }
+        }
     }
 
     public func getCacheOccupancy() -> Double {
-        state.withLock { Double($0.pageCache.count) / Double(capacity) }
+        var total = 0
+        for s in stripes {
+            total += s.withLock { $0.pageCache.count }
+        }
+        return Double(total) / Double(capacity)
     }
 }
 

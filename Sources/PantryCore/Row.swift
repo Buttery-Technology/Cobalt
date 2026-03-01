@@ -159,7 +159,7 @@ extension Row {
 
     // MARK: - DBValue binary helpers
 
-    private static func encodeDBValue(_ value: DBValue, into buf: inout Data) {
+    public static func encodeDBValue(_ value: DBValue, into buf: inout Data) {
         switch value {
         case .null:
             buf.append(0) // tag 0
@@ -190,7 +190,7 @@ extension Row {
         }
     }
 
-    private static func decodeDBValue(from data: Data, at offset: inout Int) -> DBValue? {
+    public static func decodeDBValue(from data: Data, at offset: inout Int) -> DBValue? {
         guard offset < data.count else { return nil }
         let tag = data[offset]
         offset += 1
@@ -240,48 +240,48 @@ extension Row {
 // MARK: - Data binary read/write helpers
 
 extension Data {
-    mutating func appendUInt16(_ value: UInt16) {
+    public mutating func appendUInt16(_ value: UInt16) {
         var v = value.littleEndian
         Swift.withUnsafeBytes(of: &v) { self.append(contentsOf: $0) }
     }
 
-    mutating func appendUInt32(_ value: UInt32) {
+    public mutating func appendUInt32(_ value: UInt32) {
         var v = value.littleEndian
         Swift.withUnsafeBytes(of: &v) { self.append(contentsOf: $0) }
     }
 
-    mutating func appendInt64(_ value: Int64) {
+    public mutating func appendInt64(_ value: Int64) {
         var v = value.littleEndian
         Swift.withUnsafeBytes(of: &v) { self.append(contentsOf: $0) }
     }
 
-    mutating func appendFloat64(_ value: Double) {
+    public mutating func appendFloat64(_ value: Double) {
         var v = value.bitPattern.littleEndian
         Swift.withUnsafeBytes(of: &v) { self.append(contentsOf: $0) }
     }
 
-    func readUInt16(at offset: inout Int) -> UInt16? {
+    public func readUInt16(at offset: inout Int) -> UInt16? {
         guard offset + 2 <= count else { return nil }
         let value = self.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt16.self) }
         offset += 2
         return UInt16(littleEndian: value)
     }
 
-    func readUInt32(at offset: inout Int) -> UInt32? {
+    public func readUInt32(at offset: inout Int) -> UInt32? {
         guard offset + 4 <= count else { return nil }
         let value = self.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self) }
         offset += 4
         return UInt32(littleEndian: value)
     }
 
-    func readInt64(at offset: inout Int) -> Int64? {
+    public func readInt64(at offset: inout Int) -> Int64? {
         guard offset + 8 <= count else { return nil }
         let value = self.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: Int64.self) }
         offset += 8
         return Int64(littleEndian: value)
     }
 
-    func readFloat64(at offset: inout Int) -> Double? {
+    public func readFloat64(at offset: inout Int) -> Double? {
         guard offset + 8 <= count else { return nil }
         let bits = self.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self) }
         offset += 8
