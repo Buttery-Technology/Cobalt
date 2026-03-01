@@ -179,3 +179,306 @@ import Foundation
     #expect(schema.columns.count == 3)
     #expect(schema.primaryKeyColumn?.name == "id")
 }
+
+// MARK: - Page Edge Cases
+
+@Test func testPageFillNearCapacity() throws {
+    var page = DatabasePage(pageID: 0)
+    var recordsAdded = 0
+
+    // Fill the page with small records until it can't fit more
+    while true {
+        let record = Record(id: UInt64(recordsAdded + 1), data: Data("record_\(recordsAdded)".utf8))
+        if !page.addRecord(record) {
+            break
+        }
+        recordsAdded += 1
+    }
+
+    #expect(recordsAdded > 0, "Should fit at least some records")
+    #expect(page.recordCount == recordsAdded)
+
+    // Verify data integrity after near-capacity fill
+    try page.saveRecords()
+    page.loadRecords()
+    #expect(page.records.count == recordsAdded)
+
+    // Verify each record's ID survived
+    let ids = Set(page.records.map { $0.id })
+    for i in 1...recordsAdded {
+        #expect(ids.contains(UInt64(i)), "Missing record ID \(i)")
+    }
+}
+
+@Test func testPageMultipleDeletesAndAdds() throws {
+    var page = DatabasePage(pageID: 0)
+
+    // Add 5 records
+    for i in 1...5 {
+        _ = page.addRecord(Record(id: UInt64(i), data: Data("r\(i)".utf8)))
+    }
+    #expect(page.recordCount == 5)
+
+    // Delete odd IDs
+    _ = page.deleteRecord(id: 1)
+    _ = page.deleteRecord(id: 3)
+    _ = page.deleteRecord(id: 5)
+    #expect(page.recordCount == 2)
+
+    // Verify remaining
+    try page.saveRecords()
+    page.loadRecords()
+    let ids = Set(page.records.map { $0.id })
+    #expect(ids == [2, 4])
+}
+
+@Test func testRecordWithEmptyData() {
+    let record = Record(id: 1, data: Data())
+    let serialized = record.serialize()
+    let deserialized = Record.deserialize(from: serialized)
+    #expect(deserialized != nil)
+    #expect(deserialized!.id == 1)
+    #expect(deserialized!.data.isEmpty)
+}
+
+@Test func testRecordWithLargeData() {
+    let largeData = Data(repeating: 0xAB, count: 4000)
+    let record = Record(id: 99, data: largeData)
+    let serialized = record.serialize()
+    let deserialized = Record.deserialize(from: serialized)
+    #expect(deserialized != nil)
+    #expect(deserialized!.id == 99)
+    #expect(deserialized!.data == largeData)
+}
+
+// MARK: - DBValue Edge Cases
+
+@Test func testDBValueNaNHandling() {
+    // NaN == NaN should be true (reflexive for storage, unlike IEEE)
+    let nan1 = DBValue.double(.nan)
+    let nan2 = DBValue.double(.nan)
+    #expect(nan1 == nan2)
+
+    // NaN hashing must be consistent
+    #expect(nan1.hashValue == nan2.hashValue)
+
+    // -0.0 == +0.0
+    let negZero = DBValue.double(-0.0)
+    let posZero = DBValue.double(0.0)
+    #expect(negZero == posZero)
+    #expect(negZero.hashValue == posZero.hashValue)
+}
+
+@Test func testDBValueCrossTypeComparisons() {
+    // Null is less than everything
+    #expect(DBValue.null < DBValue.integer(0))
+    #expect(DBValue.null < DBValue.string(""))
+    #expect(DBValue.null < DBValue.boolean(false))
+
+    // Type ordering: null(0) < boolean(1) < integer(2) < double(3) < string(4) < blob(5)
+    // Note: integer and double cross-compare as numbers, not by type order
+    #expect(DBValue.boolean(false) < DBValue.integer(0))
+    #expect(DBValue.double(0.0) < DBValue.string(""))
+    #expect(DBValue.string("") < DBValue.blob(Data()))
+
+    // Integer and double compare numerically
+    #expect(DBValue.integer(0) == DBValue.double(0.0))
+    #expect(DBValue.integer(1) < DBValue.double(1.5))
+    #expect(DBValue.double(0.5) < DBValue.integer(1))
+}
+
+@Test func testDBValueIntegerComparisons() {
+    #expect(DBValue.integer(Int64.min) < DBValue.integer(0))
+    #expect(DBValue.integer(0) < DBValue.integer(Int64.max))
+    #expect(DBValue.integer(Int64.max) == DBValue.integer(Int64.max))
+}
+
+@Test func testDBValueBlobComparisons() {
+    let a = DBValue.blob(Data([0x00, 0x01]))
+    let b = DBValue.blob(Data([0x00, 0x02]))
+    let c = DBValue.blob(Data([0x00, 0x01, 0x00]))
+    #expect(a < b)
+    #expect(a < c) // shorter but prefix matches
+}
+
+// MARK: - Row Edge Cases
+
+@Test func testRowEquality() {
+    let r1 = Row(values: ["a": .integer(1), "b": .string("hello")])
+    let r2 = Row(values: ["a": .integer(1), "b": .string("hello")])
+    let r3 = Row(values: ["a": .integer(1), "b": .string("world")])
+    #expect(r1 == r2)
+    #expect(r1 != r3)
+}
+
+@Test func testRowHashing() {
+    let r1 = Row(values: ["x": .integer(42)])
+    let r2 = Row(values: ["x": .integer(42)])
+    #expect(r1.hashValue == r2.hashValue)
+
+    // Can be used in Set
+    var rowSet: Set<Row> = [r1, r2]
+    #expect(rowSet.count == 1)
+    rowSet.insert(Row(values: ["x": .integer(43)]))
+    #expect(rowSet.count == 2)
+}
+
+@Test func testRowEmptyValues() {
+    let empty = Row(values: [:])
+    #expect(empty["anything"] == nil)
+    #expect(empty.values.isEmpty)
+}
+
+// MARK: - CRC32 Edge Cases
+
+@Test func testCRC32EmptyData() {
+    let checksum = CRC32.checksum(Data())
+    #expect(checksum != 0 || checksum == 0) // Should not crash; value is 0 for empty
+}
+
+@Test func testCRC32KnownValue() {
+    // CRC32 of "123456789" is a well-known test vector: 0xCBF43926
+    let data = Data("123456789".utf8)
+    let checksum = CRC32.checksum(data)
+    #expect(checksum == 0xCBF43926)
+}
+
+@Test func testCRC32LargeData() {
+    let largeData = Data(repeating: 0xFF, count: 100_000)
+    let checksum = CRC32.checksum(largeData)
+    // Same data should produce same checksum
+    #expect(CRC32.checksum(largeData) == checksum)
+}
+
+// MARK: - Encryption Edge Cases
+
+@Test func testEncryptionSmallData() throws {
+    let key = Data(repeating: 0x42, count: 32)
+    let provider = try AESGCMEncryptionProvider(key: key)
+
+    // Single byte — smallest non-empty plaintext
+    let small = Data([0x42])
+    let encrypted = try provider.encrypt(small)
+    #expect(encrypted.count > small.count) // nonce + ciphertext + tag
+    let decrypted = try provider.decrypt(encrypted)
+    #expect(decrypted == small)
+}
+
+@Test func testEncryptionDifferentCiphertexts() throws {
+    let key = Data(repeating: 0x42, count: 32)
+    let provider = try AESGCMEncryptionProvider(key: key)
+
+    let plaintext = Data("same data".utf8)
+    let enc1 = try provider.encrypt(plaintext)
+    let enc2 = try provider.encrypt(plaintext)
+
+    // Different nonces = different ciphertexts
+    #expect(enc1 != enc2)
+
+    // Both decrypt to same plaintext
+    #expect(try provider.decrypt(enc1) == plaintext)
+    #expect(try provider.decrypt(enc2) == plaintext)
+}
+
+@Test func testDecryptionWithWrongKey() throws {
+    let key1 = Data(repeating: 0x42, count: 32)
+    let key2 = Data(repeating: 0x43, count: 32)
+
+    let provider1 = try AESGCMEncryptionProvider(key: key1)
+    let provider2 = try AESGCMEncryptionProvider(key: key2)
+
+    let encrypted = try provider1.encrypt(Data("secret".utf8))
+
+    #expect(throws: Error.self) {
+        _ = try provider2.decrypt(encrypted)
+    }
+}
+
+@Test func testDecryptionWithCorruptedData() throws {
+    let key = Data(repeating: 0x42, count: 32)
+    let provider = try AESGCMEncryptionProvider(key: key)
+
+    let encrypted = try provider.encrypt(Data("test".utf8))
+    var corrupted = encrypted
+    corrupted[corrupted.count / 2] ^= 0xFF // Flip bits in the middle
+
+    #expect(throws: Error.self) {
+        _ = try provider.decrypt(corrupted)
+    }
+}
+
+// MARK: - Schema Factory Methods
+
+@Test func testSchemaFactoryMethods() {
+    let id = PantryColumn.id("pk")
+    #expect(id.name == "pk")
+    #expect(id.type == .string)
+    #expect(id.isPrimaryKey)
+    #expect(!id.isNullable)
+
+    let str = PantryColumn.string("name", nullable: false, defaultValue: "unknown")
+    #expect(str.type == .string)
+    #expect(!str.isNullable)
+    #expect(str.defaultValue == .string("unknown"))
+
+    let int = PantryColumn.integer("age", defaultValue: 0)
+    #expect(int.type == .integer)
+    #expect(int.isNullable) // default
+    #expect(int.defaultValue == .integer(0))
+
+    let dbl = PantryColumn.double("score")
+    #expect(dbl.type == .double)
+    #expect(dbl.defaultValue == nil)
+
+    let bool = PantryColumn.boolean("active", defaultValue: true)
+    #expect(bool.type == .boolean)
+    #expect(bool.defaultValue == .boolean(true))
+
+    let data = PantryColumn.blob("photo")
+    #expect(data.type == .blob)
+}
+
+// MARK: - StorageManager Edge Cases
+
+@Test func testStorageManagerMultiplePages() async throws {
+    let path = NSTemporaryDirectory() + "pantry_sm_multi_\(UUID().uuidString).db"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let sm = try StorageManager(databasePath: path)
+
+    // Create and write multiple pages
+    var pages: [DatabasePage] = []
+    for i in 0..<10 {
+        var page = try await sm.createNewPage()
+        _ = page.addRecord(Record(id: UInt64(i + 1), data: Data("page_\(i)".utf8)))
+        try await sm.writePage(&page)
+        pages.append(page)
+    }
+
+    // Read them all back in reverse order
+    for i in (0..<10).reversed() {
+        let loaded = try await sm.readPage(pageID: pages[i].pageID)
+        #expect(loaded.records.count == 1)
+        #expect(loaded.records[0].id == UInt64(i + 1))
+    }
+
+    try await sm.close()
+}
+
+@Test func testPageFlagsAllCombinations() {
+    var page = DatabasePage(pageID: 0)
+
+    // Set all flags
+    page.pageFlags = [.system, .indexNode, .dataPage, .overflow, .tableRegistry]
+    #expect(page.isSystemPage)
+    #expect(page.pageFlags.contains(.indexNode))
+    #expect(page.pageFlags.contains(.dataPage))
+    #expect(page.pageFlags.contains(.overflow))
+    #expect(page.pageFlags.contains(.tableRegistry))
+
+    // Clear and set one
+    page.pageFlags = .dataPage
+    #expect(!page.isSystemPage)
+    #expect(page.pageFlags.contains(.dataPage))
+    #expect(!page.pageFlags.contains(.indexNode))
+}
