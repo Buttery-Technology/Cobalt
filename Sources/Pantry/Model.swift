@@ -5,16 +5,32 @@ import PantryCore
 
 /// A type-safe model that can be stored in a Pantry database.
 /// Models are value types (structs) with a string ID and Codable properties.
+///
+/// The table name defaults to the lowercased type name + "s" (e.g., `User` → `"users"`).
+/// Override `tableName` if you need a custom name:
+///
+/// ```swift
+/// struct User: PantryModel {
+///     var id: String = UUID().uuidString
+///     var name: String
+///     // Uses default table name "users"
+/// }
+///
+/// struct HTTPLog: PantryModel {
+///     static let tableName = "http_logs"  // Custom override
+///     var id: String = UUID().uuidString
+///     var url: String
+/// }
+/// ```
 public protocol PantryModel: Codable, Sendable {
     /// The database table name for this model type.
-    /// Defaults to the lowercased type name + "s" (e.g., `User` → `"users"`).
+    /// Defaults to the lowercased type name + "s". Override to customize.
     static var tableName: String { get }
     /// The unique identifier for this model instance.
     var id: String { get set }
 }
 
 extension PantryModel {
-    /// Default table name: lowercased type name + "s" (e.g., `User` → `"users"`).
     public static var tableName: String {
         String(describing: Self.self).lowercased() + "s"
     }
