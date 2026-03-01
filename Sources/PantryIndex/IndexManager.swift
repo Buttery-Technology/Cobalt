@@ -116,6 +116,11 @@ public actor IndexManager: IndexHook, Sendable {
         return tableIndexes.map { (column: $0.key, isCompound: $0.value.compoundColumns != nil) }
     }
 
+    /// Check if an index exists on a table column
+    public func hasIndex(tableName: String, columnName: String) -> Bool {
+        indexes[tableName]?[columnName] != nil
+    }
+
     /// Drop a single index by table and column name
     public func dropIndex(tableName: String, columnName: String) {
         indexes[tableName]?.removeValue(forKey: columnName)

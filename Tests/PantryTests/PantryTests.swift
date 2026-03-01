@@ -2164,16 +2164,16 @@ import Foundation
         PantryColumn(name: "age", type: .integer),
     ]))
 
-    // No indexes initially
+    // Auto-created PK index on "id"
     let before = await db.listIndexes(on: "t")
-    #expect(before.isEmpty)
+    #expect(before.count == 1)
+    #expect(before[0].column == "id")
 
     // Create a single-column index
     try await db.createIndex(table: "t", column: "name")
     let after = await db.listIndexes(on: "t")
-    #expect(after.count == 1)
-    #expect(after[0].column == "name")
-    #expect(after[0].isCompound == false)
+    #expect(after.count == 2)
+    #expect(after.contains { $0.column == "name" && !$0.isCompound })
 
     try await db.close()
 }
@@ -2190,11 +2190,12 @@ import Foundation
 
     try await db.createIndex(table: "t", column: "name")
     let beforeDrop = await db.listIndexes(on: "t")
-    #expect(beforeDrop.count == 1)
+    #expect(beforeDrop.count == 2) // PK index + name index
 
     await db.dropIndex(table: "t", column: "name")
     let afterDrop = await db.listIndexes(on: "t")
-    #expect(afterDrop.isEmpty)
+    #expect(afterDrop.count == 1) // PK index remains
+    #expect(afterDrop[0].column == "id")
 
     try await db.close()
 }
@@ -2212,8 +2213,8 @@ import Foundation
 
     try await db.createCompoundIndex(table: "t", columns: ["name", "age"])
     let indexes = await db.listIndexes(on: "t")
-    #expect(indexes.count == 1)
-    #expect(indexes[0].isCompound == true)
+    #expect(indexes.count == 2) // PK index + compound index
+    #expect(indexes.contains { $0.isCompound == true })
 
     try await db.close()
 }

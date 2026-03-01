@@ -21,6 +21,7 @@ public actor WriteAheadLog: Sendable {
     private let logCacheLimit = 1000
     private let storageManager: StorageManager
     private let groupCommitConfig: GroupCommitConfig
+    private let encryptionProvider: EncryptionProvider?
 
     /// Pending commit continuations waiting for the next fsync batch
     private var pendingCommits: [(txID: UInt64, continuation: CheckedContinuation<Void, Error>)] = []
@@ -55,10 +56,11 @@ public actor WriteAheadLog: Sendable {
 
     // MARK: - Initialization
 
-    public init(databasePath: String, storageManager: StorageManager, groupCommitConfig: GroupCommitConfig = GroupCommitConfig()) async throws {
+    public init(databasePath: String, storageManager: StorageManager, groupCommitConfig: GroupCommitConfig = GroupCommitConfig(), encryptionProvider: EncryptionProvider? = nil) async throws {
         self.logFilePath = databasePath + ".wal"
         self.storageManager = storageManager
         self.groupCommitConfig = groupCommitConfig
+        self.encryptionProvider = encryptionProvider
 
         if !FileManager.default.fileExists(atPath: logFilePath) {
             FileManager.default.createFile(atPath: logFilePath, contents: nil)
@@ -406,18 +408,26 @@ public actor WriteAheadLog: Sendable {
             throw PantryError.walWriteError(description: "WAL file handle is closed")
         }
 
-        let crc = CRC32.checksum(data)
+        // Encrypt the record payload if encryption is configured
+        let payload: Data
+        if let provider = encryptionProvider {
+            payload = try provider.encrypt(data)
+        } else {
+            payload = data
+        }
+
+        let crc = CRC32.checksum(payload)
 
         var headerData = Data()
-        let totalLength = UInt32(data.count + 8)
+        let totalLength = UInt32(payload.count + 8)
         withUnsafeBytes(of: totalLength) { headerData.append(contentsOf: $0) }
         withUnsafeBytes(of: crc) { headerData.append(contentsOf: $0) }
 
         try fh.seek(toOffset: currentLogPosition)
         try fh.write(contentsOf: headerData)
-        try fh.write(contentsOf: data)
+        try fh.write(contentsOf: payload)
 
-        currentLogPosition += UInt64(headerData.count + data.count)
+        currentLogPosition += UInt64(headerData.count + payload.count)
     }
 
     /// Parse the actual log file to retrieve all log records
@@ -446,11 +456,19 @@ public actor WriteAheadLog: Sendable {
             let dataLength = Int(totalLength) - 8
             guard dataLength > 0, pos + dataLength <= allData.count else { break }
 
-            let recordData = allData.subdata(in: pos..<(pos + dataLength))
-            let computedCRC = CRC32.checksum(recordData)
+            let payload = allData.subdata(in: pos..<(pos + dataLength))
+            let computedCRC = CRC32.checksum(payload)
             guard computedCRC == storedCRC else {
                 pos += dataLength
                 continue
+            }
+
+            // Decrypt if encryption is configured
+            let recordData: Data
+            if let provider = encryptionProvider {
+                do { recordData = try provider.decrypt(payload) } catch { pos += dataLength; continue }
+            } else {
+                recordData = payload
             }
 
             if let record = parseLogRecord(recordData) {
@@ -587,11 +605,19 @@ public actor WriteAheadLog: Sendable {
             let dataLength = Int(totalLength) - 8
             guard dataLength > 0, pos + dataLength <= allData.count else { break }
 
-            let recordData = allData.subdata(in: pos..<(pos + dataLength))
-            let computedCRC = CRC32.checksum(recordData)
+            let payload = allData.subdata(in: pos..<(pos + dataLength))
+            let computedCRC = CRC32.checksum(payload)
             guard computedCRC == storedCRC else {
                 pos += dataLength
                 continue
+            }
+
+            // Decrypt if encryption is configured
+            let recordData: Data
+            if let provider = encryptionProvider {
+                do { recordData = try provider.decrypt(payload) } catch { pos += dataLength; continue }
+            } else {
+                recordData = payload
             }
 
             if let record = parseLogRecord(recordData) {
