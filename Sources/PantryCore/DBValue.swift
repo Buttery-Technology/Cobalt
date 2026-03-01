@@ -92,6 +92,19 @@ public enum DBValue: Codable, Comparable, Hashable, Sendable {
         }
     }
 
+    /// String key for statistics collection (distinct value counting)
+    public var statsKey: String {
+        switch self {
+        case .null: return "__null__"
+        case .integer(let v): return "i:\(v)"
+        case .double(let v): return "d:\(v)"
+        case .string(let v): return "s:\(v)"
+        case .boolean(let v): return "b:\(v)"
+        case .blob(let v): return "x:\(v.base64EncodedString())"
+        case .compound(let values): return "c:[\(values.map { $0.statsKey }.joined(separator: ","))]"
+        }
+    }
+
     private var typeOrder: Int {
         switch self {
         case .null: return 0

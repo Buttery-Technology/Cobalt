@@ -27,11 +27,19 @@ public actor QueryExecutor: Sendable {
     public func executeSelect(from table: String, columns: [String]? = nil, where condition: WhereCondition? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {
         let rows: [Row]
 
-        // Attempt index lookup before falling back to table scan
+        // Attempt index lookup — skip if selectivity is too low (>30% of table)
         if let condition = condition,
+           shouldUseIndex(table: table, condition: condition),
            let indexed = try await indexManager.attemptIndexLookup(tableName: table, condition: condition) {
-            // Index returned results; apply remaining in-memory filtering and strip __rid
-            rows = indexed.filter { evaluateCondition(condition, row: $0) }.map { stripRID($0) }
+            // Index returned slim rows with __rid; batch-fetch full records from table
+            let matchingRIDs = Set(indexed.compactMap { row -> UInt64? in
+                guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
+                return UInt64(bitPattern: ridSigned)
+            })
+            let fullRecords = try await storageEngine.getRecordsByIDs(matchingRIDs, tableName: table, transactionContext: transactionContext)
+            rows = fullRecords
+                .map { $0.1 }
+                .filter { evaluateCondition(condition, row: $0) }
         } else if let condition = condition {
             // Full table scan with parallel page decoding + lazy deserialization
             let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
@@ -107,22 +115,24 @@ public actor QueryExecutor: Sendable {
     // MARK: - UPDATE
 
     public func executeUpdate(table: String, set values: [String: DBValue], where condition: WhereCondition?, transactionContext: TransactionContext? = nil) async throws -> Int {
-        // Try index-accelerated path when a condition with __rid-enabled index results is available
+        // Try index-accelerated path: index returns slim rows with __rid, batch-fetch full records
         if let condition = condition,
            let indexedRows = try await indexManager.attemptIndexLookup(tableName: table, condition: condition) {
-            var updatedCount = 0
-            for indexRow in indexedRows where evaluateCondition(condition, row: indexRow) {
-                guard case .integer(let ridSigned) = indexRow.values["__rid"] else { continue }
-                let recordId = UInt64(bitPattern: ridSigned)
+            let matchingRIDs = Set(indexedRows.compactMap { row -> UInt64? in
+                guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
+                return UInt64(bitPattern: ridSigned)
+            })
+            let fullRecords = try await storageEngine.getRecordsByIDs(matchingRIDs, tableName: table, transactionContext: transactionContext)
 
-                var updatedValues = indexRow.values
-                updatedValues.removeValue(forKey: "__rid")
+            var updatedCount = 0
+            for (record, row) in fullRecords where evaluateCondition(condition, row: row) {
+                var updatedValues = row.values
                 for (key, value) in values { updatedValues[key] = value }
                 let updatedRow = Row(values: updatedValues)
 
                 let rowData = updatedRow.toBytes()
-                let newRecord = Record(id: recordId, data: rowData)
-                try await storageEngine.deleteRecord(id: recordId, tableName: table, transactionContext: transactionContext)
+                let newRecord = Record(id: record.id, data: rowData)
+                try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
                 try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
                 updatedCount += 1
             }
@@ -156,14 +166,18 @@ public actor QueryExecutor: Sendable {
     // MARK: - DELETE
 
     public func executeDelete(from table: String, where condition: WhereCondition?, transactionContext: TransactionContext? = nil) async throws -> Int {
-        // Try index-accelerated path
+        // Try index-accelerated path: slim rows → batch fetch full records for condition eval
         if let condition = condition,
            let indexedRows = try await indexManager.attemptIndexLookup(tableName: table, condition: condition) {
+            let matchingRIDs = Set(indexedRows.compactMap { row -> UInt64? in
+                guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
+                return UInt64(bitPattern: ridSigned)
+            })
+            let fullRecords = try await storageEngine.getRecordsByIDs(matchingRIDs, tableName: table, transactionContext: transactionContext)
+
             var deletedCount = 0
-            for indexRow in indexedRows where evaluateCondition(condition, row: indexRow) {
-                guard case .integer(let ridSigned) = indexRow.values["__rid"] else { continue }
-                let recordId = UInt64(bitPattern: ridSigned)
-                try await storageEngine.deleteRecord(id: recordId, tableName: table, transactionContext: transactionContext)
+            for (record, row) in fullRecords where evaluateCondition(condition, row: row) {
+                try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
                 deletedCount += 1
             }
             return deletedCount
@@ -378,6 +392,31 @@ public actor QueryExecutor: Sendable {
             return false
         default:
             return nil // Fall back to full decode
+        }
+    }
+
+    // MARK: - Statistics-Based Optimization
+
+    /// Decide whether to use an index based on column statistics.
+    /// Returns false (prefer table scan) when selectivity is too low.
+    private nonisolated func shouldUseIndex(table: String, condition: WhereCondition) -> Bool {
+        switch condition {
+        case .equals(let column, _):
+            if let stats = storageEngine.getColumnStats(table, column: column) {
+                // If equality selectivity > 30%, table scan is likely faster
+                return stats.equalitySelectivity <= 0.3
+            }
+            return true // No stats — assume index is helpful
+
+        case .in(let column, let values):
+            if let stats = storageEngine.getColumnStats(table, column: column) {
+                let selectivity = stats.equalitySelectivity * Double(values.count)
+                return selectivity <= 0.5
+            }
+            return true
+
+        default:
+            return true // For range queries, between, etc. — always use index
         }
     }
 

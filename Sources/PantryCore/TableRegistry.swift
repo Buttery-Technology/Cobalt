@@ -1,6 +1,24 @@
 import Foundation
 import Synchronization
 
+/// Per-column statistics for query optimization
+public struct ColumnStats: Codable, Sendable {
+    /// Approximate number of distinct values in this column
+    public var distinctCount: Int
+    /// Whether this column has an index
+    public var isIndexed: Bool
+
+    public init(distinctCount: Int = 0, isIndexed: Bool = false) {
+        self.distinctCount = distinctCount
+        self.isIndexed = isIndexed
+    }
+
+    /// Selectivity estimate for an equality predicate (lower = more selective)
+    public var equalitySelectivity: Double {
+        distinctCount > 0 ? 1.0 / Double(distinctCount) : 1.0
+    }
+}
+
 /// Metadata about a single table stored in the registry
 public struct TableInfo: Codable, Sendable {
     public var tableID: Int
@@ -9,14 +27,17 @@ public struct TableInfo: Codable, Sendable {
     public var lastPageID: Int
     public var recordCount: Int
     public var schema: PantryTableSchema
+    /// Per-column statistics for query optimization (column name → stats)
+    public var columnStats: [String: ColumnStats]
 
-    public init(tableID: Int, name: String, firstPageID: Int, lastPageID: Int, recordCount: Int, schema: PantryTableSchema) {
+    public init(tableID: Int, name: String, firstPageID: Int, lastPageID: Int, recordCount: Int, schema: PantryTableSchema, columnStats: [String: ColumnStats] = [:]) {
         self.tableID = tableID
         self.name = name
         self.firstPageID = firstPageID
         self.lastPageID = lastPageID
         self.recordCount = recordCount
         self.schema = schema
+        self.columnStats = columnStats
     }
 }
 

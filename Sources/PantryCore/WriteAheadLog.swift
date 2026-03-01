@@ -1,5 +1,16 @@
 import Foundation
 
+/// Configuration for group commit batching
+public struct GroupCommitConfig: Sendable {
+    public let maxDelayMicroseconds: Int
+    public let maxBatchSize: Int
+
+    public init(maxDelayMicroseconds: Int = 1000, maxBatchSize: Int = 32) {
+        self.maxDelayMicroseconds = maxDelayMicroseconds
+        self.maxBatchSize = maxBatchSize
+    }
+}
+
 /// Write-Ahead Log for transaction durability and crash recovery
 public actor WriteAheadLog: Sendable {
     private let logFilePath: String
@@ -9,6 +20,10 @@ public actor WriteAheadLog: Sendable {
     private var logCache: [UInt64: LogRecord] = [:]
     private let logCacheLimit = 1000
     private let storageManager: StorageManager
+    private let groupCommitConfig: GroupCommitConfig
+
+    /// Pending commit continuations waiting for the next fsync batch
+    private var pendingCommits: [(txID: UInt64, continuation: CheckedContinuation<Void, Error>)] = []
 
     // MARK: - Types
 
@@ -19,11 +34,14 @@ public actor WriteAheadLog: Sendable {
         case pageBeforeUpdate = 4
         case pageAfterUpdate = 5
         case checkpoint = 6
+        case pageBeforeDelta = 7
+        case pageAfterDelta = 8
     }
 
     public enum LogContent: Sendable {
         case transaction(IsolationLevel)
         case pageImage(Int, UInt64, Data) // pageID, timestamp, data
+        case pageDelta(Int, UInt64, Data) // pageID, timestamp, delta data
         case checkpoint([UInt64]) // active transaction IDs
     }
 
@@ -37,9 +55,10 @@ public actor WriteAheadLog: Sendable {
 
     // MARK: - Initialization
 
-    public init(databasePath: String, storageManager: StorageManager) async throws {
+    public init(databasePath: String, storageManager: StorageManager, groupCommitConfig: GroupCommitConfig = GroupCommitConfig()) async throws {
         self.logFilePath = databasePath + ".wal"
         self.storageManager = storageManager
+        self.groupCommitConfig = groupCommitConfig
 
         if !FileManager.default.fileExists(atPath: logFilePath) {
             FileManager.default.createFile(atPath: logFilePath, contents: nil)
@@ -93,7 +112,7 @@ public actor WriteAheadLog: Sendable {
         try writeLogRecord(logData)
     }
 
-    public func logTransactionCommit(txID: UInt64, isolationLevel: IsolationLevel = .readCommitted) throws {
+    public func logTransactionCommit(txID: UInt64, isolationLevel: IsolationLevel = .readCommitted) async throws {
         let lsn = nextLSN
         nextLSN += 1
 
@@ -107,7 +126,38 @@ public actor WriteAheadLog: Sendable {
         cacheLogRecord(lsn: lsn, type: .transactionCommit, txID: txID, timestamp: timestamp, content: .transaction(isolationLevel))
 
         try writeLogRecord(logData)
-        try logFileHandle?.synchronize()
+
+        // Join the pending batch for fsync
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            pendingCommits.append((txID: txID, continuation: cont))
+            if pendingCommits.count >= groupCommitConfig.maxBatchSize {
+                flushBatch()
+            } else if pendingCommits.count == 1 {
+                // First in batch — schedule delayed flush
+                Task { [weak self] in
+                    try? await Task.sleep(for: .microseconds(self?.groupCommitConfig.maxDelayMicroseconds ?? 1000))
+                    await self?.flushBatchIfNeeded()
+                }
+            }
+        }
+    }
+
+    private func flushBatch() {
+        guard !pendingCommits.isEmpty else { return }
+        let batch = pendingCommits
+        pendingCommits = []
+        do {
+            try logFileHandle?.synchronize()
+            for item in batch { item.continuation.resume() }
+        } catch {
+            for item in batch { item.continuation.resume(throwing: error) }
+        }
+    }
+
+    private func flushBatchIfNeeded() {
+        if !pendingCommits.isEmpty {
+            flushBatch()
+        }
     }
 
     public func logTransactionRollback(txID: UInt64, isolationLevel: IsolationLevel = .readCommitted) throws {
@@ -168,6 +218,116 @@ public actor WriteAheadLog: Sendable {
         try writeLogRecord(logData)
     }
 
+    // MARK: - Delta Page Logging
+
+    /// Compute a binary delta between two page data buffers and log it.
+    /// Delta format: [2B range count][per range: [2B offset][2B length][N bytes data]]
+    /// Returns true if delta was used, false if full image was logged instead.
+    @discardableResult
+    public func logPageDelta(txID: UInt64, pageID: Int, oldData: Data, newData: Data, type: LogRecordType) throws -> Bool {
+        let delta = Self.computeDelta(oldData: oldData, newData: newData)
+
+        // Threshold: use delta only when it's smaller than 4KB (half a page)
+        if delta.count >= 4096 {
+            let fullType: LogRecordType = (type == .pageBeforeDelta) ? .pageBeforeUpdate : .pageAfterUpdate
+            let lsn = nextLSN
+            nextLSN += 1
+            let timestamp = UInt64(Date().timeIntervalSince1970)
+
+            var logData = Data()
+            logData.append(fullType.rawValue)
+            withUnsafeBytes(of: lsn) { logData.append(contentsOf: $0) }
+            withUnsafeBytes(of: txID) { logData.append(contentsOf: $0) }
+            withUnsafeBytes(of: timestamp) { logData.append(contentsOf: $0) }
+            withUnsafeBytes(of: pageID) { logData.append(contentsOf: $0) }
+            let imageData = (type == .pageBeforeDelta) ? oldData : newData
+            let dataLength = UInt32(imageData.count)
+            withUnsafeBytes(of: dataLength) { logData.append(contentsOf: $0) }
+            logData.append(imageData)
+
+            cacheLogRecord(lsn: lsn, type: fullType, txID: txID, timestamp: timestamp, content: .pageImage(pageID, timestamp, imageData))
+            try writeLogRecord(logData)
+            return false
+        }
+
+        let lsn = nextLSN
+        nextLSN += 1
+        let timestamp = UInt64(Date().timeIntervalSince1970)
+
+        var logData = Data()
+        logData.append(type.rawValue)
+        withUnsafeBytes(of: lsn) { logData.append(contentsOf: $0) }
+        withUnsafeBytes(of: txID) { logData.append(contentsOf: $0) }
+        withUnsafeBytes(of: timestamp) { logData.append(contentsOf: $0) }
+        withUnsafeBytes(of: pageID) { logData.append(contentsOf: $0) }
+        let deltaLength = UInt32(delta.count)
+        withUnsafeBytes(of: deltaLength) { logData.append(contentsOf: $0) }
+        logData.append(delta)
+
+        cacheLogRecord(lsn: lsn, type: type, txID: txID, timestamp: timestamp, content: .pageDelta(pageID, timestamp, delta))
+        try writeLogRecord(logData)
+        return true
+    }
+
+    /// Compute binary delta between old and new data.
+    /// Format: [2B range count][per range: [2B offset][2B length][N bytes changed data]]
+    public static func computeDelta(oldData: Data, newData: Data) -> Data {
+        let len = min(oldData.count, newData.count)
+        var ranges: [(offset: UInt16, data: Data)] = []
+        var i = 0
+
+        while i < len {
+            if oldData[oldData.startIndex + i] == newData[newData.startIndex + i] {
+                i += 1
+                continue
+            }
+            let start = i
+            while i < len && oldData[oldData.startIndex + i] != newData[newData.startIndex + i] {
+                i += 1
+            }
+            let rangeData = newData.subdata(in: (newData.startIndex + start)..<(newData.startIndex + i))
+            ranges.append((offset: UInt16(start), data: rangeData))
+        }
+
+        var delta = Data()
+        var rangeCount = UInt16(ranges.count)
+        withUnsafeBytes(of: &rangeCount) { delta.append(contentsOf: $0) }
+        for range in ranges {
+            var off = range.offset.littleEndian
+            withUnsafeBytes(of: &off) { delta.append(contentsOf: $0) }
+            var length = UInt16(range.data.count).littleEndian
+            withUnsafeBytes(of: &length) { delta.append(contentsOf: $0) }
+            delta.append(range.data)
+        }
+
+        return delta
+    }
+
+    /// Apply a delta to page data to produce the modified version.
+    public static func applyDelta(to baseData: Data, delta: Data) -> Data? {
+        guard delta.count >= 2 else { return nil }
+        var result = baseData
+        var pos = 0
+
+        let rangeCount = delta.withUnsafeBytes { UInt16(littleEndian: $0.loadUnaligned(fromByteOffset: pos, as: UInt16.self)) }
+        pos += 2
+
+        for _ in 0..<rangeCount {
+            guard pos + 4 <= delta.count else { return nil }
+            let offset = delta.withUnsafeBytes { Int(UInt16(littleEndian: $0.loadUnaligned(fromByteOffset: pos, as: UInt16.self))) }
+            pos += 2
+            let length = delta.withUnsafeBytes { Int(UInt16(littleEndian: $0.loadUnaligned(fromByteOffset: pos, as: UInt16.self))) }
+            pos += 2
+            guard pos + length <= delta.count else { return nil }
+            guard offset + length <= result.count else { return nil }
+            let rangeData = delta.subdata(in: pos..<(pos + length))
+            result.replaceSubrange(offset..<(offset + length), with: rangeData)
+            pos += length
+        }
+
+        return result
+    }
+
     // MARK: - Recovery
 
     public func recoverPage(pageID: Int) throws -> DatabasePage {
@@ -191,7 +351,7 @@ public actor WriteAheadLog: Sendable {
         throw PantryError.pageNotInLog
     }
 
-    /// Undo a transaction by restoring before-images via StorageManager
+    /// Undo a transaction by restoring before-images (or applying before-deltas) via StorageManager
     public func undoTransaction(txID: UInt64) async throws {
         let logRecords = try getAllLogRecords()
 
@@ -199,11 +359,25 @@ public actor WriteAheadLog: Sendable {
             .sorted { $0.lsn > $1.lsn }
 
         for record in txRecords {
-            if case let .pageImage(pageID, _, pageData) = record.content,
-               record.type == .pageBeforeUpdate {
-                var restoredPage = DatabasePage(pageID: pageID, data: pageData)
-                restoredPage.loadRecords()
-                try await storageManager.writePage(&restoredPage)
+            switch record.type {
+            case .pageBeforeUpdate:
+                if case let .pageImage(pageID, _, pageData) = record.content {
+                    var restoredPage = DatabasePage(pageID: pageID, data: pageData)
+                    restoredPage.loadRecords()
+                    try await storageManager.writePage(&restoredPage)
+                }
+            case .pageBeforeDelta:
+                if case let .pageDelta(pageID, _, delta) = record.content {
+                    // Read current on-disk page and apply the before-delta to reconstruct pre-modification state
+                    let currentPage = try await storageManager.readPage(pageID: pageID)
+                    if let restoredData = Self.applyDelta(to: currentPage.data, delta: delta) {
+                        var restoredPage = DatabasePage(pageID: pageID, data: restoredData)
+                        restoredPage.loadRecords()
+                        try await storageManager.writePage(&restoredPage)
+                    }
+                }
+            default:
+                break
             }
         }
     }
@@ -341,6 +515,20 @@ public actor WriteAheadLog: Sendable {
             guard pos + 8 <= data.count else { return nil }
             let timestamp = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: pos, as: UInt64.self) }
             return LogRecord(lsn: lsn, type: type, transactionID: 0, timestamp: timestamp, content: .checkpoint([]))
+
+        case .pageBeforeDelta, .pageAfterDelta:
+            guard pos + 8 + 8 + 8 + 4 <= data.count else { return nil }
+            let txID = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: pos, as: UInt64.self) }
+            pos += 8
+            let timestamp = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: pos, as: UInt64.self) }
+            pos += 8
+            let pageID = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: pos, as: Int.self) }
+            pos += 8
+            let deltaLength = data.withUnsafeBytes { Int($0.loadUnaligned(fromByteOffset: pos, as: UInt32.self)) }
+            pos += 4
+            guard pos + deltaLength <= data.count else { return nil }
+            let deltaData = data.subdata(in: pos..<(pos + deltaLength))
+            return LogRecord(lsn: lsn, type: type, transactionID: txID, timestamp: timestamp, content: .pageDelta(pageID, timestamp, deltaData))
         }
     }
 

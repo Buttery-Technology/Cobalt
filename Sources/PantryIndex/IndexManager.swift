@@ -68,7 +68,7 @@ public actor IndexManager: IndexHook, Sendable {
     /// Create a new index for a table column
     public func createIndex(tableName: String, columnName: String) async throws -> ColumnIndex {
         let nodeStore = PageBackedNodeStore(bufferPool: bufferPool, storageManager: storageManager)
-        let btree = BTree(order: 10, nodeStore: nodeStore)
+        let btree = BTree(order: 64, nodeStore: nodeStore)
         let columnIndex = ColumnIndex(tableName: tableName, columnName: columnName, btree: btree, nodeStore: nodeStore)
 
         if indexes[tableName] == nil {
@@ -85,7 +85,7 @@ public actor IndexManager: IndexHook, Sendable {
         }
         let indexName = columns.joined(separator: "+")
         let nodeStore = PageBackedNodeStore(bufferPool: bufferPool, storageManager: storageManager)
-        let btree = BTree(order: 10, nodeStore: nodeStore)
+        let btree = BTree(order: 64, nodeStore: nodeStore)
         let columnIndex = ColumnIndex(tableName: tableName, columnName: indexName, compoundColumns: columns, btree: btree, nodeStore: nodeStore)
 
         if indexes[tableName] == nil {
@@ -149,7 +149,7 @@ public actor IndexManager: IndexHook, Sendable {
             let nodeStore = PageBackedNodeStore(bufferPool: bufferPool, storageManager: storageManager)
             await nodeStore.restoreNodePageMap(entry.decodedNodePageMap)
 
-            let btree = BTree(order: 10, nodeStore: nodeStore)
+            let btree = BTree(order: 64, nodeStore: nodeStore)
             await btree.setRootId(entry.rootNodeId)
 
             let columnIndex = ColumnIndex(
@@ -192,21 +192,24 @@ public actor IndexManager: IndexHook, Sendable {
     public func updateIndexes(record: Record, row: Row, tableName: String) async throws {
         guard let tableIndexes = indexes[tableName] else { return }
 
-        // Embed record ID so index-accelerated update/delete can skip table scan
-        var indexValues = row.values
-        indexValues["__rid"] = .integer(Int64(bitPattern: record.id))
-        let indexRow = Row(values: indexValues)
+        let rid: DBValue = .integer(Int64(bitPattern: record.id))
 
         for (_, columnIndex) in tableIndexes {
             if let columns = await columnIndex.compoundColumns {
-                // Compound index: build compound key from multiple columns
-                let keyValues = columns.map { indexRow.values[$0] ?? .null }
+                // Compound index: slim row with __rid + indexed columns only
+                var slimValues: [String: DBValue] = ["__rid": rid]
+                let keyValues = columns.map { col -> DBValue in
+                    let v = row.values[col] ?? .null
+                    slimValues[col] = v
+                    return v
+                }
                 let compoundKey = DBValue.compound(keyValues)
-                try await columnIndex.insert(key: compoundKey, row: indexRow)
+                try await columnIndex.insert(key: compoundKey, row: Row(values: slimValues))
             } else {
                 let columnName = await columnIndex.columnName
-                if let value = indexRow.values[columnName] {
-                    try await columnIndex.insert(key: value, row: indexRow)
+                if let value = row.values[columnName] {
+                    let slimRow = Row(values: ["__rid": rid, columnName: value])
+                    try await columnIndex.insert(key: value, row: slimRow)
                 }
             }
         }
@@ -215,19 +218,23 @@ public actor IndexManager: IndexHook, Sendable {
     public func removeFromIndexes(id: UInt64, row: Row, tableName: String) async throws {
         guard let tableIndexes = indexes[tableName] else { return }
 
-        var indexValues = row.values
-        indexValues["__rid"] = .integer(Int64(bitPattern: id))
-        let indexRow = Row(values: indexValues)
+        let rid: DBValue = .integer(Int64(bitPattern: id))
 
         for (_, columnIndex) in tableIndexes {
             if let columns = await columnIndex.compoundColumns {
-                let keyValues = columns.map { indexRow.values[$0] ?? .null }
+                var slimValues: [String: DBValue] = ["__rid": rid]
+                let keyValues = columns.map { col -> DBValue in
+                    let v = row.values[col] ?? .null
+                    slimValues[col] = v
+                    return v
+                }
                 let compoundKey = DBValue.compound(keyValues)
-                try await columnIndex.delete(key: compoundKey, row: indexRow)
+                try await columnIndex.delete(key: compoundKey, row: Row(values: slimValues))
             } else {
                 let columnName = await columnIndex.columnName
-                if let value = indexRow.values[columnName] {
-                    try await columnIndex.delete(key: value, row: indexRow)
+                if let value = row.values[columnName] {
+                    let slimRow = Row(values: ["__rid": rid, columnName: value])
+                    try await columnIndex.delete(key: value, row: slimRow)
                 }
             }
         }

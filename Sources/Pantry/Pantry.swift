@@ -81,29 +81,37 @@ public actor PantryDatabase: Sendable {
     public func createIndex(table: String, column: String) async throws {
         let columnIndex = try await indexManager.createIndex(tableName: table, columnName: column)
 
-        // Populate the index from existing data, embedding __rid for index-accelerated ops
+        // Populate the index from existing data with slim rows: __rid + indexed column only
         let rows = try await storageEngine.scanTable(table)
         for (record, row) in rows {
             if let value = row.values[column] {
-                var indexValues = row.values
-                indexValues["__rid"] = .integer(Int64(bitPattern: record.id))
-                try await columnIndex.insert(key: value, row: Row(values: indexValues))
+                let slimRow = Row(values: [
+                    "__rid": .integer(Int64(bitPattern: record.id)),
+                    column: value
+                ])
+                try await columnIndex.insert(key: value, row: slimRow)
             }
         }
+
+        // Mark column as indexed in stats and refresh distinct counts
+        try await storageEngine.analyzeTable(table)
     }
 
     public func createCompoundIndex(table: String, columns: [String]) async throws {
         let columnIndex = try await indexManager.createCompoundIndex(tableName: table, columns: columns)
 
-        // Populate the index from existing data, embedding __rid for index-accelerated ops
+        // Populate the index from existing data with slim rows: __rid + indexed columns only
         let rows = try await storageEngine.scanTable(table)
         for (record, row) in rows {
-            var indexValues = row.values
-            indexValues["__rid"] = .integer(Int64(bitPattern: record.id))
-            let indexRow = Row(values: indexValues)
-            let keyValues = columns.map { indexRow.values[$0] ?? .null }
+            let rid: DBValue = .integer(Int64(bitPattern: record.id))
+            var slimValues: [String: DBValue] = ["__rid": rid]
+            let keyValues = columns.map { col -> DBValue in
+                let v = row.values[col] ?? .null
+                slimValues[col] = v
+                return v
+            }
             let compoundKey = DBValue.compound(keyValues)
-            try await columnIndex.insert(key: compoundKey, row: indexRow)
+            try await columnIndex.insert(key: compoundKey, row: Row(values: slimValues))
         }
     }
 
@@ -113,6 +121,11 @@ public actor PantryDatabase: Sendable {
 
     public func dropIndex(table: String, column: String) async {
         await indexManager.dropIndex(tableName: table, columnName: column)
+    }
+
+    /// Collect column statistics for query optimization (like SQL ANALYZE)
+    public func analyzeTable(_ table: String) async throws {
+        try await storageEngine.analyzeTable(table)
     }
 
     // MARK: - Queries

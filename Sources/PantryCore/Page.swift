@@ -204,8 +204,8 @@ public struct DatabasePage: Sendable {
         }
         records.remove(at: index)
         recordCount -= 1
-        // Recompute freeSpaceOffset from remaining records (12 = 8-byte id + 4-byte length header)
-        let totalRecordSize = records.reduce(0) { $0 + 12 + $1.data.count }
+        // Recompute freeSpaceOffset from actual serialized sizes (handles overflow headers)
+        let totalRecordSize = records.reduce(0) { $0 + $1.serialize().count }
         freeSpaceOffset = PantryConstants.PAGE_SIZE - totalRecordSize
         return true
     }
@@ -227,5 +227,14 @@ public struct DatabasePage: Sendable {
     public var pageFlags: PageFlags {
         get { PageFlags(rawValue: flags) }
         set { flags = newValue.rawValue }
+    }
+
+    /// Compute the free space category for bitmap tracking
+    public func spaceCategory() -> SpaceCategory {
+        let free = getFreeSpace()
+        if free > 6144 { return .empty }
+        if free > 2048 { return .available }
+        if free >= 256 { return .low }
+        return .full
     }
 }
