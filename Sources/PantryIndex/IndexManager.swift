@@ -68,7 +68,7 @@ public actor IndexManager: IndexHook, Sendable {
     /// Create a new index for a table column
     public func createIndex(tableName: String, columnName: String) async throws -> ColumnIndex {
         let nodeStore = PageBackedNodeStore(bufferPool: bufferPool, storageManager: storageManager)
-        let btree = BTree(order: 16, nodeStore: nodeStore)
+        let btree = BTree(order: 10, nodeStore: nodeStore)
         let columnIndex = ColumnIndex(tableName: tableName, columnName: columnName, btree: btree, nodeStore: nodeStore)
 
         if indexes[tableName] == nil {
@@ -85,7 +85,7 @@ public actor IndexManager: IndexHook, Sendable {
         }
         let indexName = columns.joined(separator: "+")
         let nodeStore = PageBackedNodeStore(bufferPool: bufferPool, storageManager: storageManager)
-        let btree = BTree(order: 16, nodeStore: nodeStore)
+        let btree = BTree(order: 10, nodeStore: nodeStore)
         let columnIndex = ColumnIndex(tableName: tableName, columnName: indexName, compoundColumns: columns, btree: btree, nodeStore: nodeStore)
 
         if indexes[tableName] == nil {
@@ -138,7 +138,7 @@ public actor IndexManager: IndexHook, Sendable {
             let nodeStore = PageBackedNodeStore(bufferPool: bufferPool, storageManager: storageManager)
             await nodeStore.restoreNodePageMap(entry.decodedNodePageMap)
 
-            let btree = BTree(order: 16, nodeStore: nodeStore)
+            let btree = BTree(order: 10, nodeStore: nodeStore)
             await btree.setRootId(entry.rootNodeId)
 
             let columnIndex = ColumnIndex(

@@ -81,11 +81,13 @@ public actor PantryDatabase: Sendable {
     public func createIndex(table: String, column: String) async throws {
         let columnIndex = try await indexManager.createIndex(tableName: table, columnName: column)
 
-        // Populate the index from existing data
+        // Populate the index from existing data, embedding __rid for index-accelerated ops
         let rows = try await storageEngine.scanTable(table)
-        for (_, row) in rows {
+        for (record, row) in rows {
             if let value = row.values[column] {
-                try await columnIndex.insert(key: value, row: row)
+                var indexValues = row.values
+                indexValues["__rid"] = .integer(Int64(bitPattern: record.id))
+                try await columnIndex.insert(key: value, row: Row(values: indexValues))
             }
         }
     }
@@ -93,12 +95,15 @@ public actor PantryDatabase: Sendable {
     public func createCompoundIndex(table: String, columns: [String]) async throws {
         let columnIndex = try await indexManager.createCompoundIndex(tableName: table, columns: columns)
 
-        // Populate the index from existing data
+        // Populate the index from existing data, embedding __rid for index-accelerated ops
         let rows = try await storageEngine.scanTable(table)
-        for (_, row) in rows {
-            let keyValues = columns.map { row.values[$0] ?? .null }
+        for (record, row) in rows {
+            var indexValues = row.values
+            indexValues["__rid"] = .integer(Int64(bitPattern: record.id))
+            let indexRow = Row(values: indexValues)
+            let keyValues = columns.map { indexRow.values[$0] ?? .null }
             let compoundKey = DBValue.compound(keyValues)
-            try await columnIndex.insert(key: compoundKey, row: row)
+            try await columnIndex.insert(key: compoundKey, row: indexRow)
         }
     }
 

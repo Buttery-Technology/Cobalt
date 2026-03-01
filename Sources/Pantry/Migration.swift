@@ -84,21 +84,24 @@ extension PantryDatabase {
             throw PantryError.invalidQuery(description: "Cannot drop primary key column '\(columnName)'")
         }
 
+        let pkName = schema.primaryKeyColumn?.name ?? "id"
+
         // Update schema
         let newColumns = schema.columns.filter { $0.name != columnName }
         let newSchema = PantryTableSchema(name: schema.name, columns: newColumns)
         try await updateTableSchema(table, schema: newSchema)
 
-        // Rewrite all rows to remove the dropped column
-        let rows = try await select(from: table)
-        for row in rows {
-            guard row.values[columnName] != nil else { continue }
-            var updated = row.values
-            updated.removeValue(forKey: columnName)
-            // Delete and re-insert with cleaned data
-            if let id = row.values["id"], id != .null {
-                _ = try await delete(from: table, where: .equals(column: "id", value: id))
-                try await insert(into: table, values: updated)
+        // Rewrite all rows to remove the dropped column, atomically
+        try await transaction { tx in
+            let rows = try await tx.select(from: table)
+            for row in rows {
+                guard row.values[columnName] != nil else { continue }
+                var updated = row.values
+                updated.removeValue(forKey: columnName)
+                if let pk = row.values[pkName], pk != .null {
+                    _ = try await tx.delete(from: table, where: .equals(column: pkName, value: pk))
+                    try await tx.insert(into: table, values: updated)
+                }
             }
         }
     }
@@ -107,6 +110,8 @@ extension PantryDatabase {
         guard let schema = await getTableSchema(table) else {
             throw PantryError.tableNotFound(name: table)
         }
+
+        let pkName = schema.primaryKeyColumn?.name ?? "id"
 
         // Update schema: rename the column
         let newColumns = schema.columns.map { col -> PantryColumn in
@@ -118,16 +123,18 @@ extension PantryDatabase {
         let newSchema = PantryTableSchema(name: schema.name, columns: newColumns)
         try await updateTableSchema(table, schema: newSchema)
 
-        // Rewrite all rows to move data from old column name to new
-        let rows = try await select(from: table)
-        for row in rows {
-            guard let value = row.values[from] else { continue }
-            var updated = row.values
-            updated.removeValue(forKey: from)
-            updated[to] = value
-            if let id = row.values["id"], id != .null {
-                _ = try await delete(from: table, where: .equals(column: "id", value: id))
-                try await insert(into: table, values: updated)
+        // Rewrite all rows to move data from old to new column name, atomically
+        try await transaction { tx in
+            let rows = try await tx.select(from: table)
+            for row in rows {
+                guard let value = row.values[from] else { continue }
+                var updated = row.values
+                updated.removeValue(forKey: from)
+                updated[to] = value
+                if let pk = row.values[pkName], pk != .null {
+                    _ = try await tx.delete(from: table, where: .equals(column: pkName, value: pk))
+                    try await tx.insert(into: table, values: updated)
+                }
             }
         }
     }

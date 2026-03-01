@@ -432,7 +432,7 @@ import Foundation
     let sm = try StorageManager(databasePath: path)
     let bp = BufferPoolManager(capacity: 100, storageManager: sm)
     let nodeStore = PageBackedNodeStore(bufferPool: bp, storageManager: sm)
-    let btree = BTree(order: 16, nodeStore: nodeStore)
+    let btree = BTree(order: 10, nodeStore: nodeStore)
     let idx = ColumnIndex(tableName: "sales", columnName: "amount", btree: btree, nodeStore: nodeStore)
 
     for i in 1...100 {
