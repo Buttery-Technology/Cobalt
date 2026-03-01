@@ -24,13 +24,17 @@ public struct PantryConfiguration: Sendable {
     /// Group commit: maximum batch size before flushing immediately (default 32)
     public let groupCommitBatchSize: Int
 
+    /// Auto-checkpoint: WAL size threshold in bytes before triggering automatic checkpoint (default 4MB, 0 = disabled)
+    public let autoCheckpointThreshold: Int
+
     public init(
         path: String,
         encryptionKey: Data? = nil,
         bufferPoolCapacity: Int = 1000,
         isolationLevel: IsolationLevel = .readCommitted,
         groupCommitDelay: Int = 1000,
-        groupCommitBatchSize: Int = 32
+        groupCommitBatchSize: Int = 32,
+        autoCheckpointThreshold: Int = 4 * 1024 * 1024
     ) {
         precondition(!path.isEmpty, "Database path must not be empty")
         precondition(bufferPoolCapacity > 0, "Buffer pool capacity must be positive")
@@ -43,6 +47,7 @@ public struct PantryConfiguration: Sendable {
         self.isolationLevel = isolationLevel
         self.groupCommitDelay = groupCommitDelay
         self.groupCommitBatchSize = groupCommitBatchSize
+        self.autoCheckpointThreshold = autoCheckpointThreshold
     }
 
     // MARK: - Default Path Helpers

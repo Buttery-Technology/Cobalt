@@ -37,16 +37,45 @@ struct QueryCost: Comparable, Sendable {
     }
 }
 
+/// Key for the query plan cache
+private struct PlanCacheKey: Hashable, Sendable {
+    let table: String
+    let conditionSignature: String
+    let pageCount: Int
+    let requestedColumns: [String]?
+}
+
+/// Cached plan with a generation counter for invalidation
+private struct CachedPlan: Sendable {
+    let plan: AccessPlan
+    let generation: UInt64
+}
+
 /// Estimates query costs and selects optimal execution plans
 struct QueryPlanner: Sendable {
     private let storageEngine: StorageEngine
     private let indexManager: IndexManager
     let registry: TableRegistry
 
+    /// Plan cache: stores computed access plans for repeated queries
+    private let planCache: PantryLock<[PlanCacheKey: CachedPlan]>
+    /// Generation counter: incremented on index/schema changes to invalidate cache
+    private let cacheGeneration: PantryLock<UInt64>
+    /// Maximum cache entries
+    private let maxCacheSize = 256
+
     init(storageEngine: StorageEngine, indexManager: IndexManager, registry: TableRegistry) {
         self.storageEngine = storageEngine
         self.indexManager = indexManager
         self.registry = registry
+        self.planCache = PantryLock([:])
+        self.cacheGeneration = PantryLock(0)
+    }
+
+    /// Invalidate the plan cache (call after index create/drop or schema change)
+    func invalidateCache() {
+        cacheGeneration.withLock { $0 += 1 }
+        planCache.withLock { $0.removeAll() }
     }
 
     // MARK: - Single-Table Plan Selection
@@ -57,6 +86,13 @@ struct QueryPlanner: Sendable {
     nonisolated func chooseAccessPlan(table: String, condition: WhereCondition?, pageCount: Int, requestedColumns: [String]? = nil, indexCoverage: [String: Set<String>]? = nil) -> AccessPlan {
         guard let condition = condition else {
             return .tableScan(pageCount: pageCount)
+        }
+
+        // Check plan cache
+        let gen = cacheGeneration.withLock { $0 }
+        let cacheKey = PlanCacheKey(table: table, conditionSignature: conditionSignature(condition), pageCount: pageCount, requestedColumns: requestedColumns)
+        if let cached = planCache.withLock({ $0[cacheKey] }), cached.generation == gen {
+            return cached.plan
         }
 
         let tableInfo = registry.getTableInfo(name: table)
@@ -108,6 +144,15 @@ struct QueryPlanner: Sendable {
                     bestPlan = .indexScan(column: column, estimatedRows: estimatedRows)
                 }
             }
+        }
+
+        // Store in cache
+        planCache.withLock { cache in
+            if cache.count >= maxCacheSize {
+                // Evict oldest entries (simple clear strategy)
+                cache.removeAll()
+            }
+            cache[cacheKey] = CachedPlan(plan: bestPlan, generation: gen)
         }
 
         return bestPlan
@@ -254,4 +299,26 @@ enum PredicateType: Sendable {
     case inList(count: Int)
     case like
     case isNull
+}
+
+// MARK: - Condition Signature for Plan Caching
+
+/// Generates a structural signature of a WhereCondition for cache keying.
+/// Two conditions with the same shape but different literal values produce the same signature.
+private func conditionSignature(_ condition: WhereCondition) -> String {
+    switch condition {
+    case .equals(let col, _): return "eq(\(col))"
+    case .notEquals(let col, _): return "ne(\(col))"
+    case .lessThan(let col, _): return "lt(\(col))"
+    case .greaterThan(let col, _): return "gt(\(col))"
+    case .lessThanOrEqual(let col, _): return "le(\(col))"
+    case .greaterThanOrEqual(let col, _): return "ge(\(col))"
+    case .in(let col, let vals): return "in(\(col),\(vals.count))"
+    case .between(let col, _, _): return "bw(\(col))"
+    case .like(let col, _): return "lk(\(col))"
+    case .isNull(let col): return "nu(\(col))"
+    case .isNotNull(let col): return "nn(\(col))"
+    case .and(let subs): return "and[\(subs.map { conditionSignature($0) }.joined(separator: ","))]"
+    case .or(let subs): return "or[\(subs.map { conditionSignature($0) }.joined(separator: ","))]"
+    }
 }

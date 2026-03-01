@@ -32,10 +32,58 @@ public actor QueryExecutor: Sendable {
         self.planner = QueryPlanner(storageEngine: storageEngine, indexManager: indexManager, registry: reg)
     }
 
+    /// Invalidate the query plan cache (call after index create/drop or schema changes)
+    public nonisolated func invalidatePlanCache() {
+        planner.invalidateCache()
+    }
+
     // MARK: - SELECT
 
     public func executeSelect(from table: String, columns: [String]? = nil, where condition: WhereCondition? = nil, modifiers: QueryModifiers? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {
         var rows: [Row]
+
+        // Fast path: ORDER BY + LIMIT on a single indexed column → index-ordered scan with early exit
+        if let mods = modifiers,
+           let orderBy = mods.orderBy, orderBy.count == 1,
+           let limit = mods.limit, limit > 0,
+           !mods.distinct,
+           condition == nil {
+            let orderCol = orderBy[0].column
+            let ascending = orderBy[0].direction == .ascending
+            if let index = await indexManager.getIndex(tableName: table, columnName: orderCol) {
+                let totalNeeded = limit + (mods.offset ?? 0)
+                let indexRows = try await index.searchRangeWithLimit(from: nil, to: nil, limit: totalNeeded, ascending: ascending)
+
+                // Fetch full rows by RID
+                let rids = Set(indexRows.compactMap { row -> UInt64? in
+                    guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
+                    return UInt64(bitPattern: ridSigned)
+                })
+                let fullRecords = try await storageEngine.getRecordsByIDs(rids, tableName: table, transactionContext: transactionContext)
+
+                // Re-sort by the index order (getRecordsByIDs doesn't preserve order)
+                let ridToRow = Dictionary(fullRecords.map { (record, row) in (record.id, row) }, uniquingKeysWith: { a, _ in a })
+                rows = indexRows.compactMap { indexRow -> Row? in
+                    guard case .integer(let ridSigned) = indexRow.values["__rid"] else { return nil }
+                    return ridToRow[UInt64(bitPattern: ridSigned)]
+                }
+
+                // Apply OFFSET then LIMIT (already sorted by index)
+                if let offset = mods.offset, offset > 0 {
+                    rows = Array(rows.dropFirst(offset))
+                }
+                rows = Array(rows.prefix(limit))
+
+                // Project columns
+                if let columns = columns, !columns.isEmpty {
+                    return rows.map { row in
+                        let projected = columns.reduce(into: [String: DBValue]()) { r, c in r[c] = row.values[c] ?? .null }
+                        return Row(values: projected)
+                    }
+                }
+                return rows
+            }
+        }
 
         // Get page chain for cost estimation
         let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
@@ -48,10 +96,8 @@ public actor QueryExecutor: Sendable {
 
         switch plan {
         case .indexOnlyScan:
-            // All requested columns are in the index — skip heap fetch
             if let condition = condition,
                let indexed = try await indexManager.attemptIndexLookup(tableName: table, condition: condition) {
-                // Strip __rid and return index rows directly (they have all needed columns)
                 rows = indexed.map { row in
                     var vals = row.values
                     vals.removeValue(forKey: "__rid")
@@ -71,7 +117,7 @@ public actor QueryExecutor: Sendable {
                 let fullRecords = try await storageEngine.getRecordsByIDs(matchingRIDs, tableName: table, transactionContext: transactionContext)
                 rows = fullRecords
                     .map { $0.1 }
-                    .filter { condition == nil || evaluateCondition(condition, row: $0) }
+                    .filter { evaluateCondition(condition, row: $0) }
             } else {
                 rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, transactionContext: transactionContext)
             }
@@ -82,12 +128,10 @@ public actor QueryExecutor: Sendable {
 
         // Apply query modifiers: DISTINCT, ORDER BY, OFFSET, LIMIT
         if let mods = modifiers {
-            // DISTINCT — deduplicate before sorting
             if mods.distinct {
                 rows = deduplicateRows(rows, columns: columns)
             }
 
-            // ORDER BY
             if let orderBy = mods.orderBy, !orderBy.isEmpty {
                 rows.sort { a, b in
                     for clause in orderBy {
@@ -101,18 +145,15 @@ public actor QueryExecutor: Sendable {
                 }
             }
 
-            // OFFSET
             if let offset = mods.offset, offset > 0 {
                 rows = Array(rows.dropFirst(offset))
             }
 
-            // LIMIT
             if let limit = mods.limit, limit >= 0 {
                 rows = Array(rows.prefix(limit))
             }
         }
 
-        // Project only requested columns
         if let columns = columns, !columns.isEmpty {
             return rows.map { row in
                 let projectedValues = columns.reduce(into: [String: DBValue]()) { result, column in
@@ -156,7 +197,7 @@ public actor QueryExecutor: Sendable {
             return Row(values: prefixed)
         }
 
-        // Process each join in optimized order
+        // Process each join in optimized order, using planner's join strategy
         for (i, join) in optimizedJoins.enumerated() {
             let rightRows: [Row]
             if i == 0 {
@@ -165,13 +206,20 @@ public actor QueryExecutor: Sendable {
                 rightRows = try await scanAllRows(table: join.table, transactionContext: transactionContext)
             }
 
+            // Consult planner for join strategy (hash join with build-side selection)
+            let strategy = planner.chooseJoinStrategy(
+                leftRows: result.count,
+                rightRows: rightRows.count,
+                join: join
+            )
+
             switch join.type {
             case .inner:
-                result = innerJoin(left: result, right: rightRows, join: join)
+                result = hashInnerJoin(left: result, right: rightRows, join: join, strategy: strategy)
             case .left:
-                result = leftJoin(left: result, right: rightRows, join: join)
+                result = hashLeftJoin(left: result, right: rightRows, join: join, strategy: strategy)
             case .right:
-                result = rightJoin(left: result, right: rightRows, join: join)
+                result = hashRightJoin(left: result, right: rightRows, join: join, strategy: strategy)
             case .cross:
                 result = crossJoin(left: result, right: rightRows, join: join)
             }
@@ -382,6 +430,57 @@ public actor QueryExecutor: Sendable {
         try await storageEngine.insertRecord(record, tableName: table, row: row, transactionContext: transactionContext)
     }
 
+    /// Bulk insert: inserts all rows with deferred index updates for better throughput.
+    /// Validates PK uniqueness in batch before inserting, then updates indexes once at the end.
+    public func executeBulkInsert(into table: String, rows: [Row], transactionContext: TransactionContext? = nil) async throws {
+        guard !rows.isEmpty else { return }
+
+        // Validate primary key uniqueness in batch
+        let schema = await storageEngine.getTableSchema(table)
+        if let pkColumn = schema?.primaryKeyColumn {
+            var seenPKs = Set<String>()
+            for row in rows {
+                if let pkValue = row.values[pkColumn.name], pkValue != .null {
+                    let key = "\(pkValue)"
+                    guard seenPKs.insert(key).inserted else {
+                        throw PantryError.primaryKeyViolation
+                    }
+                    // Check existing data via index or scan
+                    if let indexed = try await indexManager.attemptIndexLookup(
+                        tableName: table,
+                        condition: .equals(column: pkColumn.name, value: pkValue)
+                    ), !indexed.isEmpty {
+                        throw PantryError.primaryKeyViolation
+                    } else if !(await indexManager.hasIndex(tableName: table, columnName: pkColumn.name)) {
+                        let existing = try await executeSelect(from: table, columns: [pkColumn.name], where: .equals(column: pkColumn.name, value: pkValue), transactionContext: transactionContext)
+                        if !existing.isEmpty {
+                            throw PantryError.primaryKeyViolation
+                        }
+                    }
+                } else if !pkColumn.isNullable {
+                    throw PantryError.notNullConstraintViolation(column: pkColumn.name)
+                }
+            }
+        }
+
+        // Phase 1: Insert all records without index updates
+        var insertedPairs: [(Record, Row)] = []
+        insertedPairs.reserveCapacity(rows.count)
+
+        for row in rows {
+            let rowData = row.toBytes()
+            let recordID = generateRecordID()
+            let record = Record(id: recordID, data: rowData)
+            _ = try await storageEngine.insertRecordSkipIndex(record, tableName: table, transactionContext: transactionContext)
+            insertedPairs.append((record, row))
+        }
+
+        // Phase 2: Batch index updates
+        for (record, row) in insertedPairs {
+            try await indexManager.updateIndexes(record: record, row: row, tableName: table)
+        }
+    }
+
     // MARK: - UPDATE
 
     public func executeUpdate(table: String, set values: [String: DBValue], where condition: WhereCondition?, transactionContext: TransactionContext? = nil) async throws -> Int {
@@ -490,6 +589,36 @@ public actor QueryExecutor: Sendable {
     // MARK: - AGGREGATE
 
     public func executeAggregate(from table: String, _ function: AggregateFunction, where condition: WhereCondition? = nil, transactionContext: TransactionContext? = nil) async throws -> DBValue {
+        // Aggregate pushdown: avoid full table scan for common patterns
+
+        // COUNT(*) without WHERE → use registry record count
+        if case .count(let col) = function, col == nil, condition == nil {
+            let count = planner.registry.getTableInfo(name: table)?.recordCount ?? 0
+            return .integer(Int64(count))
+        }
+
+        // MIN/MAX on indexed column without WHERE → use B-tree endpoints
+        if condition == nil {
+            switch function {
+            case .min(let column):
+                if let index = await indexManager.getIndex(tableName: table, columnName: column) {
+                    let firstRows = try await index.searchRangeWithLimit(from: nil, to: nil, limit: 1, ascending: true)
+                    if let first = firstRows.first, let value = first.values[column], value != .null {
+                        return value
+                    }
+                }
+            case .max(let column):
+                if let index = await indexManager.getIndex(tableName: table, columnName: column) {
+                    let lastRows = try await index.searchRangeWithLimit(from: nil, to: nil, limit: 1, ascending: false)
+                    if let last = lastRows.first, let value = last.values[column], value != .null {
+                        return value
+                    }
+                }
+            default:
+                break
+            }
+        }
+
         let rows = try await executeSelect(from: table, where: condition, transactionContext: transactionContext)
 
         // For large datasets, partition and compute in parallel
@@ -789,28 +918,52 @@ public actor QueryExecutor: Sendable {
         return values
     }
 
-    private nonisolated func innerJoin(left: [Row], right: [Row], join: JoinClause) -> [Row] {
-        // Build hash table on right side for O(n+m) join
-        var hashTable = [DBValue: [Row]]()
-        for row in right {
-            let key = row.values[join.rightColumn] ?? .null
-            if key != .null { hashTable[key, default: []].append(row) }
-        }
+    /// Hash inner join: builds hash table on the smaller side (per planner strategy)
+    private nonisolated func hashInnerJoin(left: [Row], right: [Row], join: JoinClause, strategy: JoinStrategy) -> [Row] {
+        let buildOnRight: Bool
+        if case .hashJoin(let side) = strategy { buildOnRight = (side == .right) } else { buildOnRight = true }
 
-        var result = [Row]()
-        for leftRow in left {
-            let leftKey = leftRow.values[join.leftColumn] ?? .null
-            guard leftKey != .null, let matches = hashTable[leftKey] else { continue }
-            for rightRow in matches {
-                var combined = leftRow.values
-                for (k, v) in rightRow.values { combined["\(join.table).\(k)"] = v; combined[k] = v }
-                result.append(Row(values: combined))
+        if buildOnRight {
+            // Build on right, probe with left
+            var hashTable = [DBValue: [Row]]()
+            for row in right {
+                let key = row.values[join.rightColumn] ?? .null
+                if key != .null { hashTable[key, default: []].append(row) }
             }
+            var result = [Row]()
+            for leftRow in left {
+                let leftKey = leftRow.values[join.leftColumn] ?? .null
+                guard leftKey != .null, let matches = hashTable[leftKey] else { continue }
+                for rightRow in matches {
+                    var combined = leftRow.values
+                    for (k, v) in rightRow.values { combined["\(join.table).\(k)"] = v; combined[k] = v }
+                    result.append(Row(values: combined))
+                }
+            }
+            return result
+        } else {
+            // Build on left, probe with right
+            var hashTable = [DBValue: [Row]]()
+            for row in left {
+                let key = row.values[join.leftColumn] ?? .null
+                if key != .null { hashTable[key, default: []].append(row) }
+            }
+            var result = [Row]()
+            for rightRow in right {
+                let rightKey = rightRow.values[join.rightColumn] ?? .null
+                guard rightKey != .null, let matches = hashTable[rightKey] else { continue }
+                for leftRow in matches {
+                    var combined = leftRow.values
+                    for (k, v) in rightRow.values { combined["\(join.table).\(k)"] = v; combined[k] = v }
+                    result.append(Row(values: combined))
+                }
+            }
+            return result
         }
-        return result
     }
 
-    private nonisolated func leftJoin(left: [Row], right: [Row], join: JoinClause) -> [Row] {
+    /// Hash left join: always probes with left, builds on right
+    private nonisolated func hashLeftJoin(left: [Row], right: [Row], join: JoinClause, strategy: JoinStrategy) -> [Row] {
         var hashTable = [DBValue: [Row]]()
         var rightColumns = Set<String>()
         for row in right {
@@ -829,7 +982,6 @@ public actor QueryExecutor: Sendable {
                     result.append(Row(values: combined))
                 }
             } else {
-                // No match — fill right columns with NULL
                 var combined = leftRow.values
                 for col in rightColumns { combined["\(join.table).\(col)"] = .null }
                 result.append(Row(values: combined))
@@ -838,8 +990,8 @@ public actor QueryExecutor: Sendable {
         return result
     }
 
-    private nonisolated func rightJoin(left: [Row], right: [Row], join: JoinClause) -> [Row] {
-        // Right join = reverse left join
+    /// Hash right join: builds on left, probes with right
+    private nonisolated func hashRightJoin(left: [Row], right: [Row], join: JoinClause, strategy: JoinStrategy) -> [Row] {
         var hashTable = [DBValue: [Row]]()
         var leftColumns = Set<String>()
         for leftRow in left {

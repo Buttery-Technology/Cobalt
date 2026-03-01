@@ -30,6 +30,13 @@ public actor StorageEngine: Sendable {
     /// Persisted free space bitmap for O(1) page selection
     private let freeSpaceBitmap = FreeSpaceBitmap()
 
+    /// Auto-checkpoint: WAL size threshold in bytes (0 = disabled)
+    private var autoCheckpointThreshold: Int = 0
+
+    public func setAutoCheckpointThreshold(_ threshold: Int) {
+        autoCheckpointThreshold = threshold
+    }
+
     /// Set of system/reserved page IDs that should not be used for data
     private var systemPageIDs: Set<Int> = [0, 1]
 
@@ -242,6 +249,55 @@ public actor StorageEngine: Sendable {
         if let row = row {
             try await indexHook?.updateIndexes(record: record, row: row, tableName: tableName)
         }
+
+        return record.id
+    }
+
+    /// Insert a record without triggering index updates — caller is responsible for indexing.
+    /// Used by bulk insert to defer index updates until all records are inserted.
+    public func insertRecordSkipIndex(_ record: Record, tableName: String, transactionContext: TransactionContext? = nil) async throws -> UInt64 {
+        guard tableRegistry.getTableInfo(name: tableName) != nil else {
+            throw PantryError.tableNotFound(name: tableName)
+        }
+
+        let serializedSize = record.serialize().count
+        let maxInlineSize = PantryConstants.MAX_INLINE_RECORD_SIZE
+
+        if serializedSize > maxInlineSize {
+            let insertedRecord = try await insertOverflowRecord(record, tableName: tableName, transactionContext: transactionContext)
+            guard var updatedInfo = tableRegistry.getTableInfo(name: tableName) else {
+                throw PantryError.tableNotFound(name: tableName)
+            }
+            updatedInfo.recordCount += 1
+            tableRegistry.updateTableInfo(updatedInfo)
+            return insertedRecord.id
+        }
+
+        guard let currentInfo = tableRegistry.getTableInfo(name: tableName) else {
+            throw PantryError.tableNotFound(name: tableName)
+        }
+        let targetPageID = try await findTargetPageForInsert(tableInfo: currentInfo, recordSize: serializedSize)
+        var page = try await getPage(pageID: targetPageID, transactionContext: transactionContext)
+
+        if !page.addRecord(record) {
+            guard var freshInfo = tableRegistry.getTableInfo(name: tableName) else {
+                throw PantryError.tableNotFound(name: tableName)
+            }
+            var newPage = try await createNewPageForTable(tableInfo: &freshInfo)
+            if !newPage.addRecord(record) {
+                throw PantryError.recordTooLarge(size: serializedSize)
+            }
+            try await savePage(newPage, transactionContext: transactionContext)
+            tableRegistry.updateTableInfo(freshInfo)
+        } else {
+            try await savePage(page, transactionContext: transactionContext)
+        }
+
+        guard var updatedInfo = tableRegistry.getTableInfo(name: tableName) else {
+            throw PantryError.tableNotFound(name: tableName)
+        }
+        updatedInfo.recordCount += 1
+        tableRegistry.updateTableInfo(updatedInfo)
 
         return record.id
     }
@@ -605,6 +661,15 @@ public actor StorageEngine: Sendable {
 
     public func commitTransaction(_ txContext: TransactionContext) async throws {
         try await transactionManager.commitTransaction(txContext)
+
+        // Auto-checkpoint: if WAL exceeds threshold and no active transactions, checkpoint
+        if autoCheckpointThreshold > 0 {
+            let walBytes = await logManager.walSize
+            if walBytes >= UInt64(autoCheckpointThreshold),
+               await transactionManager.getActiveTransactionCount() == 0 {
+                try? await transactionManager.createCheckpoint()
+            }
+        }
     }
 
     public func rollbackTransaction(_ txContext: TransactionContext) async throws {
