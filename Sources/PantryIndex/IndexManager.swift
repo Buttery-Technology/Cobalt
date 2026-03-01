@@ -16,7 +16,7 @@ public actor ColumnIndex: Sendable {
     /// Hash-based key existence set for O(1) definitive negative lookups (supplements bloom filter)
     private var keyHashSet: Set<Int> = []
     /// Maximum size for hash set before it stops growing (memory bound)
-    private static let maxHashSetSize = 100_000
+    private static let maxHashSetSize = 1_000_000
     public let nodeStore: PageBackedNodeStore
 
     public init(tableName: String, columnName: String, compoundColumns: [String]? = nil, includeColumns: [String]? = nil, partialCondition: WhereCondition? = nil, btree: BTree, nodeStore: PageBackedNodeStore, expectedElements: Int = 10000) {
@@ -27,7 +27,7 @@ public actor ColumnIndex: Sendable {
         self.partialCondition = partialCondition
         self.btree = btree
         self.nodeStore = nodeStore
-        self.bloomFilter = BloomFilter(expectedElements: expectedElements)
+        self.bloomFilter = BloomFilter(expectedElements: expectedElements, falsePositiveRate: 0.001)
     }
 
     /// Whether this is a compound (multi-column) index

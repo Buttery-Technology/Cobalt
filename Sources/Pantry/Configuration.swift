@@ -1,5 +1,6 @@
 import Foundation
 import PantryCore
+import PantryQuery
 #if canImport(Security)
 import Security
 #endif
@@ -27,6 +28,18 @@ public struct PantryConfiguration: Sendable {
     /// Auto-checkpoint: WAL size threshold in bytes before triggering automatic checkpoint (default 4MB, 0 = disabled)
     public let autoCheckpointThreshold: Int
 
+    /// Number of buffer pool stripes for lock partitioning (default 8)
+    public let bufferPoolStripeCount: Int
+
+    /// Background writer flush interval in milliseconds (default 100)
+    public let bgWriterIntervalMs: Int
+
+    /// Long-running transaction timeout in seconds before deadlock detection aborts it (default 30)
+    public let longRunningTxTimeoutSeconds: Int
+
+    /// Cost model weights for query planner — use .ssd for SSD storage, .default for HDD
+    public let costWeights: CostModelWeights
+
     public init(
         path: String,
         encryptionKey: Data? = nil,
@@ -34,7 +47,11 @@ public struct PantryConfiguration: Sendable {
         isolationLevel: IsolationLevel = .readCommitted,
         groupCommitDelay: Int = 1000,
         groupCommitBatchSize: Int = 32,
-        autoCheckpointThreshold: Int = 4 * 1024 * 1024
+        autoCheckpointThreshold: Int = 4 * 1024 * 1024,
+        bufferPoolStripeCount: Int = 8,
+        bgWriterIntervalMs: Int = 100,
+        longRunningTxTimeoutSeconds: Int = 30,
+        costWeights: CostModelWeights = .default
     ) {
         precondition(!path.isEmpty, "Database path must not be empty")
         precondition(bufferPoolCapacity > 0, "Buffer pool capacity must be positive")
@@ -48,6 +65,10 @@ public struct PantryConfiguration: Sendable {
         self.groupCommitDelay = groupCommitDelay
         self.groupCommitBatchSize = groupCommitBatchSize
         self.autoCheckpointThreshold = autoCheckpointThreshold
+        self.bufferPoolStripeCount = bufferPoolStripeCount
+        self.bgWriterIntervalMs = bgWriterIntervalMs
+        self.longRunningTxTimeoutSeconds = longRunningTxTimeoutSeconds
+        self.costWeights = costWeights
     }
 
     // MARK: - Default Path Helpers

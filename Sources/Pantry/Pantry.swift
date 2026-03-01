@@ -27,12 +27,15 @@ public actor PantryDatabase: Sendable {
         let engine = try await StorageEngine(
             databasePath: configuration.path,
             bufferPoolCapacity: configuration.bufferPoolCapacity,
-            encryptionProvider: encryptionProvider
+            encryptionProvider: encryptionProvider,
+            bufferPoolStripeCount: configuration.bufferPoolStripeCount,
+            bgWriterIntervalMs: configuration.bgWriterIntervalMs
         )
         self.storageEngine = engine
 
-        // Configure auto-checkpoint threshold
+        // Configure auto-checkpoint threshold and long-running TX timeout
         await engine.setAutoCheckpointThreshold(configuration.autoCheckpointThreshold)
+        await engine.transactionManager.setLongRunningTxTimeout(configuration.longRunningTxTimeoutSeconds)
 
         // Initialize index manager
         let im = IndexManager(
@@ -45,7 +48,7 @@ public actor PantryDatabase: Sendable {
         await engine.setIndexHook(im)
 
         // Initialize query executor with table registry for cost-based planning
-        self.queryExecutor = QueryExecutor(storageEngine: engine, indexManager: im, tableRegistry: await engine.tableRegistry)
+        self.queryExecutor = QueryExecutor(storageEngine: engine, indexManager: im, tableRegistry: await engine.tableRegistry, costWeights: configuration.costWeights)
 
         // Restore persisted indexes
         if let indexData = try await engine.loadIndexRegistry() {
@@ -108,7 +111,7 @@ public actor PantryDatabase: Sendable {
 
         // Mark column as indexed in stats and refresh distinct counts
         try await storageEngine.analyzeTable(table)
-        queryExecutor.invalidatePlanCache()
+        queryExecutor.invalidatePlanCache(forTable: table)
     }
 
     /// Create a partial index on a column — only rows matching `where` condition are indexed.
@@ -134,7 +137,7 @@ public actor PantryDatabase: Sendable {
         }
 
         try await storageEngine.analyzeTable(table)
-        queryExecutor.invalidatePlanCache()
+        queryExecutor.invalidatePlanCache(forTable: table)
     }
 
     public func createCompoundIndex(table: String, columns: [String]) async throws {
@@ -153,7 +156,7 @@ public actor PantryDatabase: Sendable {
             let compoundKey = DBValue.compound(keyValues)
             try await columnIndex.insert(key: compoundKey, row: Row(values: slimValues))
         }
-        queryExecutor.invalidatePlanCache()
+        queryExecutor.invalidatePlanCache(forTable: table)
     }
 
     public func listIndexes(on table: String) async -> [(column: String, isCompound: Bool)] {
@@ -162,7 +165,7 @@ public actor PantryDatabase: Sendable {
 
     public func dropIndex(table: String, column: String) async {
         await indexManager.dropIndex(tableName: table, columnName: column)
-        queryExecutor.invalidatePlanCache()
+        queryExecutor.invalidatePlanCache(forTable: table)
     }
 
     /// Collect column statistics for query optimization (like SQL ANALYZE)

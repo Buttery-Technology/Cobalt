@@ -5,9 +5,12 @@ import PantryCore
 /// Each B-tree node is serialized and stored in a PantryCore page.
 public actor PageBackedNodeStore: Sendable {
     private var nodePageMap: [UUID: Int] = [:]
-    /// Node object cache — returns references directly without deep copying.
+    /// Node object cache with LRU eviction — returns references directly without deep copying.
     /// Safe because BTree and PageBackedNodeStore are both actors (serialized access).
     private var nodeCache: [UUID: BTreeNode] = [:]
+    private var nodeCacheOrder: [UUID: UInt64] = [:]  // LRU: access counter per node
+    private var nodeCacheCounter: UInt64 = 0
+    private static let maxNodeCacheSize = 10_000
     private let bufferPool: BufferPoolManager
     private let storageManager: StorageManager
 
@@ -49,12 +52,17 @@ public actor PageBackedNodeStore: Sendable {
         }
         // Cache the node directly — no copy needed (actor serializes access)
         nodeCache[node.nodeId] = node
+        nodeCacheCounter += 1
+        nodeCacheOrder[node.nodeId] = nodeCacheCounter
+        evictNodeCacheIfNeeded()
     }
 
     /// Load a B-tree node from its page.
     /// Returns cached reference directly (no deep copy) — safe under actor isolation.
     public func loadNode(nodeId: UUID) async throws -> BTreeNode? {
         if let cached = nodeCache[nodeId] {
+            nodeCacheCounter += 1
+            nodeCacheOrder[nodeId] = nodeCacheCounter
             return cached
         }
 
@@ -69,6 +77,9 @@ public actor PageBackedNodeStore: Sendable {
 
         let node = try BTreeNode.deserialize(from: record.data)
         nodeCache[nodeId] = node
+        nodeCacheCounter += 1
+        nodeCacheOrder[nodeId] = nodeCacheCounter
+        evictNodeCacheIfNeeded()
         return node
     }
 
@@ -76,6 +87,18 @@ public actor PageBackedNodeStore: Sendable {
     public func removeNode(nodeId: UUID) {
         nodePageMap.removeValue(forKey: nodeId)
         nodeCache.removeValue(forKey: nodeId)
+        nodeCacheOrder.removeValue(forKey: nodeId)
+    }
+
+    /// LRU eviction: remove least recently used quarter when cache exceeds max size
+    private func evictNodeCacheIfNeeded() {
+        guard nodeCache.count > Self.maxNodeCacheSize else { return }
+        let evictCount = Self.maxNodeCacheSize / 4
+        let sorted = nodeCacheOrder.sorted { $0.value < $1.value }
+        for entry in sorted.prefix(evictCount) {
+            nodeCache.removeValue(forKey: entry.key)
+            nodeCacheOrder.removeValue(forKey: entry.key)
+        }
     }
 
     /// Flush all dirty index pages to disk

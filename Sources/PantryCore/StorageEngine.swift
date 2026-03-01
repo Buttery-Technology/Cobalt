@@ -40,10 +40,10 @@ public actor StorageEngine: Sendable {
     /// Set of system/reserved page IDs that should not be used for data
     private var systemPageIDs: Set<Int> = [0, 1]
 
-    public init(databasePath: String, bufferPoolCapacity: Int = 1000, encryptionProvider: EncryptionProvider? = nil) async throws {
+    public init(databasePath: String, bufferPoolCapacity: Int = 1000, encryptionProvider: EncryptionProvider? = nil, bufferPoolStripeCount: Int = 8, bgWriterIntervalMs: Int = 100) async throws {
         let sm = try StorageManager(databasePath: databasePath, encryptionProvider: encryptionProvider)
         self.storageManager = sm
-        self.bufferPoolManager = BufferPoolManager(capacity: bufferPoolCapacity, storageManager: sm)
+        self.bufferPoolManager = BufferPoolManager(capacity: bufferPoolCapacity, storageManager: sm, stripeCount: bufferPoolStripeCount, bgWriterConfig: BackgroundWriterConfig(intervalMilliseconds: bgWriterIntervalMs))
         self.logManager = try await WriteAheadLog(databasePath: databasePath, storageManager: sm, encryptionProvider: encryptionProvider)
         self.transactionManager = try await TransactionManager(logManager: logManager)
         self.tableRegistry = TableRegistry(storageManager: sm, bufferPool: bufferPoolManager)
@@ -136,7 +136,7 @@ public actor StorageEngine: Sendable {
         return loadedPage
     }
 
-    public func savePage(_ page: DatabasePage, transactionContext: TransactionContext? = nil) async throws {
+    public func savePage(_ page: DatabasePage, transactionContext: TransactionContext? = nil, skipAfterImage: Bool = false) async throws {
         var beforePageData: Data? = nil
 
         if let txContext = transactionContext {
@@ -164,7 +164,7 @@ public actor StorageEngine: Sendable {
         bufferPoolManager.updatePage(serializedPage)
         bufferPoolManager.markDirty(pageID: page.pageID)
 
-        if let txContext = transactionContext {
+        if let txContext = transactionContext, !skipAfterImage {
             // Log after-image: use delta if we have the before-image data
             if let beforeData = beforePageData {
                 try await logManager.logPageDelta(
@@ -234,10 +234,21 @@ public actor StorageEngine: Sendable {
                 throw PantryError.recordTooLarge(size: serializedSize)
             }
 
-            try await savePage(newPage, transactionContext: transactionContext)
+            // Use record-level WAL entry instead of full page after-image
+            if let txContext = transactionContext {
+                try await logManager.logRecordInsert(txID: txContext.transactionID, pageID: newPage.pageID, recordID: record.id, data: record.data)
+                try await savePage(newPage, transactionContext: transactionContext, skipAfterImage: true)
+            } else {
+                try await savePage(newPage, transactionContext: transactionContext)
+            }
             tableRegistry.updateTableInfo(freshInfo)
         } else {
-            try await savePage(page, transactionContext: transactionContext)
+            if let txContext = transactionContext {
+                try await logManager.logRecordInsert(txID: txContext.transactionID, pageID: page.pageID, recordID: record.id, data: record.data)
+                try await savePage(page, transactionContext: transactionContext, skipAfterImage: true)
+            } else {
+                try await savePage(page, transactionContext: transactionContext)
+            }
         }
 
         guard var updatedInfo = tableRegistry.getTableInfo(name: tableName) else {
@@ -287,10 +298,20 @@ public actor StorageEngine: Sendable {
             if !newPage.addRecord(record) {
                 throw PantryError.recordTooLarge(size: serializedSize)
             }
-            try await savePage(newPage, transactionContext: transactionContext)
+            if let txContext = transactionContext {
+                try await logManager.logRecordInsert(txID: txContext.transactionID, pageID: newPage.pageID, recordID: record.id, data: record.data)
+                try await savePage(newPage, transactionContext: transactionContext, skipAfterImage: true)
+            } else {
+                try await savePage(newPage, transactionContext: transactionContext)
+            }
             tableRegistry.updateTableInfo(freshInfo)
         } else {
-            try await savePage(page, transactionContext: transactionContext)
+            if let txContext = transactionContext {
+                try await logManager.logRecordInsert(txID: txContext.transactionID, pageID: page.pageID, recordID: record.id, data: record.data)
+                try await savePage(page, transactionContext: transactionContext, skipAfterImage: true)
+            } else {
+                try await savePage(page, transactionContext: transactionContext)
+            }
         }
 
         guard var updatedInfo = tableRegistry.getTableInfo(name: tableName) else {
@@ -331,26 +352,40 @@ public actor StorageEngine: Sendable {
 
         // Decode the row before deletion so indexes can be updated
         // Also check for overflow pages that need to be freed
+        let deleteSchema = tableRegistry.getTableInfo(name: tableName)?.schema
         let deletedRow: Row?
         var overflowPageIDToFree: Int? = nil
         if let record = page.records.first(where: { $0.id == id }) {
             if record.isOverflow {
                 // Reassemble the full record to get the row, then free overflow pages
                 let fullRecord = try await reassembleOverflowRecord(record)
-                deletedRow = Row.fromBytes(fullRecord.data)
+                deletedRow = Row.fromBytesAuto(fullRecord.data, schema: deleteSchema)
                 overflowPageIDToFree = record.overflowPageID
             } else {
-                deletedRow = Row.fromBytes(record.data)
+                deletedRow = Row.fromBytesAuto(record.data, schema: deleteSchema)
             }
         } else {
             deletedRow = nil
+        }
+
+        // Capture record data for WAL before deletion
+        let deletedRecordData: Data?
+        if transactionContext != nil, let record = page.records.first(where: { $0.id == id }) {
+            deletedRecordData = record.data
+        } else {
+            deletedRecordData = nil
         }
 
         if !page.deleteRecord(id: id) {
             throw PantryError.recordNotFound(id: id)
         }
 
-        try await savePage(page, transactionContext: transactionContext)
+        if let txContext = transactionContext, let recordData = deletedRecordData {
+            try await logManager.logRecordDelete(txID: txContext.transactionID, pageID: pageID, recordID: id, data: recordData)
+            try await savePage(page, transactionContext: transactionContext, skipAfterImage: true)
+        } else {
+            try await savePage(page, transactionContext: transactionContext)
+        }
 
         // Free overflow pages
         if let overflowStart = overflowPageIDToFree {
@@ -378,6 +413,7 @@ public actor StorageEngine: Sendable {
             throw PantryError.tableNotFound(name: tableName)
         }
 
+        let scanSchema = tableInfo.schema
         var results: [(Record, Row)] = []
         var currentPageID = tableInfo.firstPageID
         var visited: Set<Int> = []
@@ -407,7 +443,7 @@ public actor StorageEngine: Sendable {
                     }
                     record = try await reassembleOverflowRecord(record)
                 }
-                if let row = Row.fromBytes(record.data) {
+                if let row = Row.fromBytesAuto(record.data, schema: scanSchema) {
                     results.append((record, row))
                 }
             }
@@ -464,6 +500,7 @@ public actor StorageEngine: Sendable {
             throw PantryError.tableNotFound(name: tableName)
         }
 
+        let idsSchema = tableInfo.schema
         var remaining = ids
         var results: [(Record, Row)] = []
         var currentPageID = tableInfo.firstPageID
@@ -485,7 +522,7 @@ public actor StorageEngine: Sendable {
                     }
                     record = try await reassembleOverflowRecord(record)
                 }
-                if let row = Row.fromBytes(record.data) {
+                if let row = Row.fromBytesAuto(record.data, schema: idsSchema) {
                     results.append((record, row))
                     remaining.remove(record.id)
                 }
@@ -525,6 +562,7 @@ public actor StorageEngine: Sendable {
         }
 
         let firstPageID = tableInfo.firstPageID
+        let streamSchema = tableInfo.schema
         let engine = self
 
         return AsyncStream { continuation in
@@ -540,7 +578,7 @@ public actor StorageEngine: Sendable {
                             if record.isOverflow {
                                 record = try await engine.reassembleOverflowRecord(record)
                             }
-                            if let row = Row.fromBytes(record.data) {
+                            if let row = Row.fromBytesAuto(record.data, schema: streamSchema) {
                                 continuation.yield((record, row))
                             }
                         }
@@ -563,21 +601,44 @@ public actor StorageEngine: Sendable {
 
         let columnNames = info.schema.columns.map { $0.name }
         var distinctSets: [String: Set<String>] = [:]
+        var nullCounts: [String: Int] = [:]
+        var minValues: [String: String] = [:]
+        var maxValues: [String: String] = [:]
+        var allValues: [String: [String]] = [:]  // for histogram building
+        var totalRows = 0
+
         for col in columnNames {
             distinctSets[col] = Set()
+            nullCounts[col] = 0
+            allValues[col] = []
         }
 
-        // Single scan to collect distinct values
+        // Single scan to collect statistics
         var currentPageID = info.firstPageID
         var visited: Set<Int> = []
         while currentPageID != 0 {
             guard visited.insert(currentPageID).inserted else { break }
             let page = try await getPage(pageID: currentPageID)
             for record in page.records {
-                if let row = Row.fromBytes(record.data) {
+                if let row = Row.fromBytesAuto(record.data, schema: info.schema) {
+                    totalRows += 1
                     for col in columnNames {
-                        if let value = row.values[col], value != .null {
-                            distinctSets[col]?.insert(value.statsKey)
+                        if let value = row.values[col] {
+                            if value == .null {
+                                nullCounts[col, default: 0] += 1
+                            } else {
+                                let key = value.statsKey
+                                distinctSets[col]?.insert(key)
+                                // Track min/max
+                                if minValues[col] == nil || key < minValues[col]! { minValues[col] = key }
+                                if maxValues[col] == nil || key > maxValues[col]! { maxValues[col] = key }
+                                // Sample values for histogram (cap at 10K to avoid memory bloat)
+                                if (allValues[col]?.count ?? 0) < 10_000 {
+                                    allValues[col]?.append(key)
+                                }
+                            }
+                        } else {
+                            nullCounts[col, default: 0] += 1
                         }
                     }
                 }
@@ -585,12 +646,25 @@ public actor StorageEngine: Sendable {
             currentPageID = page.nextPageID
         }
 
-        // Update stats
+        // Build histograms and update stats
         for col in columnNames {
             let existing = info.columnStats[col] ?? ColumnStats()
+            var boundaries: [String] = []
+            if let vals = allValues[col], vals.count >= 64 {
+                let sorted = vals.sorted()
+                let bucketSize = sorted.count / 64
+                for i in 1..<64 {
+                    boundaries.append(sorted[i * bucketSize])
+                }
+            }
             info.columnStats[col] = ColumnStats(
                 distinctCount: distinctSets[col]?.count ?? 0,
-                isIndexed: existing.isIndexed
+                isIndexed: existing.isIndexed,
+                nullCount: nullCounts[col] ?? 0,
+                totalCount: totalRows,
+                minValue: minValues[col],
+                maxValue: maxValues[col],
+                histogramBoundaries: boundaries
             )
         }
         tableRegistry.updateTableInfo(info)
@@ -944,9 +1018,11 @@ public actor StorageEngine: Sendable {
         var fullData = Data(record.data)
         var currentOverflowPageID = firstOverflowPageID
         var visited: Set<Int> = []
+        var prefetchTask: Task<Void, Never>?
 
         while currentOverflowPageID != 0 {
             guard visited.insert(currentOverflowPageID).inserted else {
+                prefetchTask?.cancel()
                 throw PantryError.corruptPage(pageID: currentOverflowPageID)
             }
 
@@ -957,6 +1033,14 @@ public actor StorageEngine: Sendable {
             let nextOverflowPageID = Int(page.data.withUnsafeBytes {
                 $0.loadUnaligned(fromByteOffset: headerSize, as: Int32.self)
             })
+
+            // Prefetch next overflow page while processing current
+            if nextOverflowPageID != 0 {
+                let bp = bufferPoolManager
+                let nextID = nextOverflowPageID
+                prefetchTask?.cancel()
+                prefetchTask = Task { await bp.prefetchPages([nextID]) }
+            }
 
             // Read continuation data (after header + 4B pointer)
             let dataStart = headerSize + 4
@@ -973,6 +1057,7 @@ public actor StorageEngine: Sendable {
             currentOverflowPageID = nextOverflowPageID
         }
 
+        prefetchTask?.cancel()
         return Record(id: record.id, data: fullData)
     }
 
