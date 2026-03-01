@@ -73,9 +73,10 @@ public struct PantryConfiguration: Sendable {
         let keyPath = dbPath + ".key"
         let fm = FileManager.default
 
-        if fm.fileExists(atPath: keyPath),
-           let existing = fm.contents(atPath: keyPath),
-           existing.count == 32 {
+        if fm.fileExists(atPath: keyPath) {
+            guard let existing = fm.contents(atPath: keyPath), existing.count == 32 else {
+                throw PantryError.corruptedKeyFile(path: keyPath)
+            }
             return existing
         }
 
