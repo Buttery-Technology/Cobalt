@@ -13,10 +13,17 @@ public actor TransactionContext: Sendable {
     public private(set) var writePages = Set<Int>()
     public private(set) var beforeImagePages = Set<Int>()
 
-    public init(transactionID: UInt64, isolationLevel: IsolationLevel = .readCommitted) {
+    /// MVCC: snapshot version captured at transaction start for repeatable reads
+    public let snapshotVersion: UInt64
+
+    /// MVCC: set of record IDs written by this transaction (for write-write conflict detection)
+    public private(set) var writtenRecordIDs = Set<UInt64>()
+
+    public init(transactionID: UInt64, isolationLevel: IsolationLevel = .readCommitted, snapshotVersion: UInt64 = 0) {
         self.transactionID = transactionID
         self.startTime = Date()
         self.isolationLevel = isolationLevel
+        self.snapshotVersion = snapshotVersion
     }
 
     public func recordAccess(pageID: Int, isWrite: Bool) {
@@ -37,6 +44,11 @@ public actor TransactionContext: Sendable {
 
     public func addLock(_ lock: ResourceLock) {
         heldLocks.append(lock)
+    }
+
+    /// MVCC: track a record ID as written by this transaction
+    public func recordWrite(recordID: UInt64) {
+        writtenRecordIDs.insert(recordID)
     }
 
     public func commit() {

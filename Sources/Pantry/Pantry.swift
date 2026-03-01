@@ -41,8 +41,8 @@ public actor PantryDatabase: Sendable {
         // Wire index hook into storage engine
         await engine.setIndexHook(im)
 
-        // Initialize query executor
-        self.queryExecutor = QueryExecutor(storageEngine: engine, indexManager: im)
+        // Initialize query executor with table registry for cost-based planning
+        self.queryExecutor = QueryExecutor(storageEngine: engine, indexManager: im, tableRegistry: await engine.tableRegistry)
 
         // Restore persisted indexes
         if let indexData = try await engine.loadIndexRegistry() {
@@ -83,22 +83,52 @@ public actor PantryDatabase: Sendable {
         try await storageEngine.updateTableSchema(name, schema: schema)
     }
 
-    public func createIndex(table: String, column: String) async throws {
-        let columnIndex = try await indexManager.createIndex(tableName: table, columnName: column)
+    /// Create an index on a column, optionally with INCLUDE columns for covering index scans
+    public func createIndex(table: String, column: String, include: [String]? = nil) async throws {
+        let columnIndex = try await indexManager.createIndex(tableName: table, columnName: column, includeColumns: include)
 
-        // Populate the index from existing data with slim rows: __rid + indexed column only
+        // Populate the index from existing data with slim rows: __rid + indexed column + INCLUDE columns
         let rows = try await storageEngine.scanTable(table)
         for (record, row) in rows {
             if let value = row.values[column] {
-                let slimRow = Row(values: [
+                var slimValues: [String: DBValue] = [
                     "__rid": .integer(Int64(bitPattern: record.id)),
                     column: value
-                ])
-                try await columnIndex.insert(key: value, row: slimRow)
+                ]
+                // Add INCLUDE columns for covering index
+                if let include = include {
+                    for incCol in include { slimValues[incCol] = row.values[incCol] ?? .null }
+                }
+                try await columnIndex.insert(key: value, row: Row(values: slimValues))
             }
         }
 
         // Mark column as indexed in stats and refresh distinct counts
+        try await storageEngine.analyzeTable(table)
+    }
+
+    /// Create a partial index on a column — only rows matching `where` condition are indexed.
+    /// Partial indexes are smaller and faster when queries always include the same filter.
+    public func createPartialIndex(table: String, column: String, where condition: WhereCondition, include: [String]? = nil) async throws {
+        let columnIndex = try await indexManager.createIndex(tableName: table, columnName: column, includeColumns: include, partialCondition: condition)
+
+        // Populate the index from existing data that matches the condition
+        let rows = try await storageEngine.scanTable(table)
+        for (record, row) in rows {
+            // Only index rows that satisfy the partial condition
+            if !evaluateConditionForPartialIndex(condition, row: row) { continue }
+            if let value = row.values[column] {
+                var slimValues: [String: DBValue] = [
+                    "__rid": .integer(Int64(bitPattern: record.id)),
+                    column: value
+                ]
+                if let include = include {
+                    for incCol in include { slimValues[incCol] = row.values[incCol] ?? .null }
+                }
+                try await columnIndex.insert(key: value, row: Row(values: slimValues))
+            }
+        }
+
         try await storageEngine.analyzeTable(table)
     }
 
@@ -186,6 +216,15 @@ public actor PantryDatabase: Sendable {
             : nil
         return try await queryExecutor.executeGroupBy(from: table, select: expressions, where: condition, groupBy: groupByClause, modifiers: mods, transactionContext: currentTransactionContext)
     }
+
+    // MARK: - Set Operations
+
+    /// Combine two query results using UNION, UNION ALL, INTERSECT, or EXCEPT
+    public func combine(_ operation: SetOperation, left: [Row], right: [Row]) async -> [Row] {
+        await queryExecutor.executeSetOperation(operation, left: left, right: right)
+    }
+
+    // MARK: - DML
 
     public func insert(into table: String, values: [String: DBValue]) async throws {
         let row = Row(values: values)
@@ -275,6 +314,61 @@ public actor PantryDatabase: Sendable {
 
     public func getBufferPoolStats() async -> BufferPoolStats {
         await storageEngine.getBufferPoolStats()
+    }
+
+    // MARK: - Partial Index Condition Evaluator
+
+    /// Evaluate a WHERE condition against a Row for partial index population.
+    private func evaluateConditionForPartialIndex(_ condition: WhereCondition, row: Row) -> Bool {
+        switch condition {
+        case let .equals(column, value):
+            if value == .null { return false }
+            guard let rv = row.values[column], rv != .null else { return false }
+            return rv == value
+        case let .notEquals(column, value):
+            if value == .null { return false }
+            guard let rv = row.values[column], rv != .null else { return false }
+            return rv != value
+        case let .greaterThan(column, value):
+            guard let rv = row.values[column], rv != .null, value != .null else { return false }
+            return rv > value
+        case let .lessThan(column, value):
+            guard let rv = row.values[column], rv != .null, value != .null else { return false }
+            return rv < value
+        case let .greaterThanOrEqual(column, value):
+            guard let rv = row.values[column], rv != .null, value != .null else { return false }
+            return rv >= value
+        case let .lessThanOrEqual(column, value):
+            guard let rv = row.values[column], rv != .null, value != .null else { return false }
+            return rv <= value
+        case let .isNull(column):
+            return row.values[column] == nil || row.values[column] == .null
+        case let .isNotNull(column):
+            return row.values[column] != nil && row.values[column] != .null
+        case let .and(subs):
+            return subs.allSatisfy { evaluateConditionForPartialIndex($0, row: row) }
+        case let .or(subs):
+            return subs.contains { evaluateConditionForPartialIndex($0, row: row) }
+        case let .in(column, values):
+            guard let rv = row.values[column], rv != .null else { return false }
+            return values.contains(rv)
+        case let .between(column, min, max):
+            guard let rv = row.values[column], rv != .null else { return false }
+            return rv >= min && rv <= max
+        case let .like(column, pattern):
+            guard let rv = row.values[column], case .string(let str) = rv else { return false }
+            // Simple LIKE match
+            let s = Array(str), p = Array(pattern)
+            var si = 0, pi = 0, starSi = -1, starPi = -1
+            while si < s.count {
+                if pi < p.count && p[pi] == "%" { starPi = pi; starSi = si; pi += 1 }
+                else if pi < p.count && (p[pi] == "_" || p[pi] == s[si]) { si += 1; pi += 1 }
+                else if starPi >= 0 { pi = starPi + 1; starSi += 1; si = starSi }
+                else { return false }
+            }
+            while pi < p.count && p[pi] == "%" { pi += 1 }
+            return pi == p.count
+        }
     }
 }
 

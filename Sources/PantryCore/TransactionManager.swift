@@ -7,6 +7,9 @@ public actor TransactionManager: Sendable {
     private let logManager: WriteAheadLog
     private let defaultIsolationLevel: IsolationLevel
 
+    /// MVCC: global monotonic version counter, incremented on each commit
+    private var globalVersion: UInt64 = 0
+
     /// Closure injected by StorageEngine to flush modified pages
     public var pageFlusher: (@Sendable (Set<Int>) async throws -> Void)?
 
@@ -34,7 +37,8 @@ public actor TransactionManager: Sendable {
         nextTransactionID += 1
 
         let level = isolationLevel ?? defaultIsolationLevel
-        let txContext = TransactionContext(transactionID: txID, isolationLevel: level)
+        // MVCC: capture current global version as the transaction's snapshot
+        let txContext = TransactionContext(transactionID: txID, isolationLevel: level, snapshotVersion: globalVersion)
 
         // WAL write first — if it fails, no phantom transaction is registered
         try await logManager.logTransactionBegin(txID: txID, isolationLevel: level)
@@ -52,6 +56,11 @@ public actor TransactionManager: Sendable {
             try await validateSerializableTransaction(txContext)
         }
 
+        // MVCC: write-write conflict detection for repeatable read and above
+        if txContext.isolationLevel.rawValue >= IsolationLevel.repeatableRead.rawValue {
+            try await detectWriteWriteConflicts(txContext)
+        }
+
         // WAL protocol: commit record must be durable BEFORE pages are flushed
         try await logManager.logTransactionCommit(txID: txContext.transactionID, isolationLevel: txContext.isolationLevel)
 
@@ -60,10 +69,27 @@ public actor TransactionManager: Sendable {
         await txContext.commit()
         activeTransactions.removeValue(forKey: txContext.transactionID)
 
+        // MVCC: advance global version
+        globalVersion += 1
+
         // Now safe to flush modified pages to disk
         let modifiedPages = await txContext.modifiedPages
         if let flusher = pageFlusher {
             try await flusher(modifiedPages)
+        }
+    }
+
+    /// MVCC: detect write-write conflicts between concurrent transactions
+    private func detectWriteWriteConflicts(_ txContext: TransactionContext) async throws {
+        let myWrittenIDs = await txContext.writtenRecordIDs
+        guard !myWrittenIDs.isEmpty else { return }
+
+        for (otherTxID, otherTx) in activeTransactions {
+            if otherTxID == txContext.transactionID { continue }
+            let otherWrittenIDs = await otherTx.writtenRecordIDs
+            if !myWrittenIDs.isDisjoint(with: otherWrittenIDs) {
+                throw PantryError.writeWriteConflict
+            }
         }
     }
 
@@ -111,6 +137,11 @@ public actor TransactionManager: Sendable {
 
     public func getActiveTransactionIDs() -> [UInt64] {
         Array(activeTransactions.keys)
+    }
+
+    /// MVCC: return current global version (for monitoring/debugging)
+    public func getCurrentVersion() -> UInt64 {
+        globalVersion
     }
 
     // MARK: - Checkpointing

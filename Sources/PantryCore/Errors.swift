@@ -27,6 +27,7 @@ public enum PantryError: Error, Sendable {
     case transactionNotFound
     case invalidTransactionState
     case serializationConflict
+    case writeWriteConflict
     case deadlockDetected
     case lockTimeout
 

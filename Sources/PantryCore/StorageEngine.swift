@@ -105,6 +105,9 @@ public actor StorageEngine: Sendable {
         if indexRegistryPageID != 0 {
             systemPageIDs.insert(indexRegistryPageID)
         }
+
+        // Start background dirty page writer
+        bufferPoolManager.startBackgroundWriter()
     }
 
     // MARK: - Page Operations
@@ -1032,6 +1035,9 @@ public actor StorageEngine: Sendable {
     // MARK: - Lifecycle
 
     public func close() async throws {
+        // Stop background writer before final flush
+        bufferPoolManager.stopBackgroundWriter()
+
         var firstError: Error?
 
         do { try await bufferPoolManager.flushAllDirtyPages() } catch { if firstError == nil { firstError = error } }

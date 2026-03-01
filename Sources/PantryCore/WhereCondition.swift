@@ -157,3 +157,17 @@ public enum SelectExpression: Sendable {
     case min(column: String)
     case max(column: String)
 }
+
+// MARK: - Set Operations
+
+/// Combines two result sets
+public enum SetOperation: Sendable {
+    /// Combine and deduplicate
+    case union
+    /// Combine without deduplication
+    case unionAll
+    /// Only rows in both result sets
+    case intersect
+    /// Rows in first but not second
+    case except
+}

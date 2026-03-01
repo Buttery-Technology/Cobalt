@@ -11,19 +11,99 @@ private struct StripeState {
     var flushCount: Int = 0
 }
 
+/// Configuration for the background page writer
+public struct BackgroundWriterConfig: Sendable {
+    /// Interval between flush cycles in milliseconds
+    public let intervalMilliseconds: Int
+    /// Maximum number of dirty pages to flush per cycle
+    public let maxPagesPerCycle: Int
+    /// Dirty page ratio threshold to trigger flush (0.0–1.0)
+    public let dirtyThreshold: Double
+
+    public init(intervalMilliseconds: Int = 100, maxPagesPerCycle: Int = 16, dirtyThreshold: Double = 0.25) {
+        self.intervalMilliseconds = intervalMilliseconds
+        self.maxPagesPerCycle = maxPagesPerCycle
+        self.dirtyThreshold = dirtyThreshold
+    }
+}
+
 /// Manages an in-memory cache of database pages to minimize disk I/O.
 /// Uses stripe-based partitioning (pageID % stripeCount) to reduce mutex contention.
+/// Includes a background writer that asynchronously flushes dirty pages.
 public final class BufferPoolManager: Sendable {
     private let capacity: Int
     private let storageManager: StorageManager
     private let stripes: [PantryLock<StripeState>]
     private let stripeCount: Int
+    private let bgWriterConfig: BackgroundWriterConfig
+    private let bgWriterTask: PantryLock<Task<Void, Never>?>
 
-    public init(capacity: Int, storageManager: StorageManager, stripeCount: Int = 8) {
+    public init(capacity: Int, storageManager: StorageManager, stripeCount: Int = 8, bgWriterConfig: BackgroundWriterConfig = BackgroundWriterConfig()) {
         self.capacity = capacity
         self.storageManager = storageManager
         self.stripeCount = max(1, stripeCount)
         self.stripes = (0..<max(1, stripeCount)).map { _ in PantryLock(StripeState()) }
+        self.bgWriterConfig = bgWriterConfig
+        self.bgWriterTask = PantryLock(nil)
+    }
+
+    /// Start the background dirty page writer
+    public func startBackgroundWriter() {
+        let task = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(self?.bgWriterConfig.intervalMilliseconds ?? 100))
+                guard !Task.isCancelled, let self = self else { break }
+                await self.backgroundFlushCycle()
+            }
+        }
+        bgWriterTask.withLock { $0 = task }
+    }
+
+    /// Stop the background writer
+    public func stopBackgroundWriter() {
+        bgWriterTask.withLock { task in
+            task?.cancel()
+            task = nil
+        }
+    }
+
+    /// Single background flush cycle: flush oldest dirty pages from stripes that exceed threshold
+    private func backgroundFlushCycle() async {
+        var totalFlushed = 0
+        let maxPerCycle = bgWriterConfig.maxPagesPerCycle
+
+        for s in stripes {
+            guard totalFlushed < maxPerCycle else { break }
+
+            let pagesToFlush: [(Int, DatabasePage)] = s.withLock { st in
+                let dirtyRatio = st.pageCache.isEmpty ? 0.0 : Double(st.dirtyPages.count) / Double(st.pageCache.count)
+                guard dirtyRatio >= bgWriterConfig.dirtyThreshold else { return [] }
+
+                // Pick oldest dirty pages first
+                let sorted = st.dirtyPages
+                    .compactMap { pageID -> (Int, UInt64, DatabasePage)? in
+                        guard let page = st.pageCache[pageID] else { return nil }
+                        return (pageID, st.accessOrder[pageID] ?? 0, page)
+                    }
+                    .sorted { $0.1 < $1.1 }
+                    .prefix(maxPerCycle - totalFlushed)
+
+                return sorted.map { ($0.0, $0.2) }
+            }
+
+            for (pageID, var page) in pagesToFlush {
+                do {
+                    try await storageManager.writePage(&page)
+                    s.withLock { st in
+                        st.dirtyPages.remove(pageID)
+                        st.flushCount += 1
+                    }
+                    totalFlushed += 1
+                } catch {
+                    // Background flush errors are non-critical — page remains dirty for later
+                }
+            }
+        }
     }
 
     private func stripe(for pageID: Int) -> PantryLock<StripeState> {
