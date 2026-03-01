@@ -7,14 +7,20 @@ public actor ColumnIndex: Sendable {
     public let columnName: String
     /// For compound indexes, the ordered list of columns that form the key
     public let compoundColumns: [String]?
+    /// Extra non-key columns stored in index for covering index scans (INCLUDE columns)
+    public let includeColumns: [String]?
+    /// Optional WHERE condition for partial indexes — only rows matching this are indexed
+    public let partialCondition: WhereCondition?
     public let btree: BTree
     private var bloomFilter: BloomFilter
     public let nodeStore: PageBackedNodeStore
 
-    public init(tableName: String, columnName: String, compoundColumns: [String]? = nil, btree: BTree, nodeStore: PageBackedNodeStore, expectedElements: Int = 10000) {
+    public init(tableName: String, columnName: String, compoundColumns: [String]? = nil, includeColumns: [String]? = nil, partialCondition: WhereCondition? = nil, btree: BTree, nodeStore: PageBackedNodeStore, expectedElements: Int = 10000) {
         self.tableName = tableName
         self.columnName = columnName
         self.compoundColumns = compoundColumns
+        self.includeColumns = includeColumns
+        self.partialCondition = partialCondition
         self.btree = btree
         self.nodeStore = nodeStore
         self.bloomFilter = BloomFilter(expectedElements: expectedElements)
@@ -22,6 +28,20 @@ public actor ColumnIndex: Sendable {
 
     /// Whether this is a compound (multi-column) index
     public var isCompound: Bool { compoundColumns != nil }
+
+    /// All columns available from this index (key columns + include columns)
+    public var coveredColumns: Set<String> {
+        var cols = Set<String>()
+        if let compound = compoundColumns {
+            cols.formUnion(compound)
+        } else {
+            cols.insert(columnName)
+        }
+        if let include = includeColumns {
+            cols.formUnion(include)
+        }
+        return cols
+    }
 
     /// Insert a key-row pair into this index
     public func insert(key: DBValue, row: Row) async throws {
@@ -65,11 +85,11 @@ public actor IndexManager: IndexHook, Sendable {
         self.storageManager = storageManager
     }
 
-    /// Create a new index for a table column
-    public func createIndex(tableName: String, columnName: String) async throws -> ColumnIndex {
+    /// Create a new index for a table column, optionally with INCLUDE columns for covering scans
+    public func createIndex(tableName: String, columnName: String, includeColumns: [String]? = nil, partialCondition: WhereCondition? = nil) async throws -> ColumnIndex {
         let nodeStore = PageBackedNodeStore(bufferPool: bufferPool, storageManager: storageManager)
         let btree = BTree(order: 64, nodeStore: nodeStore)
-        let columnIndex = ColumnIndex(tableName: tableName, columnName: columnName, btree: btree, nodeStore: nodeStore)
+        let columnIndex = ColumnIndex(tableName: tableName, columnName: columnName, includeColumns: includeColumns, partialCondition: partialCondition, btree: btree, nodeStore: nodeStore)
 
         if indexes[tableName] == nil {
             indexes[tableName] = [:]
@@ -200,6 +220,11 @@ public actor IndexManager: IndexHook, Sendable {
         let rid: DBValue = .integer(Int64(bitPattern: record.id))
 
         for (_, columnIndex) in tableIndexes {
+            // Skip row if partial index condition is not satisfied
+            if let condition = await columnIndex.partialCondition {
+                if !evaluateConditionForIndex(condition, row: row) { continue }
+            }
+
             if let columns = await columnIndex.compoundColumns {
                 // Compound index: slim row with __rid + indexed columns only
                 var slimValues: [String: DBValue] = ["__rid": rid]
@@ -226,6 +251,11 @@ public actor IndexManager: IndexHook, Sendable {
         let rid: DBValue = .integer(Int64(bitPattern: id))
 
         for (_, columnIndex) in tableIndexes {
+            // Skip row if partial index condition is not satisfied (it wasn't indexed)
+            if let condition = await columnIndex.partialCondition {
+                if !evaluateConditionForIndex(condition, row: row) { continue }
+            }
+
             if let columns = await columnIndex.compoundColumns {
                 var slimValues: [String: DBValue] = ["__rid": rid]
                 let keyValues = columns.map { col -> DBValue in
@@ -339,6 +369,63 @@ public actor IndexManager: IndexHook, Sendable {
 }
 
 // MARK: - Helpers
+
+/// Lightweight WHERE condition evaluator for partial index filtering (no QueryExecutor dependency)
+private func evaluateConditionForIndex(_ condition: WhereCondition, row: Row) -> Bool {
+    switch condition {
+    case let .equals(column, value):
+        if value == .null { return false }
+        guard let rv = row.values[column], rv != .null else { return false }
+        return rv == value
+    case let .notEquals(column, value):
+        if value == .null { return false }
+        guard let rv = row.values[column], rv != .null else { return false }
+        return rv != value
+    case let .lessThan(column, value):
+        guard let rv = row.values[column], rv != .null, value != .null else { return false }
+        return rv < value
+    case let .greaterThan(column, value):
+        guard let rv = row.values[column], rv != .null, value != .null else { return false }
+        return rv > value
+    case let .lessThanOrEqual(column, value):
+        guard let rv = row.values[column], rv != .null, value != .null else { return false }
+        return rv <= value
+    case let .greaterThanOrEqual(column, value):
+        guard let rv = row.values[column], rv != .null, value != .null else { return false }
+        return rv >= value
+    case let .isNull(column):
+        return row.values[column] == nil || row.values[column] == .null
+    case let .isNotNull(column):
+        return row.values[column] != nil && row.values[column] != .null
+    case let .and(conditions):
+        return conditions.allSatisfy { evaluateConditionForIndex($0, row: row) }
+    case let .or(conditions):
+        return conditions.contains { evaluateConditionForIndex($0, row: row) }
+    case let .in(column, values):
+        guard let rv = row.values[column], rv != .null else { return false }
+        return values.contains(rv)
+    case let .between(column, min, max):
+        guard let rv = row.values[column], rv != .null else { return false }
+        return rv >= min && rv <= max
+    case let .like(column, pattern):
+        guard let rv = row.values[column], case .string(let str) = rv else { return false }
+        return matchLikeForIndex(str, pattern: pattern)
+    }
+}
+
+/// Simple LIKE pattern match for partial index evaluation
+private func matchLikeForIndex(_ string: String, pattern: String) -> Bool {
+    let s = Array(string), p = Array(pattern)
+    var si = 0, pi = 0, starSi = -1, starPi = -1
+    while si < s.count {
+        if pi < p.count && p[pi] == "%" { starPi = pi; starSi = si; pi += 1 }
+        else if pi < p.count && (p[pi] == "_" || p[pi] == s[si]) { si += 1; pi += 1 }
+        else if starPi >= 0 { pi = starPi + 1; starSi += 1; si = starSi }
+        else { return false }
+    }
+    while pi < p.count && p[pi] == "%" { pi += 1 }
+    return pi == p.count
+}
 
 /// Extract a column→value map from a list of .equals conditions
 private func extractEqualsMap(from conditions: [WhereCondition]) -> [String: DBValue] {

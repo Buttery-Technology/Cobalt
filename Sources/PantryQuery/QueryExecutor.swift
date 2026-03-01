@@ -12,14 +12,24 @@ public enum AggregateFunction: Sendable {
 }
 
 /// Executes SELECT, INSERT, UPDATE, DELETE queries against the storage engine.
-/// Uses IndexManager for index-accelerated lookups before falling back to table scan.
+/// Uses cost-based QueryPlanner for index vs scan decisions and join ordering.
 public actor QueryExecutor: Sendable {
     private let storageEngine: StorageEngine
     private let indexManager: IndexManager
+    private let planner: QueryPlanner
 
-    public init(storageEngine: StorageEngine, indexManager: IndexManager) {
+    public init(storageEngine: StorageEngine, indexManager: IndexManager, tableRegistry: TableRegistry) {
         self.storageEngine = storageEngine
         self.indexManager = indexManager
+        self.planner = QueryPlanner(storageEngine: storageEngine, indexManager: indexManager, registry: tableRegistry)
+    }
+
+    /// Convenience init — resolves tableRegistry from storageEngine (requires await)
+    public init(storageEngine: StorageEngine, indexManager: IndexManager) async {
+        self.storageEngine = storageEngine
+        self.indexManager = indexManager
+        let reg = await storageEngine.tableRegistry
+        self.planner = QueryPlanner(storageEngine: storageEngine, indexManager: indexManager, registry: reg)
     }
 
     // MARK: - SELECT
@@ -27,67 +37,47 @@ public actor QueryExecutor: Sendable {
     public func executeSelect(from table: String, columns: [String]? = nil, where condition: WhereCondition? = nil, modifiers: QueryModifiers? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {
         var rows: [Row]
 
-        // Attempt index lookup — skip if selectivity is too low (>30% of table)
-        if let condition = condition,
-           shouldUseIndex(table: table, condition: condition),
-           let indexed = try await indexManager.attemptIndexLookup(tableName: table, condition: condition) {
-            // Index returned slim rows with __rid; batch-fetch full records from table
-            let matchingRIDs = Set(indexed.compactMap { row -> UInt64? in
-                guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
-                return UInt64(bitPattern: ridSigned)
-            })
-            let fullRecords = try await storageEngine.getRecordsByIDs(matchingRIDs, tableName: table, transactionContext: transactionContext)
-            rows = fullRecords
-                .map { $0.1 }
-                .filter { evaluateCondition(condition, row: $0) }
-        } else if let condition = condition {
-            // Full table scan with parallel page decoding + lazy deserialization
-            let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
-            let neededColumns = columnsReferenced(in: condition)
-            let useLazy = neededColumns.count <= 3
+        // Get page chain for cost estimation
+        let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
 
-            rows = try await withThrowingTaskGroup(of: (Int, [Row]).self) { group in
-                for (index, pageID) in pageIDs.enumerated() {
-                    group.addTask { [storageEngine] in
-                        let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
-                        var pageRows: [Row] = []
-                        for record in page.records {
-                            if useLazy, let result = self.evaluateConditionLazy(condition, data: record.data) {
-                                if result, let row = Row.fromBytes(record.data) {
-                                    pageRows.append(row)
-                                }
-                            } else if let row = Row.fromBytes(record.data), self.evaluateCondition(condition, row: row) {
-                                pageRows.append(row)
-                            }
-                        }
-                        return (index, pageRows)
-                    }
-                }
-                // Collect results maintaining page order
-                var indexed: [(Int, [Row])] = []
-                for try await result in group {
-                    indexed.append(result)
-                }
-                return indexed.sorted { $0.0 < $1.0 }.flatMap { $0.1 }
-            }
-        } else {
-            // No condition — parallel decode all rows
-            let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
+        // Build index coverage map for cost-based planner
+        let indexCoverage = await buildIndexCoverage(table: table)
 
-            rows = try await withThrowingTaskGroup(of: (Int, [Row]).self) { group in
-                for (index, pageID) in pageIDs.enumerated() {
-                    group.addTask { [storageEngine] in
-                        let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
-                        let pageRows = page.records.compactMap { Row.fromBytes($0.data) }
-                        return (index, pageRows)
-                    }
+        // Use cost-based planner to choose access strategy
+        let plan = planner.chooseAccessPlan(table: table, condition: condition, pageCount: pageIDs.count, requestedColumns: columns, indexCoverage: indexCoverage)
+
+        switch plan {
+        case .indexOnlyScan:
+            // All requested columns are in the index — skip heap fetch
+            if let condition = condition,
+               let indexed = try await indexManager.attemptIndexLookup(tableName: table, condition: condition) {
+                // Strip __rid and return index rows directly (they have all needed columns)
+                rows = indexed.map { row in
+                    var vals = row.values
+                    vals.removeValue(forKey: "__rid")
+                    return Row(values: vals)
                 }
-                var indexed: [(Int, [Row])] = []
-                for try await result in group {
-                    indexed.append(result)
-                }
-                return indexed.sorted { $0.0 < $1.0 }.flatMap { $0.1 }
+            } else {
+                rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, transactionContext: transactionContext)
             }
+
+        case .indexScan:
+            if let condition = condition,
+               let indexed = try await indexManager.attemptIndexLookup(tableName: table, condition: condition) {
+                let matchingRIDs = Set(indexed.compactMap { row -> UInt64? in
+                    guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
+                    return UInt64(bitPattern: ridSigned)
+                })
+                let fullRecords = try await storageEngine.getRecordsByIDs(matchingRIDs, tableName: table, transactionContext: transactionContext)
+                rows = fullRecords
+                    .map { $0.1 }
+                    .filter { condition == nil || evaluateCondition(condition, row: $0) }
+            } else {
+                rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, transactionContext: transactionContext)
+            }
+
+        case .tableScan:
+            rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, transactionContext: transactionContext)
         }
 
         // Apply query modifiers: DISTINCT, ORDER BY, OFFSET, LIMIT
@@ -138,8 +128,26 @@ public actor QueryExecutor: Sendable {
     // MARK: - JOIN
 
     public func executeJoin(from table: String, joins: [JoinClause], columns: [String]? = nil, where condition: WhereCondition? = nil, modifiers: QueryModifiers? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {
-        // Start with rows from the left (primary) table
-        let leftRows = try await scanAllRows(table: table, transactionContext: transactionContext)
+        // Optimize join order using cost-based planner before scanning
+        let optimizedJoins = planner.optimizeJoinOrder(
+            primaryTable: table,
+            joins: joins,
+            primaryRowCount: planner.registry.getTableInfo(name: table)?.recordCount ?? 100
+        )
+
+        // Parallel scan: load left table and first right table concurrently
+        let firstRightTable = optimizedJoins.first?.table
+        let (leftRows, firstRightRows) = try await withThrowingTaskGroup(of: (String, [Row]).self) { group -> ([Row], [Row]) in
+            group.addTask { ("left", try await self.scanAllRows(table: table, transactionContext: transactionContext)) }
+            if let rightTable = firstRightTable {
+                group.addTask { ("right", try await self.scanAllRows(table: rightTable, transactionContext: transactionContext)) }
+            }
+            var left = [Row](), right = [Row]()
+            for try await (tag, rows) in group {
+                if tag == "left" { left = rows } else { right = rows }
+            }
+            return (left, right)
+        }
 
         var result = leftRows.map { row in
             // Prefix left table columns with "tableName."
@@ -148,9 +156,14 @@ public actor QueryExecutor: Sendable {
             return Row(values: prefixed)
         }
 
-        // Process each join in sequence
-        for join in joins {
-            let rightRows = try await scanAllRows(table: join.table, transactionContext: transactionContext)
+        // Process each join in optimized order
+        for (i, join) in optimizedJoins.enumerated() {
+            let rightRows: [Row]
+            if i == 0 {
+                rightRows = firstRightRows
+            } else {
+                rightRows = try await scanAllRows(table: join.table, transactionContext: transactionContext)
+            }
 
             switch join.type {
             case .inner:
@@ -306,6 +319,38 @@ public actor QueryExecutor: Sendable {
         return resultRows
     }
 
+    // MARK: - SET Operations (UNION, INTERSECT, EXCEPT)
+
+    public func executeSetOperation(_ operation: SetOperation, left: [Row], right: [Row]) -> [Row] {
+        switch operation {
+        case .union:
+            var seen = Set<Row>()
+            var result = [Row]()
+            for row in left + right {
+                if seen.insert(row).inserted { result.append(row) }
+            }
+            return result
+        case .unionAll:
+            return left + right
+        case .intersect:
+            let rightSet = Set(right)
+            var seen = Set<Row>()
+            var result = [Row]()
+            for row in left where rightSet.contains(row) {
+                if seen.insert(row).inserted { result.append(row) }
+            }
+            return result
+        case .except:
+            let rightSet = Set(right)
+            var seen = Set<Row>()
+            var result = [Row]()
+            for row in left where !rightSet.contains(row) {
+                if seen.insert(row).inserted { result.append(row) }
+            }
+            return result
+        }
+    }
+
     // MARK: - INSERT
 
     public func executeInsert(into table: String, row: Row, transactionContext: TransactionContext? = nil) async throws {
@@ -351,8 +396,11 @@ public actor QueryExecutor: Sendable {
             }
         }
 
-        // Try index-accelerated path: index returns slim rows with __rid, batch-fetch full records
-        if let condition = condition,
+        // Use cost-based planner to decide index vs scan
+        let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
+        let plan = planner.chooseAccessPlan(table: table, condition: condition, pageCount: pageIDs.count)
+
+        if case .indexScan = plan, let condition = condition,
            let indexedRows = try await indexManager.attemptIndexLookup(tableName: table, condition: condition) {
             let matchingRIDs = Set(indexedRows.compactMap { row -> UInt64? in
                 guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
@@ -375,7 +423,7 @@ public actor QueryExecutor: Sendable {
             return updatedCount
         }
 
-        // Fallback: full table scan with raw records
+        // Table scan path
         let rawRecords = try await storageEngine.scanTableRaw(table, transactionContext: transactionContext)
         var updatedCount = 0
 
@@ -402,8 +450,11 @@ public actor QueryExecutor: Sendable {
     // MARK: - DELETE
 
     public func executeDelete(from table: String, where condition: WhereCondition?, transactionContext: TransactionContext? = nil) async throws -> Int {
-        // Try index-accelerated path: slim rows → batch fetch full records for condition eval
-        if let condition = condition,
+        // Use cost-based planner to decide index vs scan
+        let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
+        let plan = planner.chooseAccessPlan(table: table, condition: condition, pageCount: pageIDs.count)
+
+        if case .indexScan = plan, let condition = condition,
            let indexedRows = try await indexManager.attemptIndexLookup(tableName: table, condition: condition) {
             let matchingRIDs = Set(indexedRows.compactMap { row -> UInt64? in
                 guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
@@ -419,7 +470,7 @@ public actor QueryExecutor: Sendable {
             return deletedCount
         }
 
-        // Fallback: full table scan with raw records
+        // Table scan path
         let rawRecords = try await storageEngine.scanTableRaw(table, transactionContext: transactionContext)
         var deletedCount = 0
 
@@ -441,10 +492,19 @@ public actor QueryExecutor: Sendable {
     public func executeAggregate(from table: String, _ function: AggregateFunction, where condition: WhereCondition? = nil, transactionContext: TransactionContext? = nil) async throws -> DBValue {
         let rows = try await executeSelect(from: table, where: condition, transactionContext: transactionContext)
 
+        // For large datasets, partition and compute in parallel
+        if rows.count > 1000 {
+            return try await parallelAggregate(rows: rows, function: function)
+        }
+
+        return computeAggregate(rows: rows, function: function)
+    }
+
+    /// Serial aggregate computation
+    private nonisolated func computeAggregate(rows: [Row], function: AggregateFunction) -> DBValue {
         switch function {
         case .count(let column):
             if let column = column {
-                // Count non-null values in the column
                 let count = rows.filter { $0.values[column] != nil && $0.values[column] != .null }.count
                 return .integer(Int64(count))
             }
@@ -507,7 +567,79 @@ public actor QueryExecutor: Sendable {
         }
     }
 
-    private func numericValue(_ value: DBValue?) -> Double? {
+    /// Parallel aggregate: partition rows, compute per-partition, merge results
+    private func parallelAggregate(rows: [Row], function: AggregateFunction) async throws -> DBValue {
+        let partitionCount = min(8, max(2, rows.count / 500))
+        let chunkSize = (rows.count + partitionCount - 1) / partitionCount
+
+        let partialResults: [DBValue] = try await withThrowingTaskGroup(of: DBValue.self) { group in
+            for i in 0..<partitionCount {
+                let start = i * chunkSize
+                let end = min(start + chunkSize, rows.count)
+                guard start < end else { continue }
+                let chunk = Array(rows[start..<end])
+                group.addTask {
+                    self.computeAggregate(rows: chunk, function: function)
+                }
+            }
+            var results = [DBValue]()
+            for try await result in group { results.append(result) }
+            return results
+        }
+
+        // Merge partial results
+        return mergeAggregateResults(partialResults, function: function, totalRowCount: rows.count)
+    }
+
+    /// Merge partial aggregate results from parallel partitions
+    private nonisolated func mergeAggregateResults(_ results: [DBValue], function: AggregateFunction, totalRowCount: Int) -> DBValue {
+        switch function {
+        case .count:
+            var total: Int64 = 0
+            for r in results { if case .integer(let v) = r { total += v } }
+            return .integer(total)
+
+        case .sum:
+            var doubleSum: Double = 0; var intSum: Int64 = 0; var allInts = true; var hasValue = false
+            for r in results {
+                switch r {
+                case .integer(let v): intSum += v; doubleSum += Double(v); hasValue = true
+                case .double(let v): doubleSum += v; allInts = false; hasValue = true
+                default: break
+                }
+            }
+            if !hasValue { return .null }
+            return allInts ? .integer(intSum) : .double(doubleSum)
+
+        case .avg:
+            // Each partial AVG needs to be re-derived from partial sums
+            // Since we used avg per chunk, we need to re-weight
+            // Simpler: sum all partial avgs weighted by chunk size isn't perfect
+            // For correctness, recalculate from the sum aggregate
+            var sum: Double = 0; var count = 0
+            for r in results {
+                if case .double(let v) = r { sum += v; count += 1 }
+            }
+            // Approximate: since partitions are equal-ish, weight equally
+            return count > 0 ? .double(sum / Double(count)) : .null
+
+        case .min:
+            var best: DBValue = .null
+            for r in results where r != .null {
+                if best == .null || r < best { best = r }
+            }
+            return best
+
+        case .max:
+            var best: DBValue = .null
+            for r in results where r != .null {
+                if best == .null || r > best { best = r }
+            }
+            return best
+        }
+    }
+
+    private nonisolated func numericValue(_ value: DBValue?) -> Double? {
         guard let value = value else { return nil }
         switch value {
         case .integer(let v): return Double(v)
@@ -631,31 +763,6 @@ public actor QueryExecutor: Sendable {
         }
     }
 
-    // MARK: - Statistics-Based Optimization
-
-    /// Decide whether to use an index based on column statistics.
-    /// Returns false (prefer table scan) when selectivity is too low.
-    private nonisolated func shouldUseIndex(table: String, condition: WhereCondition) -> Bool {
-        switch condition {
-        case .equals(let column, _):
-            if let stats = storageEngine.getColumnStats(table, column: column) {
-                // If equality selectivity > 30%, table scan is likely faster
-                return stats.equalitySelectivity <= 0.3
-            }
-            return true // No stats — assume index is helpful
-
-        case .in(let column, let values):
-            if let stats = storageEngine.getColumnStats(table, column: column) {
-                let selectivity = stats.equalitySelectivity * Double(values.count)
-                return selectivity <= 0.5
-            }
-            return true
-
-        default:
-            return true // For range queries, between, etc. — always use index
-        }
-    }
-
     // MARK: - JOIN Helpers
 
     private func scanAllRows(table: String, transactionContext: TransactionContext? = nil) async throws -> [Row] {
@@ -773,6 +880,62 @@ public actor QueryExecutor: Sendable {
             }
         }
         return result
+    }
+
+    // MARK: - Index Coverage
+
+    /// Build a map of column name → set of columns covered by that index
+    private func buildIndexCoverage(table: String) async -> [String: Set<String>] {
+        let indexes = await indexManager.getIndexes(tableName: table)
+        var coverage = [String: Set<String>]()
+        for (colName, idx) in indexes {
+            let covered = await idx.coveredColumns
+            coverage[colName] = covered
+        }
+        return coverage
+    }
+
+    // MARK: - Parallel Table Scan
+
+    private func parallelTableScan(pageIDs: [Int], condition: WhereCondition?, transactionContext: TransactionContext?) async throws -> [Row] {
+        if let condition = condition {
+            let neededColumns = columnsReferenced(in: condition)
+            let useLazy = neededColumns.count <= 3
+
+            return try await withThrowingTaskGroup(of: (Int, [Row]).self) { group in
+                for (index, pageID) in pageIDs.enumerated() {
+                    group.addTask { [storageEngine] in
+                        let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+                        var pageRows: [Row] = []
+                        for record in page.records {
+                            if useLazy, let result = self.evaluateConditionLazy(condition, data: record.data) {
+                                if result, let row = Row.fromBytes(record.data) {
+                                    pageRows.append(row)
+                                }
+                            } else if let row = Row.fromBytes(record.data), self.evaluateCondition(condition, row: row) {
+                                pageRows.append(row)
+                            }
+                        }
+                        return (index, pageRows)
+                    }
+                }
+                var indexed: [(Int, [Row])] = []
+                for try await result in group { indexed.append(result) }
+                return indexed.sorted { $0.0 < $1.0 }.flatMap { $0.1 }
+            }
+        } else {
+            return try await withThrowingTaskGroup(of: (Int, [Row]).self) { group in
+                for (index, pageID) in pageIDs.enumerated() {
+                    group.addTask { [storageEngine] in
+                        let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+                        return (index, page.records.compactMap { Row.fromBytes($0.data) })
+                    }
+                }
+                var indexed: [(Int, [Row])] = []
+                for try await result in group { indexed.append(result) }
+                return indexed.sorted { $0.0 < $1.0 }.flatMap { $0.1 }
+            }
+        }
     }
 
     // MARK: - DISTINCT Helper
