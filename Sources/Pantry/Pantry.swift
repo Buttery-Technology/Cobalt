@@ -144,6 +144,10 @@ public actor PantryDatabase: Sendable {
         return 0
     }
 
+    public func exists(in table: String, where condition: WhereCondition) async throws -> Bool {
+        try await count(from: table, where: condition) > 0
+    }
+
     public func insertAll(into table: String, rows: [[String: DBValue]]) async throws {
         try await transaction { db in
             for row in rows {
