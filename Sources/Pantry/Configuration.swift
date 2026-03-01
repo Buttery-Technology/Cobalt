@@ -82,7 +82,9 @@ public struct PantryConfiguration: Sendable {
         let newKey = generateKey()
         let dir = (keyPath as NSString).deletingLastPathComponent
         try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        fm.createFile(atPath: keyPath, contents: newKey)
+        let keyURL = URL(fileURLWithPath: keyPath)
+        try newKey.write(to: keyURL, options: .atomic)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyPath)
         return newKey
     }
 }
