@@ -39,10 +39,10 @@ public actor StorageEngine: Sendable {
         // Wire page flusher to break circular reference
         await transactionManager.setPageFlusher { [bufferPoolManager, storageManager] modifiedPages in
             for pageID in modifiedPages {
-                if let page = await bufferPoolManager.getCachedPage(pageID: pageID) {
+                if let page = bufferPoolManager.getCachedPage(pageID: pageID) {
                     var pageToWrite = page
                     try await storageManager.writePage(&pageToWrite)
-                    await bufferPoolManager.clearDirtyFlag(pageID: pageID)
+                    bufferPoolManager.clearDirtyFlag(pageID: pageID)
                 }
             }
         }
@@ -50,7 +50,7 @@ public actor StorageEngine: Sendable {
         // Wire page invalidator so rollback evicts stale pages from buffer pool
         await transactionManager.setPageInvalidator { [bufferPoolManager] modifiedPages in
             for pageID in modifiedPages {
-                await bufferPoolManager.evictPage(pageID: pageID)
+                bufferPoolManager.evictPage(pageID: pageID)
             }
         }
 
@@ -91,7 +91,7 @@ public actor StorageEngine: Sendable {
     // MARK: - Page Operations
 
     public func getPage(pageID: Int, transactionContext: TransactionContext? = nil) async throws -> DatabasePage {
-        if let cachedPage = await bufferPoolManager.getCachedPage(pageID: pageID) {
+        if let cachedPage = bufferPoolManager.getCachedPage(pageID: pageID) {
             if let txContext = transactionContext {
                 await txContext.recordAccess(pageID: pageID, isWrite: false)
             }
@@ -129,8 +129,8 @@ public actor StorageEngine: Sendable {
         var serializedPage = page
         try serializedPage.saveRecords()
 
-        await bufferPoolManager.updatePage(serializedPage)
-        await bufferPoolManager.markDirty(pageID: page.pageID)
+        bufferPoolManager.updatePage(serializedPage)
+        bufferPoolManager.markDirty(pageID: page.pageID)
 
         if let txContext = transactionContext {
             // Log after-image
@@ -139,7 +139,7 @@ public actor StorageEngine: Sendable {
 
         if transactionContext == nil {
             try await storageManager.writePage(&serializedPage)
-            await bufferPoolManager.clearDirtyFlag(pageID: page.pageID)
+            bufferPoolManager.clearDirtyFlag(pageID: page.pageID)
         }
     }
 
@@ -147,13 +147,13 @@ public actor StorageEngine: Sendable {
 
     @discardableResult
     public func insertRecord(_ record: Record, tableName: String, row: Row? = nil, transactionContext: TransactionContext? = nil) async throws -> UInt64 {
-        guard await tableRegistry.getTableInfo(name: tableName) != nil else {
+        guard tableRegistry.getTableInfo(name: tableName) != nil else {
             throw PantryError.tableNotFound(name: tableName)
         }
 
         let recordSize = record.serialize().count
         // findTargetPageForInsert may create new pages and update the registry
-        guard let currentInfo = await tableRegistry.getTableInfo(name: tableName) else {
+        guard let currentInfo = tableRegistry.getTableInfo(name: tableName) else {
             throw PantryError.tableNotFound(name: tableName)
         }
         let targetPageID = try await findTargetPageForInsert(tableInfo: currentInfo, recordSize: recordSize)
@@ -161,7 +161,7 @@ public actor StorageEngine: Sendable {
 
         if !page.addRecord(record) {
             // Re-read table info since findTargetPageForInsert may have updated it
-            guard var freshInfo = await tableRegistry.getTableInfo(name: tableName) else {
+            guard var freshInfo = tableRegistry.getTableInfo(name: tableName) else {
                 throw PantryError.tableNotFound(name: tableName)
             }
             // createNewPageForTable links the new page at the tail of the chain;
@@ -172,17 +172,17 @@ public actor StorageEngine: Sendable {
             }
 
             try await savePage(newPage, transactionContext: transactionContext)
-            await tableRegistry.updateTableInfo(freshInfo)
+            tableRegistry.updateTableInfo(freshInfo)
         } else {
             try await savePage(page, transactionContext: transactionContext)
         }
 
         // Re-read table info to avoid overwriting changes from page allocation
-        guard var updatedInfo = await tableRegistry.getTableInfo(name: tableName) else {
+        guard var updatedInfo = tableRegistry.getTableInfo(name: tableName) else {
             throw PantryError.tableNotFound(name: tableName)
         }
         updatedInfo.recordCount += 1
-        await tableRegistry.updateTableInfo(updatedInfo)
+        tableRegistry.updateTableInfo(updatedInfo)
 
         // Update indexes
         if let row = row {
@@ -205,7 +205,7 @@ public actor StorageEngine: Sendable {
     }
 
     public func deleteRecord(id: UInt64, tableName: String, transactionContext: TransactionContext? = nil) async throws {
-        guard await tableRegistry.getTableInfo(name: tableName) != nil else {
+        guard tableRegistry.getTableInfo(name: tableName) != nil else {
             throw PantryError.tableNotFound(name: tableName)
         }
 
@@ -215,9 +215,7 @@ public actor StorageEngine: Sendable {
         // Decode the row before deletion so indexes can be updated
         let deletedRow: Row?
         if let record = page.records.first(where: { $0.id == id }) {
-            let dec = JSONDecoder()
-            dec.nonConformingFloatDecodingStrategy = .convertFromString(positiveInfinity: "+inf", negativeInfinity: "-inf", nan: "nan")
-            deletedRow = try? dec.decode(Row.self, from: record.data)
+            deletedRow = Row.fromBytes(record.data)
         } else {
             deletedRow = nil
         }
@@ -236,26 +234,24 @@ public actor StorageEngine: Sendable {
         }
 
         // Re-read tableInfo to avoid lost-update race with concurrent operations
-        guard var freshInfo = await tableRegistry.getTableInfo(name: tableName) else {
+        guard var freshInfo = tableRegistry.getTableInfo(name: tableName) else {
             throw PantryError.tableNotFound(name: tableName)
         }
         if freshInfo.recordCount > 0 {
             freshInfo.recordCount -= 1
         }
-        await tableRegistry.updateTableInfo(freshInfo)
+        tableRegistry.updateTableInfo(freshInfo)
     }
 
     /// Scan all records in a table
     public func scanTable(_ tableName: String, transactionContext: TransactionContext? = nil) async throws -> [(Record, Row)] {
-        guard let tableInfo = await tableRegistry.getTableInfo(name: tableName) else {
+        guard let tableInfo = tableRegistry.getTableInfo(name: tableName) else {
             throw PantryError.tableNotFound(name: tableName)
         }
 
         var results: [(Record, Row)] = []
         var currentPageID = tableInfo.firstPageID
         var visited: Set<Int> = []
-        let decoder = JSONDecoder()
-        decoder.nonConformingFloatDecodingStrategy = .convertFromString(positiveInfinity: "+inf", negativeInfinity: "-inf", nan: "nan")
 
         while currentPageID != 0 {
             guard visited.insert(currentPageID).inserted else {
@@ -263,7 +259,7 @@ public actor StorageEngine: Sendable {
             }
             let page = try await getPage(pageID: currentPageID, transactionContext: transactionContext)
             for record in page.records {
-                if let row = try? decoder.decode(Row.self, from: record.data) {
+                if let row = Row.fromBytes(record.data) {
                     results.append((record, row))
                 }
             }
@@ -273,9 +269,56 @@ public actor StorageEngine: Sendable {
         return results
     }
 
+    /// Scan all records in a table, returning raw record data without Row decoding.
+    /// Callers are responsible for decoding rows from record.data.
+    public func scanTableRaw(_ tableName: String, transactionContext: TransactionContext? = nil) async throws -> [(Record, Data)] {
+        guard let tableInfo = tableRegistry.getTableInfo(name: tableName) else {
+            throw PantryError.tableNotFound(name: tableName)
+        }
+
+        var results: [(Record, Data)] = []
+        var currentPageID = tableInfo.firstPageID
+        var visited: Set<Int> = []
+
+        while currentPageID != 0 {
+            guard visited.insert(currentPageID).inserted else {
+                throw PantryError.corruptPage(pageID: currentPageID)
+            }
+            let page = try await getPage(pageID: currentPageID, transactionContext: transactionContext)
+            for record in page.records {
+                results.append((record, record.data))
+            }
+            currentPageID = page.nextPageID
+        }
+
+        return results
+    }
+
+    /// Walk the page chain for a table and return just the page IDs (lightweight).
+    public func getPageChain(tableName: String, transactionContext: TransactionContext? = nil) async throws -> [Int] {
+        guard let tableInfo = tableRegistry.getTableInfo(name: tableName) else {
+            throw PantryError.tableNotFound(name: tableName)
+        }
+
+        var pageIDs: [Int] = []
+        var currentPageID = tableInfo.firstPageID
+        var visited: Set<Int> = []
+
+        while currentPageID != 0 {
+            guard visited.insert(currentPageID).inserted else {
+                throw PantryError.corruptPage(pageID: currentPageID)
+            }
+            pageIDs.append(currentPageID)
+            let page = try await getPage(pageID: currentPageID, transactionContext: transactionContext)
+            currentPageID = page.nextPageID
+        }
+
+        return pageIDs
+    }
+
     /// Stream records from a table page-at-a-time, yielding (Record, Row) pairs.
     public func scanTableStream(_ tableName: String) async throws -> AsyncStream<(Record, Row)> {
-        guard let tableInfo = await tableRegistry.getTableInfo(name: tableName) else {
+        guard let tableInfo = tableRegistry.getTableInfo(name: tableName) else {
             throw PantryError.tableNotFound(name: tableName)
         }
 
@@ -286,15 +329,13 @@ public actor StorageEngine: Sendable {
             Task {
                 var currentPageID = firstPageID
                 var visited: Set<Int> = []
-                let decoder = JSONDecoder()
-                decoder.nonConformingFloatDecodingStrategy = .convertFromString(positiveInfinity: "+inf", negativeInfinity: "-inf", nan: "nan")
 
                 while currentPageID != 0 {
                     guard visited.insert(currentPageID).inserted else { break }
                     do {
                         let page = try await engine.getPage(pageID: currentPageID)
                         for record in page.records {
-                            if let row = try? decoder.decode(Row.self, from: record.data) {
+                            if let row = Row.fromBytes(record.data) {
                                 continuation.yield((record, row))
                             }
                         }
@@ -310,26 +351,26 @@ public actor StorageEngine: Sendable {
 
     /// Check if a table exists
     public func tableExists(_ name: String) async -> Bool {
-        await tableRegistry.getTableInfo(name: name) != nil
+        tableRegistry.getTableInfo(name: name) != nil
     }
 
     /// List all table names
     public func listTables() async -> [String] {
-        await tableRegistry.allTables().map { $0.name }
+        tableRegistry.allTables().map { $0.name }
     }
 
     /// Get a table's schema
     public func getTableSchema(_ name: String) async -> PantryTableSchema? {
-        await tableRegistry.getTableInfo(name: name)?.schema
+        tableRegistry.getTableInfo(name: name)?.schema
     }
 
     /// Update a table's schema in the registry (does not modify existing rows)
     public func updateTableSchema(_ name: String, schema: PantryTableSchema) async throws {
-        guard var info = await tableRegistry.getTableInfo(name: name) else {
+        guard var info = tableRegistry.getTableInfo(name: name) else {
             throw PantryError.tableNotFound(name: name)
         }
         info.schema = schema
-        await tableRegistry.updateTableInfo(info)
+        tableRegistry.updateTableInfo(info)
         try await tableRegistry.save()
     }
 
@@ -340,17 +381,17 @@ public actor StorageEngine: Sendable {
         let firstPage = try await storageManager.createNewPage()
         await bufferPoolManager.cachePage(firstPage)
 
-        _ = try await tableRegistry.registerTable(name: schema.name, schema: schema, firstPageID: firstPage.pageID)
+        _ = try tableRegistry.registerTable(name: schema.name, schema: schema, firstPageID: firstPage.pageID)
         try await tableRegistry.save()
     }
 
     public func dropTable(_ name: String) async throws {
-        guard let tableInfo = await tableRegistry.getTableInfo(name: name) else {
+        guard let tableInfo = tableRegistry.getTableInfo(name: name) else {
             throw PantryError.tableNotFound(name: name)
         }
 
         // Remove from registry and free space map first
-        await tableRegistry.removeTable(name: name)
+        tableRegistry.removeTable(name: name)
         freeSpaceMap.removeValue(forKey: name)
         try await tableRegistry.save()
 
@@ -427,7 +468,7 @@ public actor StorageEngine: Sendable {
         // Need a new page — caller will handle linking
         var info = tableInfo
         let newPage = try await createNewPageForTable(tableInfo: &info)
-        await tableRegistry.updateTableInfo(info)
+        tableRegistry.updateTableInfo(info)
         // New page has full free space
         freeSpaceMap[tableInfo.name, default: []].insert(newPage.pageID)
         return newPage.pageID
@@ -441,7 +482,7 @@ public actor StorageEngine: Sendable {
             freeListHead = freePage.nextPageID
             var reusedPage = DatabasePage(pageID: freePage.pageID)
             try reusedPage.saveRecords()
-            await bufferPoolManager.updatePage(reusedPage)
+            bufferPoolManager.updatePage(reusedPage)
             try await saveFreeListHead()
             newPage = reusedPage
         } else {
@@ -476,7 +517,7 @@ public actor StorageEngine: Sendable {
     }
 
     private func findRecordBySequentialScan(id: UInt64, tableName: String, transactionContext: TransactionContext?) async throws -> Record {
-        guard let tableInfo = await tableRegistry.getTableInfo(name: tableName) else {
+        guard let tableInfo = tableRegistry.getTableInfo(name: tableName) else {
             throw PantryError.tableNotFound(name: tableName)
         }
 
@@ -497,7 +538,7 @@ public actor StorageEngine: Sendable {
     }
 
     private func findPageContainingRecord(id: UInt64, tableName: String) async throws -> Int {
-        guard let tableInfo = await tableRegistry.getTableInfo(name: tableName) else {
+        guard let tableInfo = tableRegistry.getTableInfo(name: tableName) else {
             throw PantryError.tableNotFound(name: tableName)
         }
 
@@ -580,7 +621,7 @@ public actor StorageEngine: Sendable {
             }
 
             try await storageManager.writePage(&page)
-            await bufferPoolManager.updatePage(page)
+            bufferPoolManager.updatePage(page)
         }
     }
 
@@ -597,7 +638,7 @@ public actor StorageEngine: Sendable {
         metaPage.recordCount = 1
         metaPage.freeSpaceOffset = PantryConstants.PAGE_SIZE - record.serialize().count
         try await storageManager.writePage(&metaPage)
-        await bufferPoolManager.updatePage(metaPage)
+        bufferPoolManager.updatePage(metaPage)
     }
 
     private func saveFreeListHead() async throws {
@@ -627,7 +668,7 @@ public actor StorageEngine: Sendable {
     }
 
     public func getBufferPoolStats() async -> BufferPoolStats {
-        await bufferPoolManager.getStats()
+        bufferPoolManager.getStats()
     }
 }
 
