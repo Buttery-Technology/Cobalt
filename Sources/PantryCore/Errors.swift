@@ -35,6 +35,7 @@ public enum PantryError: Error, Sendable {
     case decryptionFailed(description: String? = nil)
     case encryptionKeyRequired
     case invalidEncryptionKey
+    case corruptedKeyFile(path: String)
 
     // WAL errors
     case invalidLogRecordType
