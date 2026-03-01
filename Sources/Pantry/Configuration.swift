@@ -1,5 +1,8 @@
 import Foundation
 import PantryCore
+#if canImport(Security)
+import Security
+#endif
 
 /// Configuration for creating a PantryDatabase instance
 public struct PantryConfiguration: Sendable {
@@ -30,5 +33,56 @@ public struct PantryConfiguration: Sendable {
         self.encryptionKey = encryptionKey
         self.bufferPoolCapacity = bufferPoolCapacity
         self.isolationLevel = isolationLevel
+    }
+
+    // MARK: - Default Path Helpers
+
+    /// Returns the default directory for Pantry databases.
+    /// Uses `~/Library/Application Support/Pantry/`, falling back to the temp directory.
+    public static func defaultDirectory() -> String {
+        let fm = FileManager.default
+        if let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            let dir = appSupport.appendingPathComponent("Pantry").path
+            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            return dir
+        }
+        return NSTemporaryDirectory()
+    }
+
+    /// Builds a full database path from a short name.
+    /// e.g. `databasePath(name: "myapp")` → `~/Library/Application Support/Pantry/myapp.pantry`
+    public static func databasePath(name: String = "default") -> String {
+        let dir = defaultDirectory()
+        return (dir as NSString).appendingPathComponent("\(name).pantry")
+    }
+
+    // MARK: - Key Management
+
+    /// Generate a cryptographically random 32-byte key suitable for AES-256-GCM encryption.
+    public static func generateKey() -> Data {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        precondition(status == errSecSuccess, "Failed to generate random key")
+        return Data(bytes)
+    }
+
+    /// Loads or creates an encryption key for the given database path.
+    /// The key is stored at `<dbPath>.key`. If the file exists and contains 32 bytes, it is reused.
+    /// Otherwise a new key is generated and written to disk.
+    internal static func resolveEncryptionKey(for dbPath: String) throws -> Data {
+        let keyPath = dbPath + ".key"
+        let fm = FileManager.default
+
+        if fm.fileExists(atPath: keyPath),
+           let existing = fm.contents(atPath: keyPath),
+           existing.count == 32 {
+            return existing
+        }
+
+        let newKey = generateKey()
+        let dir = (keyPath as NSString).deletingLastPathComponent
+        try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        fm.createFile(atPath: keyPath, contents: newKey)
+        return newKey
     }
 }
