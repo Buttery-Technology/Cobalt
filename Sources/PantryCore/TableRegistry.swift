@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 /// Metadata about a single table stored in the registry
 public struct TableInfo: Codable, Sendable {
@@ -19,11 +20,16 @@ public struct TableInfo: Codable, Sendable {
     }
 }
 
+/// Mutable state protected by Mutex
+private struct TableRegistryState: ~Copyable {
+    var tables: [String: TableInfo] = [:]
+    var nextTableID: Int = 1
+}
+
 /// Persists table metadata on system pages.
 /// Page 0 = DB metadata, page 1+ = table registry entries.
-public actor TableRegistry: Sendable {
-    private var tables: [String: TableInfo] = [:]
-    private var nextTableID: Int = 1
+public final class TableRegistry: Sendable {
+    private let state = Mutex(TableRegistryState())
     private let storageManager: StorageManager
     private let bufferPool: BufferPoolManager
 
@@ -59,9 +65,11 @@ public actor TableRegistry: Sendable {
             // Each record on a registry page is a JSON-encoded TableInfo
             for record in page.records {
                 if let info = try? JSONDecoder().decode(TableInfo.self, from: record.data) {
-                    tables[info.name] = info
-                    if info.tableID >= nextTableID {
-                        nextTableID = info.tableID + 1
+                    state.withLock { s in
+                        s.tables[info.name] = info
+                        if info.tableID >= s.nextTableID {
+                            s.nextTableID = info.tableID + 1
+                        }
                     }
                 }
             }
@@ -75,7 +83,11 @@ public actor TableRegistry: Sendable {
         let encoder = JSONEncoder()
         var records: [Record] = []
 
-        for (_, info) in tables.sorted(by: { $0.value.tableID < $1.value.tableID }) {
+        let tablesList = state.withLock { s in
+            s.tables.values.sorted(by: { $0.tableID < $1.tableID })
+        }
+
+        for info in tablesList {
             let data = try encoder.encode(info)
             records.append(Record(id: UInt64(info.tableID), data: data))
         }
@@ -133,42 +145,44 @@ public actor TableRegistry: Sendable {
 
     private func writePage(_ page: inout DatabasePage) async throws {
         try await storageManager.writePage(&page)
-        await bufferPool.updatePage(page)
+        bufferPool.updatePage(page)
     }
 
-    // MARK: - Table CRUD
+    // MARK: - Table CRUD (synchronous — Mutex-protected)
 
     public func registerTable(name: String, schema: PantryTableSchema, firstPageID: Int) throws -> TableInfo {
-        guard tables[name] == nil else {
-            throw PantryError.tableAlreadyExists(name: name)
-        }
+        try state.withLock { s in
+            guard s.tables[name] == nil else {
+                throw PantryError.tableAlreadyExists(name: name)
+            }
 
-        let info = TableInfo(
-            tableID: nextTableID,
-            name: name,
-            firstPageID: firstPageID,
-            lastPageID: firstPageID,
-            recordCount: 0,
-            schema: schema
-        )
-        nextTableID += 1
-        tables[name] = info
-        return info
+            let info = TableInfo(
+                tableID: s.nextTableID,
+                name: name,
+                firstPageID: firstPageID,
+                lastPageID: firstPageID,
+                recordCount: 0,
+                schema: schema
+            )
+            s.nextTableID += 1
+            s.tables[name] = info
+            return info
+        }
     }
 
     public func getTableInfo(name: String) -> TableInfo? {
-        tables[name]
+        state.withLock { $0.tables[name] }
     }
 
     public func updateTableInfo(_ info: TableInfo) {
-        tables[info.name] = info
+        state.withLock { $0.tables[info.name] = info }
     }
 
     public func removeTable(name: String) {
-        tables.removeValue(forKey: name)
+        _ = state.withLock { $0.tables.removeValue(forKey: name) }
     }
 
     public func allTables() -> [TableInfo] {
-        Array(tables.values)
+        state.withLock { Array($0.tables.values) }
     }
 }

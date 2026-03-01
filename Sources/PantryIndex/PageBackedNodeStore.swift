@@ -31,8 +31,8 @@ public actor PageBackedNodeStore: Sendable {
             page.recordCount = 1
             page.pageFlags = [.indexNode]
             try page.saveRecords()
-            await bufferPool.updatePage(page)
-            await bufferPool.markDirty(pageID: existingPageID)
+            bufferPool.updatePage(page)
+            bufferPool.markDirty(pageID: existingPageID)
         } else {
             // Allocate a new page
             var page = try await storageManager.createNewPage()
@@ -42,7 +42,7 @@ public actor PageBackedNodeStore: Sendable {
             }
             try page.saveRecords()
             await bufferPool.cachePage(page)
-            await bufferPool.markDirty(pageID: page.pageID)
+            bufferPool.markDirty(pageID: page.pageID)
             nodePageMap[node.nodeId] = page.pageID
         }
         nodeCache[node.nodeId] = node.deepCopy()

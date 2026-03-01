@@ -1,14 +1,20 @@
 import Foundation
+import Synchronization
+
+/// Mutable state protected by Mutex
+private struct BufferPoolState: ~Copyable {
+    var pageCache: [Int: DatabasePage] = [:]
+    var dirtyPages = Set<Int>()
+    var accessOrder: [Int: UInt64] = [:]
+    var nextAccessCounter: UInt64 = 0
+    var stats = BufferPoolStats()
+}
 
 /// Manages an in-memory cache of database pages to minimize disk I/O
-public actor BufferPoolManager: Sendable {
+public final class BufferPoolManager: Sendable {
     private let capacity: Int
     private let storageManager: StorageManager
-    private var pageCache: [Int: DatabasePage] = [:]
-    private var dirtyPages = Set<Int>()
-    private var accessOrder: [Int: UInt64] = [:]
-    private var nextAccessCounter: UInt64 = 0
-    private(set) var stats = BufferPoolStats()
+    private let state = Mutex(BufferPoolState())
 
     public init(capacity: Int, storageManager: StorageManager) {
         self.capacity = capacity
@@ -18,156 +24,201 @@ public actor BufferPoolManager: Sendable {
     // MARK: - Core Page Management
 
     public func getPage(pageID: Int) async throws -> DatabasePage {
-        if let cachedPage = pageCache[pageID] {
-            touchAccess(pageID: pageID)
-            stats.hitCount += 1
-            return cachedPage
+        let cached: DatabasePage? = state.withLock { s in
+            if let page = s.pageCache[pageID] {
+                s.accessOrder[pageID] = s.nextAccessCounter
+                s.nextAccessCounter += 1
+                s.stats.hitCount += 1
+                return page
+            }
+            s.stats.missCount += 1
+            return nil
         }
+        if let cached { return cached }
 
-        stats.missCount += 1
         let page = try await storageManager.readPage(pageID: pageID)
         try await addToCache(page)
         return page
     }
 
     public func isPageCached(pageID: Int) -> Bool {
-        pageCache[pageID] != nil
+        state.withLock { $0.pageCache[pageID] != nil }
     }
 
     public func getCachedPage(pageID: Int) -> DatabasePage? {
-        if let page = pageCache[pageID] {
-            touchAccess(pageID: pageID)
-            stats.hitCount += 1
-            return page
+        state.withLock { s in
+            if let page = s.pageCache[pageID] {
+                s.accessOrder[pageID] = s.nextAccessCounter
+                s.nextAccessCounter += 1
+                s.stats.hitCount += 1
+                return page
+            }
+            return nil
         }
-        return nil
     }
 
     public func updatePage(_ page: DatabasePage) {
-        pageCache[page.pageID] = page
-        touchAccess(pageID: page.pageID)
+        state.withLock { s in
+            s.pageCache[page.pageID] = page
+            s.accessOrder[page.pageID] = s.nextAccessCounter
+            s.nextAccessCounter += 1
+        }
     }
 
     public func markDirty(pageID: Int) {
-        dirtyPages.insert(pageID)
+        _ = state.withLock { $0.dirtyPages.insert(pageID) }
     }
 
     public func isDirty(pageID: Int) -> Bool {
-        dirtyPages.contains(pageID)
+        state.withLock { $0.dirtyPages.contains(pageID) }
     }
 
     public func clearDirtyFlag(pageID: Int) {
-        dirtyPages.remove(pageID)
+        _ = state.withLock { $0.dirtyPages.remove(pageID) }
     }
 
     // MARK: - Cache Management
 
     private func addToCache(_ page: DatabasePage) async throws {
-        if pageCache.count >= capacity {
+        let needsEviction = state.withLock { $0.pageCache.count >= capacity }
+        if needsEviction {
             try await evictPages(count: 1)
         }
-        pageCache[page.pageID] = page
-        touchAccess(pageID: page.pageID)
-    }
-
-    private func touchAccess(pageID: Int) {
-        accessOrder[pageID] = nextAccessCounter
-        nextAccessCounter += 1
+        state.withLock { s in
+            s.pageCache[page.pageID] = page
+            s.accessOrder[page.pageID] = s.nextAccessCounter
+            s.nextAccessCounter += 1
+        }
     }
 
     private func selectPagesForEviction(count: Int = 1) -> [Int] {
-        if count == 1 {
-            // O(n) minimum scan instead of O(n log n) sort
-            guard let oldest = accessOrder.min(by: { $0.value < $1.value }) else { return [] }
-            return [oldest.key]
+        state.withLock { s in
+            if count == 1 {
+                guard let oldest = s.accessOrder.min(by: { $0.value < $1.value }) else { return [] }
+                return [oldest.key]
+            }
+            return Array(s.accessOrder.sorted { $0.value < $1.value }.prefix(count).map { $0.key })
         }
-        return Array(accessOrder.sorted { $0.value < $1.value }.prefix(count).map { $0.key })
     }
 
     public func evictPages(count: Int = 1) async throws {
         let pagesToEvict = selectPagesForEviction(count: count)
 
         for pageID in pagesToEvict {
-            if dirtyPages.contains(pageID) {
-                if var page = pageCache[pageID] {
-                    try await storageManager.writePage(&page)
+            // Snapshot the dirty page under lock, then do I/O outside
+            let dirtyPage: DatabasePage? = state.withLock { s in
+                if s.dirtyPages.contains(pageID), let page = s.pageCache[pageID] {
+                    return page
                 }
-                dirtyPages.remove(pageID)
+                return nil
             }
-            pageCache.removeValue(forKey: pageID)
-            accessOrder.removeValue(forKey: pageID)
-            stats.evictionCount += 1
+            if var page = dirtyPage {
+                try await storageManager.writePage(&page)
+            }
+            state.withLock { s in
+                s.dirtyPages.remove(pageID)
+                s.pageCache.removeValue(forKey: pageID)
+                s.accessOrder.removeValue(forKey: pageID)
+                s.stats.evictionCount += 1
+            }
         }
     }
 
     /// Evict a specific page from cache (used after rollback to discard stale data)
     public func evictPage(pageID: Int) {
-        pageCache.removeValue(forKey: pageID)
-        accessOrder.removeValue(forKey: pageID)
-        dirtyPages.remove(pageID)
+        state.withLock { s in
+            s.pageCache.removeValue(forKey: pageID)
+            s.accessOrder.removeValue(forKey: pageID)
+            s.dirtyPages.remove(pageID)
+        }
     }
 
     // MARK: - Flushing
 
     public func flushAllDirtyPages() async throws {
-        let dirtyPagesCopy = dirtyPages
-        for pageID in dirtyPagesCopy {
-            if var page = pageCache[pageID] {
-                try await storageManager.writePage(&page)
-                stats.flushCount += 1
+        // Snapshot dirty pages and their data under lock
+        let pagesToFlush: [(Int, DatabasePage)] = state.withLock { s in
+            s.dirtyPages.compactMap { pageID in
+                guard let page = s.pageCache[pageID] else {
+                    s.dirtyPages.remove(pageID)
+                    return nil
+                }
+                return (pageID, page)
             }
-            // Always clear dirty flag — if page is not in cache, it's an orphaned entry
-            dirtyPages.remove(pageID)
         }
-        // Single fsync after all pages are written
+
+        for (pageID, var page) in pagesToFlush {
+            try await storageManager.writePage(&page)
+            state.withLock { s in
+                s.stats.flushCount += 1
+                s.dirtyPages.remove(pageID)
+            }
+        }
         try await storageManager.sync()
     }
 
     public func flushPage(pageID: Int) async throws {
-        if dirtyPages.contains(pageID), var page = pageCache[pageID] {
+        let pageToFlush: DatabasePage? = state.withLock { s in
+            if s.dirtyPages.contains(pageID), let page = s.pageCache[pageID] {
+                return page
+            }
+            return nil
+        }
+        if var page = pageToFlush {
             try await storageManager.writePage(&page)
-            dirtyPages.remove(pageID)
-            stats.flushCount += 1
+            state.withLock { s in
+                s.dirtyPages.remove(pageID)
+                s.stats.flushCount += 1
+            }
         }
     }
 
     // MARK: - Maintenance
 
     public func performMaintenance() async throws {
-        let dirtyPageCount = dirtyPages.count
-        if dirtyPageCount > capacity / 4 {
-            let sortedDirtyPages = dirtyPages.sorted { pageID1, pageID2 in
-                let order1 = accessOrder[pageID1] ?? 0
-                let order2 = accessOrder[pageID2] ?? 0
+        let pagesToFlush: [Int] = state.withLock { s in
+            let dirtyPageCount = s.dirtyPages.count
+            guard dirtyPageCount > s.pageCache.count / 4 || dirtyPageCount > capacity / 4 else { return [] }
+            let sorted = s.dirtyPages.sorted { pageID1, pageID2 in
+                let order1 = s.accessOrder[pageID1] ?? 0
+                let order2 = s.accessOrder[pageID2] ?? 0
                 return order1 < order2
             }
-            let pagesToFlush = sortedDirtyPages.prefix(max(1, dirtyPageCount / 4))
-            for pageID in pagesToFlush {
-                try await flushPage(pageID: pageID)
-            }
+            return Array(sorted.prefix(max(1, dirtyPageCount / 4)))
         }
 
-        if pageCache.count > Int(Double(capacity) * 0.9) {
-            let targetCount = Int(Double(capacity) * 0.8)
-            let evictionCount = pageCache.count - targetCount
-            if evictionCount > 0 {
-                let cleanPages = accessOrder
-                    .filter { !dirtyPages.contains($0.key) }
-                    .sorted { $0.value < $1.value }
-                    .prefix(evictionCount)
-                for (pageID, _) in cleanPages {
-                    pageCache.removeValue(forKey: pageID)
-                    accessOrder.removeValue(forKey: pageID)
-                    stats.evictionCount += 1
+        for pageID in pagesToFlush {
+            try await flushPage(pageID: pageID)
+        }
+
+        // Evict clean pages if cache is >90% full
+        state.withLock { s in
+            if s.pageCache.count > Int(Double(capacity) * 0.9) {
+                let targetCount = Int(Double(capacity) * 0.8)
+                let evictionCount = s.pageCache.count - targetCount
+                if evictionCount > 0 {
+                    let cleanPages = s.accessOrder
+                        .filter { !s.dirtyPages.contains($0.key) }
+                        .sorted { $0.value < $1.value }
+                        .prefix(evictionCount)
+                    for (pageID, _) in cleanPages {
+                        s.pageCache.removeValue(forKey: pageID)
+                        s.accessOrder.removeValue(forKey: pageID)
+                        s.stats.evictionCount += 1
+                    }
                 }
             }
         }
     }
 
     public func cachePage(_ page: DatabasePage) async {
-        pageCache[page.pageID] = page
-        touchAccess(pageID: page.pageID)
-        if pageCache.count > capacity {
+        let needsEviction = state.withLock { s in
+            s.pageCache[page.pageID] = page
+            s.accessOrder[page.pageID] = s.nextAccessCounter
+            s.nextAccessCounter += 1
+            return s.pageCache.count > capacity
+        }
+        if needsEviction {
             try? await evictPages(count: 1)
         }
     }
@@ -175,15 +226,15 @@ public actor BufferPoolManager: Sendable {
     // MARK: - Statistics
 
     public func getStats() -> BufferPoolStats {
-        stats
+        state.withLock { $0.stats }
     }
 
     public func resetStats() {
-        stats = BufferPoolStats()
+        state.withLock { $0.stats = BufferPoolStats() }
     }
 
     public func getCacheOccupancy() -> Double {
-        Double(pageCache.count) / Double(capacity)
+        state.withLock { Double($0.pageCache.count) / Double(capacity) }
     }
 }
 

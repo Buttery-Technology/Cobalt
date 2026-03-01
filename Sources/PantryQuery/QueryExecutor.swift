@@ -16,18 +16,10 @@ public enum AggregateFunction: Sendable {
 public actor QueryExecutor: Sendable {
     private let storageEngine: StorageEngine
     private let indexManager: IndexManager
-    private let encoder: JSONEncoder
-    private let decoder: JSONDecoder
 
     public init(storageEngine: StorageEngine, indexManager: IndexManager) {
         self.storageEngine = storageEngine
         self.indexManager = indexManager
-        let enc = JSONEncoder()
-        enc.nonConformingFloatEncodingStrategy = .convertToString(positiveInfinity: "+inf", negativeInfinity: "-inf", nan: "nan")
-        self.encoder = enc
-        let dec = JSONDecoder()
-        dec.nonConformingFloatDecodingStrategy = .convertFromString(positiveInfinity: "+inf", negativeInfinity: "-inf", nan: "nan")
-        self.decoder = dec
     }
 
     // MARK: - SELECT
@@ -40,11 +32,54 @@ public actor QueryExecutor: Sendable {
            let indexed = try await indexManager.attemptIndexLookup(tableName: table, condition: condition) {
             // Index returned results; apply remaining in-memory filtering and strip __rid
             rows = indexed.filter { evaluateCondition(condition, row: $0) }.map { stripRID($0) }
+        } else if let condition = condition {
+            // Full table scan with parallel page decoding + lazy deserialization
+            let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
+            let neededColumns = columnsReferenced(in: condition)
+            let useLazy = neededColumns.count <= 3
+
+            rows = try await withThrowingTaskGroup(of: (Int, [Row]).self) { group in
+                for (index, pageID) in pageIDs.enumerated() {
+                    group.addTask { [storageEngine] in
+                        let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+                        var pageRows: [Row] = []
+                        for record in page.records {
+                            if useLazy, let result = self.evaluateConditionLazy(condition, data: record.data) {
+                                if result, let row = Row.fromBytes(record.data) {
+                                    pageRows.append(row)
+                                }
+                            } else if let row = Row.fromBytes(record.data), self.evaluateCondition(condition, row: row) {
+                                pageRows.append(row)
+                            }
+                        }
+                        return (index, pageRows)
+                    }
+                }
+                // Collect results maintaining page order
+                var indexed: [(Int, [Row])] = []
+                for try await result in group {
+                    indexed.append(result)
+                }
+                return indexed.sorted { $0.0 < $1.0 }.flatMap { $0.1 }
+            }
         } else {
-            // Full table scan
-            let scanned = try await storageEngine.scanTable(table, transactionContext: transactionContext)
-            let allRows = scanned.map { $0.1 }
-            rows = condition != nil ? allRows.filter { evaluateCondition(condition!, row: $0) } : allRows
+            // No condition — parallel decode all rows
+            let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
+
+            rows = try await withThrowingTaskGroup(of: (Int, [Row]).self) { group in
+                for (index, pageID) in pageIDs.enumerated() {
+                    group.addTask { [storageEngine] in
+                        let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+                        let pageRows = page.records.compactMap { Row.fromBytes($0.data) }
+                        return (index, pageRows)
+                    }
+                }
+                var indexed: [(Int, [Row])] = []
+                for try await result in group {
+                    indexed.append(result)
+                }
+                return indexed.sorted { $0.0 < $1.0 }.flatMap { $0.1 }
+            }
         }
 
         // Project only requested columns
@@ -63,7 +98,7 @@ public actor QueryExecutor: Sendable {
     // MARK: - INSERT
 
     public func executeInsert(into table: String, row: Row, transactionContext: TransactionContext? = nil) async throws {
-        let rowData = try encoder.encode(row)
+        let rowData = row.toBytes()
         let recordID = generateRecordID()
         let record = Record(id: recordID, data: rowData)
         try await storageEngine.insertRecord(record, tableName: table, row: row, transactionContext: transactionContext)
@@ -85,7 +120,7 @@ public actor QueryExecutor: Sendable {
                 for (key, value) in values { updatedValues[key] = value }
                 let updatedRow = Row(values: updatedValues)
 
-                let rowData = try encoder.encode(updatedRow)
+                let rowData = updatedRow.toBytes()
                 let newRecord = Record(id: recordId, data: rowData)
                 try await storageEngine.deleteRecord(id: recordId, tableName: table, transactionContext: transactionContext)
                 try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
@@ -94,11 +129,12 @@ public actor QueryExecutor: Sendable {
             return updatedCount
         }
 
-        // Fallback: full table scan
-        let scanned = try await storageEngine.scanTable(table, transactionContext: transactionContext)
+        // Fallback: full table scan with raw records
+        let rawRecords = try await storageEngine.scanTableRaw(table, transactionContext: transactionContext)
         var updatedCount = 0
 
-        for (record, row) in scanned {
+        for (record, data) in rawRecords {
+            guard let row = Row.fromBytes(data) else { continue }
             if condition == nil || evaluateCondition(condition!, row: row) {
                 var updatedValues = row.values
                 for (key, value) in values {
@@ -106,7 +142,7 @@ public actor QueryExecutor: Sendable {
                 }
                 let updatedRow = Row(values: updatedValues)
 
-                let rowData = try encoder.encode(updatedRow)
+                let rowData = updatedRow.toBytes()
                 let newRecord = Record(id: record.id, data: rowData)
                 try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
                 try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
@@ -133,12 +169,15 @@ public actor QueryExecutor: Sendable {
             return deletedCount
         }
 
-        // Fallback: full table scan
-        let scanned = try await storageEngine.scanTable(table, transactionContext: transactionContext)
+        // Fallback: full table scan with raw records
+        let rawRecords = try await storageEngine.scanTableRaw(table, transactionContext: transactionContext)
         var deletedCount = 0
 
-        for (record, row) in scanned {
-            if condition == nil || evaluateCondition(condition!, row: row) {
+        for (record, data) in rawRecords {
+            if condition == nil {
+                try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
+                deletedCount += 1
+            } else if let row = Row.fromBytes(data), evaluateCondition(condition!, row: row) {
                 try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
                 deletedCount += 1
             }
@@ -229,7 +268,7 @@ public actor QueryExecutor: Sendable {
 
     // MARK: - Condition Evaluation
 
-    private func evaluateCondition(_ condition: WhereCondition, row: Row) -> Bool {
+    private nonisolated func evaluateCondition(_ condition: WhereCondition, row: Row) -> Bool {
         switch condition {
         case let .equals(column, value):
             // SQL: NULL = anything is false; use isNull for NULL checks
@@ -273,10 +312,79 @@ public actor QueryExecutor: Sendable {
         }
     }
 
+    // MARK: - Lazy Evaluation Helpers
+
+    /// Extract all column names referenced in a WHERE condition.
+    private nonisolated func columnsReferenced(in condition: WhereCondition) -> Set<String> {
+        switch condition {
+        case .equals(let col, _), .notEquals(let col, _),
+             .lessThan(let col, _), .greaterThan(let col, _),
+             .lessThanOrEqual(let col, _), .greaterThanOrEqual(let col, _):
+            return [col]
+        case .in(let col, _), .between(let col, _, _), .like(let col, _):
+            return [col]
+        case .isNull(let col), .isNotNull(let col):
+            return [col]
+        case .and(let subs):
+            return subs.reduce(into: Set<String>()) { $0.formUnion(columnsReferenced(in: $1)) }
+        case .or(let subs):
+            return subs.reduce(into: Set<String>()) { $0.formUnion(columnsReferenced(in: $1)) }
+        }
+    }
+
+    /// Evaluate a WHERE condition against raw binary data using partial column extraction.
+    /// Returns nil if the condition type is too complex for lazy eval.
+    private nonisolated func evaluateConditionLazy(_ condition: WhereCondition, data: Data) -> Bool? {
+        switch condition {
+        case .equals(let col, let value):
+            if value == .null { return false }
+            guard let rowValue = Row.columnValue(named: col, from: data) else { return false }
+            if rowValue == .null { return false }
+            return rowValue == value
+        case .notEquals(let col, let value):
+            if value == .null { return false }
+            guard let rowValue = Row.columnValue(named: col, from: data) else { return false }
+            if rowValue == .null { return false }
+            return rowValue != value
+        case .lessThan(let col, let value):
+            guard let rowValue = Row.columnValue(named: col, from: data), rowValue != .null, value != .null else { return false }
+            return rowValue < value
+        case .greaterThan(let col, let value):
+            guard let rowValue = Row.columnValue(named: col, from: data), rowValue != .null, value != .null else { return false }
+            return rowValue > value
+        case .lessThanOrEqual(let col, let value):
+            guard let rowValue = Row.columnValue(named: col, from: data), rowValue != .null, value != .null else { return false }
+            return rowValue <= value
+        case .greaterThanOrEqual(let col, let value):
+            guard let rowValue = Row.columnValue(named: col, from: data), rowValue != .null, value != .null else { return false }
+            return rowValue >= value
+        case .isNull(let col):
+            let val = Row.columnValue(named: col, from: data)
+            return val == nil || val == .null
+        case .isNotNull(let col):
+            guard let val = Row.columnValue(named: col, from: data) else { return false }
+            return val != .null
+        case .and(let subs):
+            for sub in subs {
+                guard let result = evaluateConditionLazy(sub, data: data) else { return nil }
+                if !result { return false }
+            }
+            return true
+        case .or(let subs):
+            for sub in subs {
+                guard let result = evaluateConditionLazy(sub, data: data) else { return nil }
+                if result { return true }
+            }
+            return false
+        default:
+            return nil // Fall back to full decode
+        }
+    }
+
     // MARK: - Helpers
 
     /// Strip the internal __rid field from index-returned rows before returning to users
-    private func stripRID(_ row: Row) -> Row {
+    private nonisolated func stripRID(_ row: Row) -> Row {
         guard row.values["__rid"] != nil else { return row }
         var values = row.values
         values.removeValue(forKey: "__rid")
@@ -292,7 +400,7 @@ public actor QueryExecutor: Sendable {
     }
 
     /// SQL LIKE pattern matching: % matches any sequence, _ matches any single character
-    private func matchLikePattern(_ string: String, pattern: String) -> Bool {
+    private nonisolated func matchLikePattern(_ string: String, pattern: String) -> Bool {
         let s = Array(string)
         let p = Array(pattern)
         var si = 0, pi = 0
