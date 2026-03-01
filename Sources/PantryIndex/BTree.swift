@@ -92,10 +92,11 @@ public actor BTree: Sendable {
     /// Collect rows in ascending order with early exit once limit is reached
     private func collectRangeLimited(node: BTreeNode, startKey: DBValue?, endKey: DBValue?, results: inout [Row], limit: Int) async throws {
         guard results.count < limit else { return }
-        var i = 0
-
+        var i: Int
         if let start = startKey {
-            while i < node.keys.count && node.keys[i] < start { i += 1 }
+            i = lowerBound(node.keys, start)
+        } else {
+            i = 0
         }
 
         if node.isLeaf {
@@ -144,13 +145,32 @@ public actor BTree: Sendable {
         }
     }
 
+    // MARK: - Binary Search Helpers
+
+    /// Binary search for the first index where keys[index] >= key (lower bound)
+    private nonisolated func lowerBound(_ keys: [DBValue], _ key: DBValue) -> Int {
+        var lo = 0, hi = keys.count
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2
+            if keys[mid] < key { lo = mid + 1 } else { hi = mid }
+        }
+        return lo
+    }
+
+    /// Binary search for the first index where keys[index] > key (upper bound)
+    private nonisolated func upperBound(_ keys: [DBValue], _ key: DBValue) -> Int {
+        var lo = 0, hi = keys.count
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2
+            if keys[mid] <= key { lo = mid + 1 } else { hi = mid }
+        }
+        return lo
+    }
+
     // MARK: - Search Helpers
 
     private func searchNode(node: BTreeNode, key: DBValue) async throws -> [Row] {
-        var i = 0
-        while i < node.keys.count && key > node.keys[i] {
-            i += 1
-        }
+        var i = lowerBound(node.keys, key)
 
         if node.isLeaf {
             // Collect all matching keys at this leaf
@@ -186,12 +206,11 @@ public actor BTree: Sendable {
     }
 
     private func collectRange(node: BTreeNode, startKey: DBValue?, endKey: DBValue?, results: inout [Row]) async throws {
-        var i = 0
-
+        var i: Int
         if let start = startKey {
-            while i < node.keys.count && node.keys[i] < start {
-                i += 1
-            }
+            i = lowerBound(node.keys, start)
+        } else {
+            i = 0
         }
 
         if node.isLeaf {
@@ -226,26 +245,15 @@ public actor BTree: Sendable {
     // MARK: - Insert Helpers
 
     private func insertNonFull(node: BTreeNode, key: DBValue, row: Row) async throws {
-        var i = node.keys.count - 1
-
         if node.isLeaf {
-            node.keys.append(key)
-            node.values.append(row)
-
-            while i >= 0 && node.keys[i] > key {
-                node.keys[i + 1] = node.keys[i]
-                node.values[i + 1] = node.values[i]
-                i -= 1
-            }
-            node.keys[i + 1] = key
-            node.values[i + 1] = row
-
+            // Binary search for insertion point
+            let insertAt = lowerBound(node.keys, key)
+            node.keys.insert(key, at: insertAt)
+            node.values.insert(row, at: insertAt)
             try await nodeStore.saveNode(node)
         } else {
-            while i >= 0 && node.keys[i] > key {
-                i -= 1
-            }
-            i += 1
+            // upperBound: first index where keys[i] > key — gives correct child index
+            var i = upperBound(node.keys, key)
 
             guard let childId = node.children?[i],
                   let child = try await nodeStore.loadNode(nodeId: childId) else {
@@ -541,10 +549,6 @@ public actor BTree: Sendable {
     }
 
     private func findKeyIndex(node: BTreeNode, key: DBValue) -> Int {
-        var index = 0
-        while index < node.keys.count && node.keys[index] < key {
-            index += 1
-        }
-        return index
+        lowerBound(node.keys, key)
     }
 }

@@ -13,6 +13,10 @@ public actor ColumnIndex: Sendable {
     public let partialCondition: WhereCondition?
     public let btree: BTree
     private var bloomFilter: BloomFilter
+    /// Hash-based key existence set for O(1) definitive negative lookups (supplements bloom filter)
+    private var keyHashSet: Set<Int> = []
+    /// Maximum size for hash set before it stops growing (memory bound)
+    private static let maxHashSetSize = 100_000
     public let nodeStore: PageBackedNodeStore
 
     public init(tableName: String, columnName: String, compoundColumns: [String]? = nil, includeColumns: [String]? = nil, partialCondition: WhereCondition? = nil, btree: BTree, nodeStore: PageBackedNodeStore, expectedElements: Int = 10000) {
@@ -46,13 +50,20 @@ public actor ColumnIndex: Sendable {
     /// Insert a key-row pair into this index
     public func insert(key: DBValue, row: Row) async throws {
         bloomFilter.add(key.indexKey)
+        if keyHashSet.count < Self.maxHashSetSize {
+            keyHashSet.insert(key.indexKey.hashValue)
+        }
         try await btree.insert(key: key, row: row)
     }
 
-    /// Search for rows matching a key, using bloom filter for fast negatives
+    /// Search for rows matching a key, using hash set + bloom filter for fast negatives
     public func search(key: DBValue) async throws -> [Row]? {
+        // Hash set check first (O(1), no false positives within hash collision bounds)
+        if keyHashSet.count < Self.maxHashSetSize && !keyHashSet.contains(key.indexKey.hashValue) {
+            return []
+        }
         if !bloomFilter.contains(key.indexKey) {
-            return [] // Definitive miss
+            return [] // Definitive miss from bloom filter
         }
         return try await btree.search(key: key)
     }
@@ -72,9 +83,12 @@ public actor ColumnIndex: Sendable {
         try await btree.delete(key: key, row: row)
     }
 
-    /// Add a value to the bloom filter only (used during index rebuild on load)
+    /// Add a value to the bloom filter and hash set (used during index rebuild on load)
     public func addToBloomFilter(_ value: DBValue) {
         bloomFilter.add(value.indexKey)
+        if keyHashSet.count < Self.maxHashSetSize {
+            keyHashSet.insert(value.indexKey.hashValue)
+        }
     }
 }
 

@@ -418,16 +418,17 @@ public actor WriteAheadLog: Sendable {
 
         let crc = CRC32.checksum(payload)
 
-        var headerData = Data()
+        // Single write: combine header (8B) + payload into one buffer to reduce syscalls
         let totalLength = UInt32(payload.count + 8)
-        withUnsafeBytes(of: totalLength) { headerData.append(contentsOf: $0) }
-        withUnsafeBytes(of: crc) { headerData.append(contentsOf: $0) }
+        var buf = Data(capacity: 8 + payload.count)
+        withUnsafeBytes(of: totalLength) { buf.append(contentsOf: $0) }
+        withUnsafeBytes(of: crc) { buf.append(contentsOf: $0) }
+        buf.append(payload)
 
         try fh.seek(toOffset: currentLogPosition)
-        try fh.write(contentsOf: headerData)
-        try fh.write(contentsOf: payload)
+        try fh.write(contentsOf: buf)
 
-        currentLogPosition += UInt64(headerData.count + payload.count)
+        currentLogPosition += UInt64(buf.count)
     }
 
     /// Parse the actual log file to retrieve all log records
