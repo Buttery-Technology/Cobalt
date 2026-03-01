@@ -94,6 +94,28 @@ public actor QueryExecutor: Sendable {
         // Use cost-based planner to choose access strategy
         let plan = planner.chooseAccessPlan(table: table, condition: condition, pageCount: pageIDs.count, requestedColumns: columns, indexCoverage: indexCoverage)
 
+        // Compute scan limit: push LIMIT down when no ORDER BY or DISTINCT requires full materialization
+        let scanLimit: Int?
+        if let mods = modifiers, let limit = mods.limit, limit >= 0,
+           (mods.orderBy == nil || mods.orderBy!.isEmpty), !mods.distinct {
+            scanLimit = limit + (mods.offset ?? 0)
+        } else {
+            scanLimit = nil
+        }
+
+        // Compute needed columns for lazy overflow loading:
+        // Union of requested columns + columns referenced in WHERE condition
+        let overflowNeededColumns: Set<String>? = {
+            var needed = Set<String>()
+            if let cols = columns { needed.formUnion(cols) }
+            if let cond = condition { needed.formUnion(columnsReferenced(in: cond)) }
+            // Also include ORDER BY and DISTINCT columns
+            if let mods = modifiers {
+                if let orderBy = mods.orderBy { needed.formUnion(orderBy.map { $0.column }) }
+            }
+            return needed.isEmpty ? nil : needed
+        }()
+
         switch plan {
         case .indexOnlyScan:
             if let condition = condition,
@@ -103,8 +125,9 @@ public actor QueryExecutor: Sendable {
                     vals.removeValue(forKey: "__rid")
                     return Row(values: vals)
                 }
+                if let scanLimit = scanLimit { rows = Array(rows.prefix(scanLimit)) }
             } else {
-                rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, transactionContext: transactionContext)
+                rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, transactionContext: transactionContext)
             }
 
         case .indexScan:
@@ -114,16 +137,17 @@ public actor QueryExecutor: Sendable {
                     guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
                     return UInt64(bitPattern: ridSigned)
                 })
-                let fullRecords = try await storageEngine.getRecordsByIDs(matchingRIDs, tableName: table, transactionContext: transactionContext)
+                let fullRecords = try await storageEngine.getRecordsByIDs(matchingRIDs, tableName: table, transactionContext: transactionContext, neededColumns: overflowNeededColumns)
                 rows = fullRecords
                     .map { $0.1 }
                     .filter { evaluateCondition(condition, row: $0) }
+                if let scanLimit = scanLimit { rows = Array(rows.prefix(scanLimit)) }
             } else {
-                rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, transactionContext: transactionContext)
+                rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, transactionContext: transactionContext)
             }
 
         case .tableScan:
-            rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, transactionContext: transactionContext)
+            rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, transactionContext: transactionContext)
         }
 
         // Apply query modifiers: DISTINCT, ORDER BY, OFFSET, LIMIT
@@ -1049,17 +1073,61 @@ public actor QueryExecutor: Sendable {
 
     // MARK: - Parallel Table Scan
 
-    private func parallelTableScan(pageIDs: [Int], condition: WhereCondition?, transactionContext: TransactionContext?) async throws -> [Row] {
+    private func parallelTableScan(pageIDs: [Int], condition: WhereCondition?, limit: Int? = nil, neededColumns: Set<String>? = nil, transactionContext: TransactionContext?) async throws -> [Row] {
         if let condition = condition {
-            let neededColumns = columnsReferenced(in: condition)
-            let useLazy = neededColumns.count <= 3
+            let conditionColumns = columnsReferenced(in: condition)
+            let useLazy = conditionColumns.count <= 3
+
+            // Sequential early-exit path when limit is set (avoids over-scanning)
+            if let limit = limit {
+                var rows: [Row] = []
+                rows.reserveCapacity(limit)
+                for pageID in pageIDs {
+                    let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+                    for var record in page.records {
+                        // Lazy overflow: try partial decode from inline data
+                        if record.isOverflow {
+                            if let needed = neededColumns,
+                               let partialRow = Row.fromBytesPartial(record.data, neededColumns: needed) {
+                                if evaluateCondition(condition, row: partialRow) {
+                                    rows.append(partialRow)
+                                    if rows.count >= limit { return rows }
+                                }
+                                continue
+                            }
+                            record = try await storageEngine.reassembleOverflowRecord(record)
+                        }
+                        if useLazy, let result = evaluateConditionLazy(condition, data: record.data) {
+                            if result, let row = Row.fromBytes(record.data) {
+                                rows.append(row)
+                                if rows.count >= limit { return rows }
+                            }
+                        } else if let row = Row.fromBytes(record.data), evaluateCondition(condition, row: row) {
+                            rows.append(row)
+                            if rows.count >= limit { return rows }
+                        }
+                    }
+                }
+                return rows
+            }
 
             return try await withThrowingTaskGroup(of: (Int, [Row]).self) { group in
                 for (index, pageID) in pageIDs.enumerated() {
                     group.addTask { [storageEngine] in
                         let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
                         var pageRows: [Row] = []
-                        for record in page.records {
+                        for var record in page.records {
+                            // Lazy overflow: try partial decode from inline data
+                            if record.isOverflow {
+                                if let needed = neededColumns,
+                                   let partialRow = Row.fromBytesPartial(record.data, neededColumns: needed) {
+                                    if self.evaluateCondition(condition, row: partialRow) {
+                                        pageRows.append(partialRow)
+                                    }
+                                    continue
+                                }
+                                record = try await storageEngine.reassembleOverflowRecord(record)
+                            }
                             if useLazy, let result = self.evaluateConditionLazy(condition, data: record.data) {
                                 if result, let row = Row.fromBytes(record.data) {
                                     pageRows.append(row)
@@ -1076,11 +1144,50 @@ public actor QueryExecutor: Sendable {
                 return indexed.sorted { $0.0 < $1.0 }.flatMap { $0.1 }
             }
         } else {
+            // Sequential early-exit path when limit is set
+            if let limit = limit {
+                var rows: [Row] = []
+                rows.reserveCapacity(limit)
+                for pageID in pageIDs {
+                    let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+                    for var record in page.records {
+                        if record.isOverflow {
+                            if let needed = neededColumns,
+                               let partialRow = Row.fromBytesPartial(record.data, neededColumns: needed) {
+                                rows.append(partialRow)
+                                if rows.count >= limit { return rows }
+                                continue
+                            }
+                            record = try await storageEngine.reassembleOverflowRecord(record)
+                        }
+                        if let row = Row.fromBytes(record.data) {
+                            rows.append(row)
+                            if rows.count >= limit { return rows }
+                        }
+                    }
+                }
+                return rows
+            }
+
             return try await withThrowingTaskGroup(of: (Int, [Row]).self) { group in
                 for (index, pageID) in pageIDs.enumerated() {
                     group.addTask { [storageEngine] in
                         let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
-                        return (index, page.records.compactMap { Row.fromBytes($0.data) })
+                        var pageRows: [Row] = []
+                        for var record in page.records {
+                            if record.isOverflow {
+                                if let needed = neededColumns,
+                                   let partialRow = Row.fromBytesPartial(record.data, neededColumns: needed) {
+                                    pageRows.append(partialRow)
+                                    continue
+                                }
+                                record = try await storageEngine.reassembleOverflowRecord(record)
+                            }
+                            if let row = Row.fromBytes(record.data) {
+                                pageRows.append(row)
+                            }
+                        }
+                        return (index, pageRows)
                     }
                 }
                 var indexed: [(Int, [Row])] = []

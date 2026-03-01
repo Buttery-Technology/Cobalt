@@ -24,13 +24,30 @@ enum JoinSide: Sendable {
     case left, right
 }
 
+/// Cost model weights — configurable for different storage media (SSD vs HDD)
+struct CostModelWeights: Sendable, Equatable {
+    /// I/O page read weight (higher = prefer index scans). Default 10 for HDD, use 2–3 for SSD.
+    let ioWeight: Double
+    /// CPU row processing weight
+    let cpuWeight: Double
+
+    static let `default` = CostModelWeights(ioWeight: 10.0, cpuWeight: 0.01)
+    static let ssd = CostModelWeights(ioWeight: 2.0, cpuWeight: 0.01)
+}
+
 /// Cost estimate in abstract I/O units (1 unit ≈ 1 page read)
 struct QueryCost: Comparable, Sendable {
     let ioPages: Double  // estimated page reads
     let cpuRows: Double  // estimated rows processed in memory
+    let weights: CostModelWeights
 
-    /// Combined cost: I/O dominates (10x weight vs CPU)
-    var total: Double { ioPages * 10.0 + cpuRows * 0.01 }
+    init(ioPages: Double, cpuRows: Double, weights: CostModelWeights = .default) {
+        self.ioPages = ioPages
+        self.cpuRows = cpuRows
+        self.weights = weights
+    }
+
+    var total: Double { ioPages * weights.ioWeight + cpuRows * weights.cpuWeight }
 
     static func < (lhs: QueryCost, rhs: QueryCost) -> Bool {
         lhs.total < rhs.total
@@ -45,10 +62,11 @@ private struct PlanCacheKey: Hashable, Sendable {
     let requestedColumns: [String]?
 }
 
-/// Cached plan with a generation counter for invalidation
+/// Cached plan with a generation counter for invalidation and LRU tracking
 private struct CachedPlan: Sendable {
     let plan: AccessPlan
     let generation: UInt64
+    var lastAccess: UInt64  // monotonic counter for LRU eviction
 }
 
 /// Estimates query costs and selects optimal execution plans
@@ -61,15 +79,21 @@ struct QueryPlanner: Sendable {
     private let planCache: PantryLock<[PlanCacheKey: CachedPlan]>
     /// Generation counter: incremented on index/schema changes to invalidate cache
     private let cacheGeneration: PantryLock<UInt64>
+    /// Monotonic access counter for LRU eviction
+    private let accessCounter: PantryLock<UInt64>
     /// Maximum cache entries
     private let maxCacheSize = 256
+    /// Cost model weights (configurable for SSD vs HDD)
+    let costWeights: CostModelWeights
 
-    init(storageEngine: StorageEngine, indexManager: IndexManager, registry: TableRegistry) {
+    init(storageEngine: StorageEngine, indexManager: IndexManager, registry: TableRegistry, costWeights: CostModelWeights = .default) {
         self.storageEngine = storageEngine
         self.indexManager = indexManager
         self.registry = registry
         self.planCache = PantryLock([:])
         self.cacheGeneration = PantryLock(0)
+        self.accessCounter = PantryLock(0)
+        self.costWeights = costWeights
     }
 
     /// Invalidate the plan cache (call after index create/drop or schema change)
@@ -91,7 +115,12 @@ struct QueryPlanner: Sendable {
         // Check plan cache
         let gen = cacheGeneration.withLock { $0 }
         let cacheKey = PlanCacheKey(table: table, conditionSignature: conditionSignature(condition), pageCount: pageCount, requestedColumns: requestedColumns)
-        if let cached = planCache.withLock({ $0[cacheKey] }), cached.generation == gen {
+        if let cached = planCache.withLock({ cache -> CachedPlan? in
+            guard var entry = cache[cacheKey], entry.generation == gen else { return nil }
+            entry.lastAccess = self.accessCounter.withLock { $0 += 1; return $0 }
+            cache[cacheKey] = entry
+            return entry
+        }) {
             return cached.plan
         }
 
@@ -127,7 +156,7 @@ struct QueryPlanner: Sendable {
             if isCovering {
                 // Index-only scan: no heap pages needed
                 let treeDepth = max(1.0, log(Double(max(1, totalRows))) / log(64.0))
-                indexCost = QueryCost(ioPages: treeDepth, cpuRows: Double(estimatedRows))
+                indexCost = QueryCost(ioPages: treeDepth, cpuRows: Double(estimatedRows), weights: costWeights)
             } else {
                 indexCost = costOfIndexScan(
                     estimatedRows: estimatedRows,
@@ -146,13 +175,18 @@ struct QueryPlanner: Sendable {
             }
         }
 
-        // Store in cache
+        // Store in cache with LRU eviction
+        let ac = accessCounter.withLock { $0 += 1; return $0 }
         planCache.withLock { cache in
             if cache.count >= maxCacheSize {
-                // Evict oldest entries (simple clear strategy)
-                cache.removeAll()
+                // LRU eviction: remove the least recently accessed quarter
+                let evictCount = maxCacheSize / 4
+                let sorted = cache.sorted { $0.value.lastAccess < $1.value.lastAccess }
+                for entry in sorted.prefix(evictCount) {
+                    cache.removeValue(forKey: entry.key)
+                }
             }
-            cache[cacheKey] = CachedPlan(plan: bestPlan, generation: gen)
+            cache[cacheKey] = CachedPlan(plan: bestPlan, generation: gen, lastAccess: ac)
         }
 
         return bestPlan
@@ -231,7 +265,7 @@ struct QueryPlanner: Sendable {
     // MARK: - Cost Estimation
 
     private nonisolated func costOfTableScan(pageCount: Int, totalRows: Int) -> QueryCost {
-        QueryCost(ioPages: Double(pageCount), cpuRows: Double(totalRows))
+        QueryCost(ioPages: Double(pageCount), cpuRows: Double(totalRows), weights: costWeights)
     }
 
     private nonisolated func costOfIndexScan(estimatedRows: Int, totalRows: Int, pageCount: Int) -> QueryCost {
@@ -239,7 +273,7 @@ struct QueryPlanner: Sendable {
         let treeDepth = max(1.0, log(Double(max(1, totalRows))) / log(64.0))
         // Plus one page read per matching record (random I/O)
         let heapPages = Double(estimatedRows) * Double(pageCount) / Double(max(1, totalRows))
-        return QueryCost(ioPages: treeDepth + heapPages, cpuRows: Double(estimatedRows))
+        return QueryCost(ioPages: treeDepth + heapPages, cpuRows: Double(estimatedRows), weights: costWeights)
     }
 
     private nonisolated func estimateMatchingRows(totalRows: Int, stats: ColumnStats, predicateType: PredicateType) -> Int {

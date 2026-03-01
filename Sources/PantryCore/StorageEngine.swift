@@ -370,8 +370,10 @@ public actor StorageEngine: Sendable {
         tableRegistry.updateTableInfo(freshInfo)
     }
 
-    /// Scan all records in a table with sequential readahead
-    public func scanTable(_ tableName: String, transactionContext: TransactionContext? = nil) async throws -> [(Record, Row)] {
+    /// Scan all records in a table with sequential readahead.
+    /// Pass `neededColumns` to enable lazy overflow loading: if an overflow record's inline data
+    /// contains all needed columns, the overflow pages are skipped entirely.
+    public func scanTable(_ tableName: String, transactionContext: TransactionContext? = nil, neededColumns: Set<String>? = nil) async throws -> [(Record, Row)] {
         guard let tableInfo = tableRegistry.getTableInfo(name: tableName) else {
             throw PantryError.tableNotFound(name: tableName)
         }
@@ -397,6 +399,12 @@ public actor StorageEngine: Sendable {
 
             for var record in page.records {
                 if record.isOverflow {
+                    // Lazy overflow: try decoding needed columns from inline data first
+                    if let needed = neededColumns,
+                       let partialRow = Row.fromBytesPartial(record.data, neededColumns: needed) {
+                        results.append((record, partialRow))
+                        continue
+                    }
                     record = try await reassembleOverflowRecord(record)
                 }
                 if let row = Row.fromBytes(record.data) {
@@ -450,7 +458,8 @@ public actor StorageEngine: Sendable {
 
     /// Batch lookup: fetch full (Record, Row) pairs for a set of record IDs in a single table scan.
     /// Much more efficient than N individual getRecord calls.
-    public func getRecordsByIDs(_ ids: Set<UInt64>, tableName: String, transactionContext: TransactionContext? = nil) async throws -> [(Record, Row)] {
+    /// Pass `neededColumns` to enable lazy overflow loading.
+    public func getRecordsByIDs(_ ids: Set<UInt64>, tableName: String, transactionContext: TransactionContext? = nil, neededColumns: Set<String>? = nil) async throws -> [(Record, Row)] {
         guard let tableInfo = tableRegistry.getTableInfo(name: tableName) else {
             throw PantryError.tableNotFound(name: tableName)
         }
@@ -468,6 +477,12 @@ public actor StorageEngine: Sendable {
             for var record in page.records {
                 guard remaining.contains(record.id) else { continue }
                 if record.isOverflow {
+                    if let needed = neededColumns,
+                       let partialRow = Row.fromBytesPartial(record.data, neededColumns: needed) {
+                        results.append((record, partialRow))
+                        remaining.remove(record.id)
+                        continue
+                    }
                     record = try await reassembleOverflowRecord(record)
                 }
                 if let row = Row.fromBytes(record.data) {
@@ -921,7 +936,7 @@ public actor StorageEngine: Sendable {
     }
 
     /// Follow the overflow page chain to reassemble a full record from its inline portion and overflow pages.
-    private func reassembleOverflowRecord(_ record: Record) async throws -> Record {
+    public func reassembleOverflowRecord(_ record: Record) async throws -> Record {
         guard let firstOverflowPageID = record.overflowPageID else {
             return record
         }

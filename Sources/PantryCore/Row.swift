@@ -61,13 +61,14 @@ extension Row {
     ///   value payload (tag-dependent)
     /// ```
     public func toBytes() -> Data {
-        var buf = Data()
+        // Pre-allocate: 2B col count + ~32B per column (2B nameLen + ~8B name + ~20B value)
+        var buf = Data(capacity: 2 + values.count * 32)
         let cols = values
         buf.appendUInt16(UInt16(cols.count))
         for (name, value) in cols {
-            let nameBytes = Array(name.utf8)
-            buf.appendUInt16(UInt16(nameBytes.count))
-            buf.append(contentsOf: nameBytes)
+            let nameUTF8 = name.utf8
+            buf.appendUInt16(UInt16(nameUTF8.count))
+            buf.append(contentsOf: nameUTF8)
             Row.encodeDBValue(value, into: &buf)
         }
         return buf
@@ -87,6 +88,33 @@ extension Row {
             offset = nameEnd
             guard let value = decodeDBValue(from: data, at: &offset) else { return nil }
             values[name] = value
+        }
+        return Row(values: values)
+    }
+
+    /// Decode as many complete columns as possible from potentially truncated binary data.
+    /// Returns a Row with whatever columns were fully decodable.
+    /// Used for overflow record lazy loading: decode columns from inline data without reading overflow pages.
+    /// Returns nil only if the data is so short that not even the column count can be read.
+    public static func fromBytesPartial(_ data: Data, neededColumns: Set<String>? = nil) -> Row? {
+        var offset = 0
+        guard let colCount = data.readUInt16(at: &offset) else { return nil }
+        var values = [String: DBValue]()
+        for _ in 0..<colCount {
+            let savedOffset = offset
+            guard let nameLen = data.readUInt16(at: &offset) else { break }
+            let nameEnd = offset + Int(nameLen)
+            guard nameEnd <= data.count else { offset = savedOffset; break }
+            guard let name = String(bytes: data[offset..<nameEnd], encoding: .utf8) else { break }
+            offset = nameEnd
+            let valueOffset = offset
+            guard let value = decodeDBValue(from: data, at: &offset) else { offset = valueOffset; break }
+            values[name] = value
+        }
+        guard !values.isEmpty else { return nil }
+        // Check if all needed columns were found in the inline portion
+        if let needed = neededColumns, !needed.isSubset(of: Set(values.keys)) {
+            return nil  // signal that overflow reassembly is required
         }
         return Row(values: values)
     }
