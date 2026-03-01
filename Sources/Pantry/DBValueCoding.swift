@@ -148,7 +148,7 @@ private struct _KeyedContainer<Key: CodingKey>: KeyedEncodingContainerProtocol {
     }
 
     mutating func encode(_ value: UInt, forKey key: Key) throws {
-        container.values[key.stringValue] = .integer(Int64(value))
+        container.values[key.stringValue] = .integer(Int64(bitPattern: UInt64(value)))
     }
 
     mutating func encode(_ value: UInt8, forKey key: Key) throws {
@@ -164,7 +164,7 @@ private struct _KeyedContainer<Key: CodingKey>: KeyedEncodingContainerProtocol {
     }
 
     mutating func encode(_ value: UInt64, forKey key: Key) throws {
-        container.values[key.stringValue] = .integer(Int64(value))
+        container.values[key.stringValue] = .integer(Int64(bitPattern: value))
     }
 
     mutating func encode<T: Encodable>(_ value: T, forKey key: Key) throws {
@@ -365,7 +365,9 @@ private struct _KeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerPr
     }
 
     func decode(_ type: UInt.Type, forKey key: Key) throws -> UInt {
-        try decodeInteger(type, forKey: key)
+        guard let value = values[key.stringValue] else { throw decodingError(type, key) }
+        if case .integer(let v) = value { return UInt(bitPattern: Int(v)) }
+        throw decodingError(type, key)
     }
 
     func decode(_ type: UInt8.Type, forKey key: Key) throws -> UInt8 {
@@ -381,7 +383,9 @@ private struct _KeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerPr
     }
 
     func decode(_ type: UInt64.Type, forKey key: Key) throws -> UInt64 {
-        try decodeInteger(type, forKey: key)
+        guard let value = values[key.stringValue] else { throw decodingError(type, key) }
+        if case .integer(let v) = value { return UInt64(bitPattern: v) }
+        throw decodingError(type, key)
     }
 
     func decode<T: Decodable>(_ type: T.Type, forKey key: Key) throws -> T {

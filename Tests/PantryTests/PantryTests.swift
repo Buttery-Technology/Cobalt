@@ -1394,7 +1394,7 @@ import Foundation
 
     // SUM
     let sumScores = try await db.aggregate(from: "scores", .sum(column: "score"))
-    #expect(sumScores == .double(240.0))
+    #expect(sumScores == .integer(240))
 
     // AVG
     let avgScores = try await db.aggregate(from: "scores", .avg(column: "score"))
@@ -1424,7 +1424,7 @@ import Foundation
     // Aggregate with WHERE
     let sumHigh = try await db.aggregate(from: "scores", .sum(column: "score"),
         where: .greaterThan(column: "score", value: .integer(75)))
-    #expect(sumHigh == .double(170.0)) // 80 + 90
+    #expect(sumHigh == .integer(170)) // 80 + 90
 
     // Aggregate on empty result set
     let sumNone = try await db.aggregate(from: "scores", .sum(column: "score"),
