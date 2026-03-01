@@ -649,3 +649,93 @@ struct Widget: PantryModel, Equatable {
 
     try await db.close()
 }
+
+// MARK: - Convenience Init Tests
+
+@Test func testConvenienceInit() async throws {
+    let db = try await PantryDatabase()
+
+    try await db.save(User(name: "Alice", age: 30))
+    let found = try await db.findAll(User.self)
+    #expect(found.count == 1)
+    #expect(found[0].name == "Alice")
+
+    try await db.close()
+}
+
+@Test func testNamedInit() async throws {
+    let name = "test_named_\(UUID().uuidString)"
+    let db = try await PantryDatabase(name: name)
+
+    try await db.save(User(name: "Bob", age: 25))
+    let found = try await db.findAll(User.self)
+    #expect(found.count == 1)
+    #expect(found[0].name == "Bob")
+
+    try await db.close()
+
+    // Clean up
+    let path = PantryConfiguration.databasePath(name: name)
+    try? FileManager.default.removeItem(atPath: path)
+}
+
+@Test func testEncryptedConvenienceInit() async throws {
+    let name = "test_encrypted_\(UUID().uuidString)"
+    let db = try await PantryDatabase(name: name, encrypted: true)
+
+    try await db.save(User(name: "Secret", age: 42))
+    let found = try await db.findAll(User.self)
+    #expect(found.count == 1)
+    #expect(found[0].name == "Secret")
+
+    // Verify .key file was created
+    let keyPath = PantryConfiguration.databasePath(name: name) + ".key"
+    #expect(FileManager.default.fileExists(atPath: keyPath))
+    let keyData = FileManager.default.contents(atPath: keyPath)
+    #expect(keyData?.count == 32)
+
+    try await db.close()
+
+    // Clean up
+    let dbPath = PantryConfiguration.databasePath(name: name)
+    try? FileManager.default.removeItem(atPath: dbPath)
+    try? FileManager.default.removeItem(atPath: keyPath)
+}
+
+@Test func testEncryptedReopenWithKeyFile() async throws {
+    let name = "test_reopen_\(UUID().uuidString)"
+
+    // Open, write, close
+    let db1 = try await PantryDatabase(name: name, encrypted: true)
+    let user = User(id: "u1", name: "Persist", age: 99)
+    try await db1.save(user)
+    try await db1.close()
+
+    // Reopen same name — should reuse key file
+    let db2 = try await PantryDatabase(name: name, encrypted: true)
+    let found = try await db2.find(User.self, id: "u1")
+    #expect(found != nil)
+    #expect(found?.name == "Persist")
+    #expect(found?.age == 99)
+    try await db2.close()
+
+    // Clean up
+    let dbPath = PantryConfiguration.databasePath(name: name)
+    try? FileManager.default.removeItem(atPath: dbPath)
+    try? FileManager.default.removeItem(atPath: dbPath + ".key")
+}
+
+@Test func testGenerateKey() async throws {
+    let key1 = PantryConfiguration.generateKey()
+    let key2 = PantryConfiguration.generateKey()
+
+    #expect(key1.count == 32)
+    #expect(key2.count == 32)
+    #expect(key1 != key2)
+}
+
+@Test func testDefaultDirectory() async throws {
+    let dir = PantryConfiguration.defaultDirectory()
+    #expect(!dir.isEmpty)
+    #expect(FileManager.default.fileExists(atPath: dir))
+}

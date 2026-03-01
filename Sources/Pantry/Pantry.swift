@@ -123,6 +123,21 @@ public actor PantryDatabase: Sendable {
     }
 }
 
+// MARK: - Convenience Initializer
+
+extension PantryDatabase {
+    /// Open a database with sensible defaults.
+    /// - Parameters:
+    ///   - name: Database name (default: "default"). Stored at `~/Library/Application Support/Pantry/<name>.pantry`.
+    ///   - encrypted: If true, enables AES-256-GCM encryption with an auto-managed key file at `<name>.pantry.key`.
+    public init(name: String = "default", encrypted: Bool = false) async throws {
+        let path = PantryConfiguration.databasePath(name: name)
+        let key: Data? = encrypted ? try PantryConfiguration.resolveEncryptionKey(for: path) : nil
+        let config = PantryConfiguration(path: path, encryptionKey: key)
+        try await self.init(configuration: config)
+    }
+}
+
 // Extension to wire index hook
 extension StorageEngine {
     public func setIndexHook(_ hook: any IndexHook) {
