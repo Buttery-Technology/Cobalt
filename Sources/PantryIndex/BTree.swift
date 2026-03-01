@@ -69,6 +69,57 @@ public actor BTree: Sendable {
         return results
     }
 
+    /// Range scan with early termination after collecting `limit` rows.
+    /// When `ascending` is false, results are collected in descending order.
+    public func searchRangeWithLimit(from startKey: DBValue?, to endKey: DBValue?, limit: Int, ascending: Bool = true) async throws -> [Row] {
+        guard let rootId = rootId,
+              let root = try await nodeStore.loadNode(nodeId: rootId) else {
+            return []
+        }
+        var results: [Row] = []
+        if ascending {
+            try await collectRangeLimited(node: root, startKey: startKey, endKey: endKey, results: &results, limit: limit)
+        } else {
+            // For descending, collect all in range then reverse + take limit
+            // (A proper reverse traversal would be more efficient for large datasets)
+            try await collectRange(node: root, startKey: startKey, endKey: endKey, results: &results)
+            results.reverse()
+            if results.count > limit { results = Array(results.prefix(limit)) }
+        }
+        return results
+    }
+
+    /// Collect rows in ascending order with early exit once limit is reached
+    private func collectRangeLimited(node: BTreeNode, startKey: DBValue?, endKey: DBValue?, results: inout [Row], limit: Int) async throws {
+        guard results.count < limit else { return }
+        var i = 0
+
+        if let start = startKey {
+            while i < node.keys.count && node.keys[i] < start { i += 1 }
+        }
+
+        if node.isLeaf {
+            while i < node.keys.count && results.count < limit {
+                if let end = endKey, node.keys[i] > end { break }
+                results.append(node.values[i])
+                i += 1
+            }
+        } else {
+            while i <= node.keys.count && results.count < limit {
+                if let childId = node.children?[i],
+                   let child = try await nodeStore.loadNode(nodeId: childId) {
+                    try await collectRangeLimited(node: child, startKey: startKey, endKey: endKey, results: &results, limit: limit)
+                }
+                guard results.count < limit else { return }
+                if i < node.keys.count {
+                    if let end = endKey, node.keys[i] > end { break }
+                    results.append(node.values[i])
+                }
+                i += 1
+            }
+        }
+    }
+
     // MARK: - Delete
 
     public func delete(key: DBValue, row: Row? = nil) async throws {

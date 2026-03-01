@@ -62,6 +62,11 @@ public actor ColumnIndex: Sendable {
         try await btree.searchRange(from: startKey, to: endKey)
     }
 
+    /// Range query with early termination after `limit` rows, in ascending or descending order
+    public func searchRangeWithLimit(from startKey: DBValue?, to endKey: DBValue?, limit: Int, ascending: Bool = true) async throws -> [Row] {
+        try await btree.searchRangeWithLimit(from: startKey, to: endKey, limit: limit, ascending: ascending)
+    }
+
     /// Delete a specific (key, row) entry from this index
     public func delete(key: DBValue, row: Row? = nil) async throws {
         try await btree.delete(key: key, row: row)

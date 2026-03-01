@@ -31,6 +31,9 @@ public actor PantryDatabase: Sendable {
         )
         self.storageEngine = engine
 
+        // Configure auto-checkpoint threshold
+        await engine.setAutoCheckpointThreshold(configuration.autoCheckpointThreshold)
+
         // Initialize index manager
         let im = IndexManager(
             bufferPool: await engine.bufferPoolManager,
@@ -105,6 +108,7 @@ public actor PantryDatabase: Sendable {
 
         // Mark column as indexed in stats and refresh distinct counts
         try await storageEngine.analyzeTable(table)
+        queryExecutor.invalidatePlanCache()
     }
 
     /// Create a partial index on a column — only rows matching `where` condition are indexed.
@@ -130,6 +134,7 @@ public actor PantryDatabase: Sendable {
         }
 
         try await storageEngine.analyzeTable(table)
+        queryExecutor.invalidatePlanCache()
     }
 
     public func createCompoundIndex(table: String, columns: [String]) async throws {
@@ -148,6 +153,7 @@ public actor PantryDatabase: Sendable {
             let compoundKey = DBValue.compound(keyValues)
             try await columnIndex.insert(key: compoundKey, row: Row(values: slimValues))
         }
+        queryExecutor.invalidatePlanCache()
     }
 
     public func listIndexes(on table: String) async -> [(column: String, isCompound: Bool)] {
@@ -156,6 +162,7 @@ public actor PantryDatabase: Sendable {
 
     public func dropIndex(table: String, column: String) async {
         await indexManager.dropIndex(tableName: table, columnName: column)
+        queryExecutor.invalidatePlanCache()
     }
 
     /// Collect column statistics for query optimization (like SQL ANALYZE)
@@ -254,10 +261,9 @@ public actor PantryDatabase: Sendable {
     }
 
     public func insertAll(into table: String, rows: [[String: DBValue]]) async throws {
-        try await transaction { db in
-            for row in rows {
-                try await db.insert(into: table, values: row)
-            }
+        let rowObjects = rows.map { Row(values: $0) }
+        try await transaction { _ in
+            try await self.queryExecutor.executeBulkInsert(into: table, rows: rowObjects, transactionContext: self.currentTransactionContext)
         }
     }
 

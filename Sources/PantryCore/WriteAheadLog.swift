@@ -646,6 +646,9 @@ public actor WriteAheadLog: Sendable {
         try writeLogHeader()
     }
 
+    /// Current WAL file size in bytes
+    public var walSize: UInt64 { currentLogPosition }
+
     // MARK: - Cleanup
 
     public func close() throws {
