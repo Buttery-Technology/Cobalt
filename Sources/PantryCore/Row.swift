@@ -52,7 +52,7 @@ extension Row {
 extension Row {
     /// Encode this row into a compact binary format.
     ///
-    /// Format:
+    /// Self-describing format (used when no schema is available):
     /// ```
     /// [2B column count (UInt16)]
     /// per column:
@@ -72,6 +72,136 @@ extension Row {
             Row.encodeDBValue(value, into: &buf)
         }
         return buf
+    }
+
+    /// Schema-based positional encoding with NULL bitmap.
+    /// Format:
+    /// ```
+    /// [1B magic 0xFF][1B version 0x02]
+    /// [2B column count (UInt16)]
+    /// [ceil(colCount/8) bytes NULL bitmap — bit=1 means NULL]
+    /// per non-NULL column (in schema order):
+    ///   [1B type tag][value payload]
+    /// ```
+    /// NULL columns use only 1 bit instead of 1 byte (type tag).
+    public func toBytesPositional(schema: PantryTableSchema) -> Data {
+        let colCount = schema.columns.count
+        let bitmapBytes = (colCount + 7) / 8
+        var buf = Data(capacity: 4 + bitmapBytes + colCount * 10)
+        buf.append(0xFF) // magic
+        buf.append(0x02) // version 2: NULL bitmap
+        buf.appendUInt16(UInt16(colCount))
+
+        // Build NULL bitmap
+        var bitmap = [UInt8](repeating: 0, count: bitmapBytes)
+        for (i, col) in schema.columns.enumerated() {
+            let value = values[col.name] ?? .null
+            if value == .null {
+                bitmap[i / 8] |= (1 << (i % 8))
+            }
+        }
+        buf.append(contentsOf: bitmap)
+
+        // Encode only non-NULL values
+        for (i, col) in schema.columns.enumerated() {
+            let isNull = (bitmap[i / 8] & (1 << (i % 8))) != 0
+            if !isNull {
+                let value = values[col.name] ?? .null
+                Row.encodeDBValue(value, into: &buf)
+            }
+        }
+        return buf
+    }
+
+    /// Decode from positional format v2 (NULL bitmap) using schema for column names.
+    public static func fromBytesPositionalV2(_ data: Data, schema: PantryTableSchema) -> Row? {
+        guard data.count >= 4,
+              data[data.startIndex] == 0xFF,
+              data[data.startIndex + 1] == 0x02 else { return nil }
+        var offset = 2
+        guard let colCount = data.readUInt16(at: &offset) else { return nil }
+
+        let encodedCount = Int(colCount)
+        let bitmapBytes = (encodedCount + 7) / 8
+        guard offset + bitmapBytes <= data.count else { return nil }
+        let bitmap = Array(data[offset..<(offset + bitmapBytes)])
+        offset += bitmapBytes
+
+        var values = [String: DBValue]()
+        values.reserveCapacity(max(encodedCount, schema.columns.count))
+        // Decode columns that exist in the encoded data
+        let decodableCount = min(encodedCount, schema.columns.count)
+        for i in 0..<decodableCount {
+            let col = schema.columns[i]
+            let isNull = (bitmap[i / 8] & (1 << (i % 8))) != 0
+            if isNull {
+                values[col.name] = .null
+            } else {
+                guard let value = decodeDBValue(from: data, at: &offset) else { return nil }
+                values[col.name] = value
+            }
+        }
+        // Skip extra encoded columns not in current schema (schema shrank)
+        if encodedCount > schema.columns.count {
+            for i in schema.columns.count..<encodedCount {
+                let isNull = (bitmap[i / 8] & (1 << (i % 8))) != 0
+                if !isNull {
+                    guard skipDBValue(in: data, at: &offset) else { return nil }
+                }
+            }
+        }
+        // Fill missing columns with .null (schema grew via migration)
+        if encodedCount < schema.columns.count {
+            for i in encodedCount..<schema.columns.count {
+                values[schema.columns[i].name] = .null
+            }
+        }
+        return Row(values: values)
+    }
+
+    /// Decode from positional format v1 (no NULL bitmap) using schema for column names.
+    public static func fromBytesPositionalV1(_ data: Data, schema: PantryTableSchema) -> Row? {
+        guard data.count >= 4,
+              data[data.startIndex] == 0xFF,
+              data[data.startIndex + 1] == 0x01 else { return nil }
+        var offset = 2
+        guard let colCount = data.readUInt16(at: &offset) else { return nil }
+        let encodedCount = Int(colCount)
+        var values = [String: DBValue]()
+        values.reserveCapacity(max(encodedCount, schema.columns.count))
+        let decodableCount = min(encodedCount, schema.columns.count)
+        for i in 0..<decodableCount {
+            guard let value = decodeDBValue(from: data, at: &offset) else { return nil }
+            values[schema.columns[i].name] = value
+        }
+        // Skip extra encoded columns not in current schema
+        if encodedCount > schema.columns.count {
+            for _ in schema.columns.count..<encodedCount {
+                guard skipDBValue(in: data, at: &offset) else { return nil }
+            }
+        }
+        // Fill missing columns with .null (schema grew)
+        if encodedCount < schema.columns.count {
+            for i in encodedCount..<schema.columns.count {
+                values[schema.columns[i].name] = .null
+            }
+        }
+        return Row(values: values)
+    }
+
+    /// Auto-detecting decode: checks magic byte, dispatches to appropriate decoder.
+    public static func fromBytesAuto(_ data: Data, schema: PantryTableSchema?) -> Row? {
+        if data.count >= 2, data[data.startIndex] == 0xFF {
+            if let schema = schema {
+                let version = data[data.startIndex + 1]
+                if version == 0x02 {
+                    return fromBytesPositionalV2(data, schema: schema)
+                } else if version == 0x01 {
+                    return fromBytesPositionalV1(data, schema: schema)
+                }
+            }
+        }
+        return fromBytes(data)
     }
 
     /// Decode a row from compact binary format. Returns nil on malformed data.

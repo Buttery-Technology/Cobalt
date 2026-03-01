@@ -226,8 +226,15 @@ public actor TransactionManager: Sendable {
         }
     }
 
+    /// Configurable long-running transaction timeout (seconds)
+    private var longRunningTxTimeoutSeconds: TimeInterval = 30
+
+    public func setLongRunningTxTimeout(_ seconds: Int) {
+        longRunningTxTimeoutSeconds = TimeInterval(seconds)
+    }
+
     private func identifyLongRunningTransactions() -> [UInt64] {
-        let thresholdSeconds: TimeInterval = 30
+        let thresholdSeconds: TimeInterval = longRunningTxTimeoutSeconds
         let now = Date()
         return activeTransactions.compactMap { (txID, context) in
             let runningTime = now.timeIntervalSince(context.startTime)

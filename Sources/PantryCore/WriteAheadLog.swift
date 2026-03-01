@@ -1,4 +1,5 @@
 import Foundation
+import Compression
 
 /// Configuration for group commit batching
 public struct GroupCommitConfig: Sendable {
@@ -26,6 +27,10 @@ public actor WriteAheadLog: Sendable {
     /// Pending commit continuations waiting for the next fsync batch
     private var pendingCommits: [(txID: UInt64, continuation: CheckedContinuation<Void, Error>)] = []
 
+    /// Adaptive batch sizing: track commits per flush cycle to scale batch size
+    private var adaptiveBatchSize: Int = 4
+    private var recentBatchSizes: [Int] = []  // rolling window of last 8 batch sizes
+
     // MARK: - Types
 
     public enum LogRecordType: UInt8, Sendable {
@@ -37,6 +42,10 @@ public actor WriteAheadLog: Sendable {
         case checkpoint = 6
         case pageBeforeDelta = 7
         case pageAfterDelta = 8
+        case pageBeforeUpdateCompressed = 9
+        case pageAfterUpdateCompressed = 10
+        case recordInsert = 11  // record-level redo: insert
+        case recordDelete = 12  // record-level redo: delete
     }
 
     public enum LogContent: Sendable {
@@ -44,6 +53,7 @@ public actor WriteAheadLog: Sendable {
         case pageImage(Int, UInt64, Data) // pageID, timestamp, data
         case pageDelta(Int, UInt64, Data) // pageID, timestamp, delta data
         case checkpoint([UInt64]) // active transaction IDs
+        case recordOp(pageID: Int, recordID: UInt64, data: Data?) // record-level: data is nil for delete
     }
 
     public struct LogRecord: Sendable {
@@ -129,10 +139,11 @@ public actor WriteAheadLog: Sendable {
 
         try writeLogRecord(logData)
 
-        // Join the pending batch for fsync
+        // Join the pending batch for fsync (adaptive batch size)
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             pendingCommits.append((txID: txID, continuation: cont))
-            if pendingCommits.count >= groupCommitConfig.maxBatchSize {
+            let effectiveBatchSize = min(adaptiveBatchSize, groupCommitConfig.maxBatchSize)
+            if pendingCommits.count >= effectiveBatchSize {
                 flushBatch()
             } else if pendingCommits.count == 1 {
                 // First in batch — schedule delayed flush
@@ -148,6 +159,14 @@ public actor WriteAheadLog: Sendable {
         guard !pendingCommits.isEmpty else { return }
         let batch = pendingCommits
         pendingCommits = []
+
+        // Adapt batch size based on recent history: grow toward larger batches under load
+        recentBatchSizes.append(batch.count)
+        if recentBatchSizes.count > 8 { recentBatchSizes.removeFirst() }
+        let avgBatch = recentBatchSizes.reduce(0, +) / max(1, recentBatchSizes.count)
+        // Scale: if recent batches are large, grow adaptive size; if small, shrink
+        adaptiveBatchSize = max(4, min(groupCommitConfig.maxBatchSize, avgBatch * 2))
+
         do {
             try logFileHandle?.synchronize()
             for item in batch { item.continuation.resume() }
@@ -186,14 +205,29 @@ public actor WriteAheadLog: Sendable {
         let timestamp = UInt64(Date().timeIntervalSince1970)
 
         var logData = Data()
-        logData.append(LogRecordType.pageBeforeUpdate.rawValue)
-        withUnsafeBytes(of: lsn) { logData.append(contentsOf: $0) }
-        withUnsafeBytes(of: txID) { logData.append(contentsOf: $0) }
-        withUnsafeBytes(of: timestamp) { logData.append(contentsOf: $0) }
-        withUnsafeBytes(of: page.pageID) { logData.append(contentsOf: $0) }
-        let dataLength = UInt32(page.data.count)
-        withUnsafeBytes(of: dataLength) { logData.append(contentsOf: $0) }
-        logData.append(page.data)
+
+        // Try LZ4 compression on page data
+        if let compressed = compressLZ4(page.data) {
+            logData.append(LogRecordType.pageBeforeUpdateCompressed.rawValue)
+            withUnsafeBytes(of: lsn) { logData.append(contentsOf: $0) }
+            withUnsafeBytes(of: txID) { logData.append(contentsOf: $0) }
+            withUnsafeBytes(of: timestamp) { logData.append(contentsOf: $0) }
+            withUnsafeBytes(of: page.pageID) { logData.append(contentsOf: $0) }
+            let originalSize = UInt32(page.data.count)
+            withUnsafeBytes(of: originalSize) { logData.append(contentsOf: $0) }
+            let compressedLength = UInt32(compressed.count)
+            withUnsafeBytes(of: compressedLength) { logData.append(contentsOf: $0) }
+            logData.append(compressed)
+        } else {
+            logData.append(LogRecordType.pageBeforeUpdate.rawValue)
+            withUnsafeBytes(of: lsn) { logData.append(contentsOf: $0) }
+            withUnsafeBytes(of: txID) { logData.append(contentsOf: $0) }
+            withUnsafeBytes(of: timestamp) { logData.append(contentsOf: $0) }
+            withUnsafeBytes(of: page.pageID) { logData.append(contentsOf: $0) }
+            let dataLength = UInt32(page.data.count)
+            withUnsafeBytes(of: dataLength) { logData.append(contentsOf: $0) }
+            logData.append(page.data)
+        }
 
         cacheLogRecord(lsn: lsn, type: .pageBeforeUpdate, txID: txID, timestamp: timestamp, content: .pageImage(page.pageID, timestamp, page.data))
 
@@ -206,14 +240,29 @@ public actor WriteAheadLog: Sendable {
         let timestamp = UInt64(Date().timeIntervalSince1970)
 
         var logData = Data()
-        logData.append(LogRecordType.pageAfterUpdate.rawValue)
-        withUnsafeBytes(of: lsn) { logData.append(contentsOf: $0) }
-        withUnsafeBytes(of: txID) { logData.append(contentsOf: $0) }
-        withUnsafeBytes(of: timestamp) { logData.append(contentsOf: $0) }
-        withUnsafeBytes(of: page.pageID) { logData.append(contentsOf: $0) }
-        let dataLength = UInt32(page.data.count)
-        withUnsafeBytes(of: dataLength) { logData.append(contentsOf: $0) }
-        logData.append(page.data)
+
+        // Try LZ4 compression on page data
+        if let compressed = compressLZ4(page.data) {
+            logData.append(LogRecordType.pageAfterUpdateCompressed.rawValue)
+            withUnsafeBytes(of: lsn) { logData.append(contentsOf: $0) }
+            withUnsafeBytes(of: txID) { logData.append(contentsOf: $0) }
+            withUnsafeBytes(of: timestamp) { logData.append(contentsOf: $0) }
+            withUnsafeBytes(of: page.pageID) { logData.append(contentsOf: $0) }
+            let originalSize = UInt32(page.data.count)
+            withUnsafeBytes(of: originalSize) { logData.append(contentsOf: $0) }
+            let compressedLength = UInt32(compressed.count)
+            withUnsafeBytes(of: compressedLength) { logData.append(contentsOf: $0) }
+            logData.append(compressed)
+        } else {
+            logData.append(LogRecordType.pageAfterUpdate.rawValue)
+            withUnsafeBytes(of: lsn) { logData.append(contentsOf: $0) }
+            withUnsafeBytes(of: txID) { logData.append(contentsOf: $0) }
+            withUnsafeBytes(of: timestamp) { logData.append(contentsOf: $0) }
+            withUnsafeBytes(of: page.pageID) { logData.append(contentsOf: $0) }
+            let dataLength = UInt32(page.data.count)
+            withUnsafeBytes(of: dataLength) { logData.append(contentsOf: $0) }
+            logData.append(page.data)
+        }
 
         cacheLogRecord(lsn: lsn, type: .pageAfterUpdate, txID: txID, timestamp: timestamp, content: .pageImage(page.pageID, timestamp, page.data))
 
@@ -269,6 +318,52 @@ public actor WriteAheadLog: Sendable {
         cacheLogRecord(lsn: lsn, type: type, txID: txID, timestamp: timestamp, content: .pageDelta(pageID, timestamp, delta))
         try writeLogRecord(logData)
         return true
+    }
+
+    // MARK: - Record-Level WAL Entries
+
+    /// Log a record insert operation. Much smaller than a full page image for single-row inserts.
+    /// Format: [1B type][8B lsn][8B txID][8B timestamp][8B pageID][8B recordID][4B dataLength][N bytes data]
+    public func logRecordInsert(txID: UInt64, pageID: Int, recordID: UInt64, data: Data) throws {
+        let lsn = nextLSN
+        nextLSN += 1
+        let timestamp = UInt64(Date().timeIntervalSince1970)
+
+        var logData = Data(capacity: 1 + 8 + 8 + 8 + 8 + 8 + 4 + data.count)
+        logData.append(LogRecordType.recordInsert.rawValue)
+        withUnsafeBytes(of: lsn) { logData.append(contentsOf: $0) }
+        withUnsafeBytes(of: txID) { logData.append(contentsOf: $0) }
+        withUnsafeBytes(of: timestamp) { logData.append(contentsOf: $0) }
+        withUnsafeBytes(of: pageID) { logData.append(contentsOf: $0) }
+        withUnsafeBytes(of: recordID) { logData.append(contentsOf: $0) }
+        let dataLength = UInt32(data.count)
+        withUnsafeBytes(of: dataLength) { logData.append(contentsOf: $0) }
+        logData.append(data)
+
+        cacheLogRecord(lsn: lsn, type: .recordInsert, txID: txID, timestamp: timestamp, content: .recordOp(pageID: pageID, recordID: recordID, data: data))
+        try writeLogRecord(logData)
+    }
+
+    /// Log a record delete operation. Stores the record data for undo capability.
+    /// Format: [1B type][8B lsn][8B txID][8B timestamp][8B pageID][8B recordID][4B dataLength][N bytes data]
+    public func logRecordDelete(txID: UInt64, pageID: Int, recordID: UInt64, data: Data) throws {
+        let lsn = nextLSN
+        nextLSN += 1
+        let timestamp = UInt64(Date().timeIntervalSince1970)
+
+        var logData = Data(capacity: 1 + 8 + 8 + 8 + 8 + 8 + 4 + data.count)
+        logData.append(LogRecordType.recordDelete.rawValue)
+        withUnsafeBytes(of: lsn) { logData.append(contentsOf: $0) }
+        withUnsafeBytes(of: txID) { logData.append(contentsOf: $0) }
+        withUnsafeBytes(of: timestamp) { logData.append(contentsOf: $0) }
+        withUnsafeBytes(of: pageID) { logData.append(contentsOf: $0) }
+        withUnsafeBytes(of: recordID) { logData.append(contentsOf: $0) }
+        let dataLength = UInt32(data.count)
+        withUnsafeBytes(of: dataLength) { logData.append(contentsOf: $0) }
+        logData.append(data)
+
+        cacheLogRecord(lsn: lsn, type: .recordDelete, txID: txID, timestamp: timestamp, content: .recordOp(pageID: pageID, recordID: recordID, data: data))
+        try writeLogRecord(logData)
     }
 
     /// Compute binary delta between old and new data.
@@ -360,6 +455,24 @@ public actor WriteAheadLog: Sendable {
         let txRecords = logRecords.filter { $0.transactionID == txID }
             .sorted { $0.lsn > $1.lsn }
 
+        // Collect pages that have full before-image entries — record-level undo is
+        // redundant for these pages since the before-image will restore them completely.
+        var pagesWithBeforeImage = Set<Int>()
+        for record in txRecords {
+            switch record.type {
+            case .pageBeforeUpdate:
+                if case let .pageImage(pageID, _, _) = record.content {
+                    pagesWithBeforeImage.insert(pageID)
+                }
+            case .pageBeforeDelta:
+                if case let .pageDelta(pageID, _, _) = record.content {
+                    pagesWithBeforeImage.insert(pageID)
+                }
+            default:
+                break
+            }
+        }
+
         for record in txRecords {
             switch record.type {
             case .pageBeforeUpdate:
@@ -377,6 +490,27 @@ public actor WriteAheadLog: Sendable {
                         restoredPage.loadRecords()
                         try await storageManager.writePage(&restoredPage)
                     }
+                }
+            case .recordInsert:
+                // Undo insert: delete the record from the page (skip if before-image covers it)
+                if case let .recordOp(pageID, recordID, _) = record.content,
+                   !pagesWithBeforeImage.contains(pageID) {
+                    var page = try await storageManager.readPage(pageID: pageID)
+                    page.loadRecords()
+                    _ = page.deleteRecord(id: recordID)
+                    try page.saveRecords()
+                    try await storageManager.writePage(&page)
+                }
+            case .recordDelete:
+                // Undo delete: re-insert the record into the page (skip if before-image covers it)
+                if case let .recordOp(pageID, recordID, data) = record.content, let data = data,
+                   !pagesWithBeforeImage.contains(pageID) {
+                    var page = try await storageManager.readPage(pageID: pageID)
+                    page.loadRecords()
+                    let restoredRecord = Record(id: recordID, data: data)
+                    _ = page.addRecord(restoredRecord)
+                    try page.saveRecords()
+                    try await storageManager.writePage(&page)
                 }
             default:
                 break
@@ -530,6 +664,26 @@ public actor WriteAheadLog: Sendable {
             let pageData = data.subdata(in: pos..<(pos + dataLength))
             return LogRecord(lsn: lsn, type: type, transactionID: txID, timestamp: timestamp, content: .pageImage(pageID, timestamp, pageData))
 
+        case .pageBeforeUpdateCompressed, .pageAfterUpdateCompressed:
+            // Compressed format: [8B txID][8B timestamp][8B pageID][4B originalSize][4B compressedLength][N bytes compressed data]
+            guard pos + 8 + 8 + 8 + 4 + 4 <= data.count else { return nil }
+            let txID = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: pos, as: UInt64.self) }
+            pos += 8
+            let timestamp = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: pos, as: UInt64.self) }
+            pos += 8
+            let pageID = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: pos, as: Int.self) }
+            pos += 8
+            let originalSize = data.withUnsafeBytes { Int($0.loadUnaligned(fromByteOffset: pos, as: UInt32.self)) }
+            pos += 4
+            let compressedLength = data.withUnsafeBytes { Int($0.loadUnaligned(fromByteOffset: pos, as: UInt32.self)) }
+            pos += 4
+            guard pos + compressedLength <= data.count else { return nil }
+            let compressedData = data.subdata(in: pos..<(pos + compressedLength))
+            guard let pageData = decompressLZ4(compressedData, originalSize: originalSize) else { return nil }
+            // Map compressed types back to uncompressed for downstream consumers
+            let mappedType: LogRecordType = (type == .pageBeforeUpdateCompressed) ? .pageBeforeUpdate : .pageAfterUpdate
+            return LogRecord(lsn: lsn, type: mappedType, transactionID: txID, timestamp: timestamp, content: .pageImage(pageID, timestamp, pageData))
+
         case .checkpoint:
             guard pos + 8 <= data.count else { return nil }
             let timestamp = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: pos, as: UInt64.self) }
@@ -548,6 +702,23 @@ public actor WriteAheadLog: Sendable {
             guard pos + deltaLength <= data.count else { return nil }
             let deltaData = data.subdata(in: pos..<(pos + deltaLength))
             return LogRecord(lsn: lsn, type: type, transactionID: txID, timestamp: timestamp, content: .pageDelta(pageID, timestamp, deltaData))
+
+        case .recordInsert, .recordDelete:
+            // Format: [8B txID][8B timestamp][8B pageID][8B recordID][4B dataLength][N bytes data]
+            guard pos + 8 + 8 + 8 + 8 + 4 <= data.count else { return nil }
+            let txID = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: pos, as: UInt64.self) }
+            pos += 8
+            let timestamp = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: pos, as: UInt64.self) }
+            pos += 8
+            let pageID = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: pos, as: Int.self) }
+            pos += 8
+            let recordID = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: pos, as: UInt64.self) }
+            pos += 8
+            let dataLength = data.withUnsafeBytes { Int($0.loadUnaligned(fromByteOffset: pos, as: UInt32.self)) }
+            pos += 4
+            guard pos + dataLength <= data.count else { return nil }
+            let recordData = data.subdata(in: pos..<(pos + dataLength))
+            return LogRecord(lsn: lsn, type: type, transactionID: txID, timestamp: timestamp, content: .recordOp(pageID: pageID, recordID: recordID, data: recordData))
         }
     }
 
@@ -649,6 +820,50 @@ public actor WriteAheadLog: Sendable {
 
     /// Current WAL file size in bytes
     public var walSize: UInt64 { currentLogPosition }
+
+    // MARK: - Compression Helpers
+
+    /// Compress data using LZ4. Returns nil if compression doesn't save space.
+    private nonisolated func compressLZ4(_ data: Data) -> Data? {
+        let sourceSize = data.count
+        // LZ4 worst case: input size + overhead
+        let destCapacity = sourceSize + (sourceSize / 255) + 16
+        var dest = Data(count: destCapacity)
+        let compressedSize = data.withUnsafeBytes { srcPtr in
+            dest.withUnsafeMutableBytes { dstPtr in
+                compression_encode_buffer(
+                    dstPtr.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                    destCapacity,
+                    srcPtr.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                    sourceSize,
+                    nil,
+                    COMPRESSION_LZ4
+                )
+            }
+        }
+        guard compressedSize > 0 && compressedSize < sourceSize else { return nil }
+        dest.count = compressedSize
+        return dest
+    }
+
+    /// Decompress LZ4-compressed data. `originalSize` must be the uncompressed size.
+    private nonisolated func decompressLZ4(_ data: Data, originalSize: Int) -> Data? {
+        var dest = Data(count: originalSize)
+        let decompressedSize = data.withUnsafeBytes { srcPtr in
+            dest.withUnsafeMutableBytes { dstPtr in
+                compression_decode_buffer(
+                    dstPtr.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                    originalSize,
+                    srcPtr.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                    data.count,
+                    nil,
+                    COMPRESSION_LZ4
+                )
+            }
+        }
+        guard decompressedSize == originalSize else { return nil }
+        return dest
+    }
 
     // MARK: - Cleanup
 

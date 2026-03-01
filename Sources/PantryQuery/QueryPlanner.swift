@@ -25,14 +25,19 @@ enum JoinSide: Sendable {
 }
 
 /// Cost model weights — configurable for different storage media (SSD vs HDD)
-struct CostModelWeights: Sendable, Equatable {
+public struct CostModelWeights: Sendable, Equatable {
     /// I/O page read weight (higher = prefer index scans). Default 10 for HDD, use 2–3 for SSD.
-    let ioWeight: Double
+    public let ioWeight: Double
     /// CPU row processing weight
-    let cpuWeight: Double
+    public let cpuWeight: Double
 
-    static let `default` = CostModelWeights(ioWeight: 10.0, cpuWeight: 0.01)
-    static let ssd = CostModelWeights(ioWeight: 2.0, cpuWeight: 0.01)
+    public init(ioWeight: Double, cpuWeight: Double) {
+        self.ioWeight = ioWeight
+        self.cpuWeight = cpuWeight
+    }
+
+    public static let `default` = CostModelWeights(ioWeight: 10.0, cpuWeight: 0.01)
+    public static let ssd = CostModelWeights(ioWeight: 2.0, cpuWeight: 0.01)
 }
 
 /// Cost estimate in abstract I/O units (1 unit ≈ 1 page read)
@@ -100,6 +105,14 @@ struct QueryPlanner: Sendable {
     func invalidateCache() {
         cacheGeneration.withLock { $0 += 1 }
         planCache.withLock { $0.removeAll() }
+    }
+
+    /// Invalidate cached plans for a specific table only
+    func invalidateCache(forTable table: String) {
+        cacheGeneration.withLock { $0 += 1 }
+        planCache.withLock { cache in
+            cache = cache.filter { $0.key.table != table }
+        }
     }
 
     // MARK: - Single-Table Plan Selection
@@ -281,16 +294,16 @@ struct QueryPlanner: Sendable {
         case .equality:
             return max(1, Int(Double(totalRows) * stats.equalitySelectivity))
         case .range:
-            // Assume ~30% selectivity for range queries
-            return max(1, Int(Double(totalRows) * 0.3))
+            // Use histogram-based range selectivity if available
+            let selectivity = stats.histogramBoundaries.isEmpty ? 0.3 : stats.rangeSelectivity(low: stats.minValue, high: stats.maxValue) * 0.5
+            return max(1, Int(Double(totalRows) * selectivity))
         case .inList(let count):
             return max(1, min(totalRows, Int(Double(totalRows) * stats.equalitySelectivity * Double(count))))
         case .like:
-            // Assume ~10% for LIKE with leading wildcard, ~1% for prefix LIKE
             return max(1, Int(Double(totalRows) * 0.1))
         case .isNull:
-            // Assume ~5% null rate
-            return max(1, Int(Double(totalRows) * 0.05))
+            // Use actual null rate from statistics
+            return max(1, Int(Double(totalRows) * stats.nullSelectivity))
         }
     }
 

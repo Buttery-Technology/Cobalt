@@ -7,15 +7,55 @@ public struct ColumnStats: Codable, Sendable {
     public var distinctCount: Int
     /// Whether this column has an index
     public var isIndexed: Bool
+    /// Number of NULL values in this column
+    public var nullCount: Int
+    /// Total number of rows sampled
+    public var totalCount: Int
+    /// Minimum value (as comparable string key)
+    public var minValue: String?
+    /// Maximum value (as comparable string key)
+    public var maxValue: String?
+    /// Equi-depth histogram bucket boundaries (up to 64 buckets)
+    /// Each entry is a value boundary; rows are roughly evenly distributed between boundaries
+    public var histogramBoundaries: [String]
 
-    public init(distinctCount: Int = 0, isIndexed: Bool = false) {
+    public init(distinctCount: Int = 0, isIndexed: Bool = false, nullCount: Int = 0, totalCount: Int = 0, minValue: String? = nil, maxValue: String? = nil, histogramBoundaries: [String] = []) {
         self.distinctCount = distinctCount
         self.isIndexed = isIndexed
+        self.nullCount = nullCount
+        self.totalCount = totalCount
+        self.minValue = minValue
+        self.maxValue = maxValue
+        self.histogramBoundaries = histogramBoundaries
     }
 
     /// Selectivity estimate for an equality predicate (lower = more selective)
     public var equalitySelectivity: Double {
         distinctCount > 0 ? 1.0 / Double(distinctCount) : 1.0
+    }
+
+    /// Selectivity estimate for a NULL predicate
+    public var nullSelectivity: Double {
+        totalCount > 0 ? Double(nullCount) / Double(totalCount) : 0.05
+    }
+
+    /// Selectivity estimate for a range predicate using histogram
+    /// Estimates fraction of rows between low and high boundaries
+    public func rangeSelectivity(low: String?, high: String?) -> Double {
+        guard !histogramBoundaries.isEmpty else { return 0.3 }
+        let buckets = histogramBoundaries.count + 1
+        var lowBucket = 0
+        var highBucket = buckets
+
+        if let low = low {
+            lowBucket = histogramBoundaries.firstIndex(where: { $0 >= low }) ?? buckets
+        }
+        if let high = high {
+            highBucket = (histogramBoundaries.firstIndex(where: { $0 > high }) ?? buckets)
+        }
+
+        let coveredBuckets = max(0, highBucket - lowBucket)
+        return max(1.0 / Double(max(1, totalCount)), Double(coveredBuckets) / Double(buckets))
     }
 }
 

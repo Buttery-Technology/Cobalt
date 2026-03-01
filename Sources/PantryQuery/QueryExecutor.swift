@@ -11,6 +11,21 @@ public enum AggregateFunction: Sendable {
     case max(column: String)
 }
 
+/// Key for query result cache
+private struct QueryResultCacheKey: Hashable {
+    let table: String
+    let conditionSignature: String
+    let columns: [String]?
+    let modifiersSignature: String
+}
+
+/// Cached query result with generation tracking
+private struct CachedQueryResult {
+    let rows: [Row]
+    let generation: UInt64
+    var lastAccess: UInt64
+}
+
 /// Executes SELECT, INSERT, UPDATE, DELETE queries against the storage engine.
 /// Uses cost-based QueryPlanner for index vs scan decisions and join ordering.
 public actor QueryExecutor: Sendable {
@@ -18,18 +33,27 @@ public actor QueryExecutor: Sendable {
     private let indexManager: IndexManager
     private let planner: QueryPlanner
 
-    public init(storageEngine: StorageEngine, indexManager: IndexManager, tableRegistry: TableRegistry) {
+    /// Query result cache: stores SELECT results keyed by query signature
+    private var resultCache: [QueryResultCacheKey: CachedQueryResult] = [:]
+    /// Per-table generation counter: incremented on INSERT/UPDATE/DELETE
+    private var tableGenerations: [String: UInt64] = [:]
+    /// Monotonic access counter for LRU eviction
+    private var resultCacheCounter: UInt64 = 0
+    /// Maximum cached query results
+    private let maxResultCacheSize = 128
+
+    public init(storageEngine: StorageEngine, indexManager: IndexManager, tableRegistry: TableRegistry, costWeights: CostModelWeights = .default) {
         self.storageEngine = storageEngine
         self.indexManager = indexManager
-        self.planner = QueryPlanner(storageEngine: storageEngine, indexManager: indexManager, registry: tableRegistry)
+        self.planner = QueryPlanner(storageEngine: storageEngine, indexManager: indexManager, registry: tableRegistry, costWeights: costWeights)
     }
 
     /// Convenience init — resolves tableRegistry from storageEngine (requires await)
-    public init(storageEngine: StorageEngine, indexManager: IndexManager) async {
+    public init(storageEngine: StorageEngine, indexManager: IndexManager, costWeights: CostModelWeights = .default) async {
         self.storageEngine = storageEngine
         self.indexManager = indexManager
         let reg = await storageEngine.tableRegistry
-        self.planner = QueryPlanner(storageEngine: storageEngine, indexManager: indexManager, registry: reg)
+        self.planner = QueryPlanner(storageEngine: storageEngine, indexManager: indexManager, registry: reg, costWeights: costWeights)
     }
 
     /// Invalidate the query plan cache (call after index create/drop or schema changes)
@@ -37,9 +61,69 @@ public actor QueryExecutor: Sendable {
         planner.invalidateCache()
     }
 
+    /// Invalidate cached plans for a specific table only
+    public nonisolated func invalidatePlanCache(forTable table: String) {
+        planner.invalidateCache(forTable: table)
+    }
+
+    /// Invalidate result cache for a specific table (called after mutations)
+    private func invalidateResultCache(forTable table: String) {
+        tableGenerations[table, default: 0] += 1
+        resultCache = resultCache.filter { $0.key.table != table }
+    }
+
+    /// Look up a cached query result, returns nil on miss or stale generation
+    private func lookupResultCache(key: QueryResultCacheKey) -> [Row]? {
+        guard let cached = resultCache[key],
+              cached.generation == tableGenerations[key.table, default: 0] else {
+            return nil
+        }
+        resultCacheCounter += 1
+        resultCache[key]?.lastAccess = resultCacheCounter
+        return cached.rows
+    }
+
+    /// Store a query result in the cache with LRU eviction
+    private func storeResultCache(key: QueryResultCacheKey, rows: [Row]) {
+        // Don't cache very large result sets (>10K rows)
+        guard rows.count <= 10_000 else { return }
+
+        if resultCache.count >= maxResultCacheSize {
+            let evictCount = maxResultCacheSize / 4
+            let sorted = resultCache.sorted { $0.value.lastAccess < $1.value.lastAccess }
+            for entry in sorted.prefix(evictCount) {
+                resultCache.removeValue(forKey: entry.key)
+            }
+        }
+
+        resultCacheCounter += 1
+        resultCache[key] = CachedQueryResult(
+            rows: rows,
+            generation: tableGenerations[key.table, default: 0],
+            lastAccess: resultCacheCounter
+        )
+    }
+
     // MARK: - SELECT
 
     public func executeSelect(from table: String, columns: [String]? = nil, where condition: WhereCondition? = nil, modifiers: QueryModifiers? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {
+        // Query result cache: skip for transactional queries (they need fresh data)
+        let cacheKey: QueryResultCacheKey?
+        if transactionContext == nil {
+            let key = QueryResultCacheKey(
+                table: table,
+                conditionSignature: condition.map { queryConditionSignature($0) } ?? "",
+                columns: columns,
+                modifiersSignature: modifiers.map { queryModifiersSignature($0) } ?? ""
+            )
+            if let cached = lookupResultCache(key: key) {
+                return cached
+            }
+            cacheKey = key
+        } else {
+            cacheKey = nil
+        }
+
         var rows: [Row]
 
         // Fast path: ORDER BY + LIMIT on a single indexed column → index-ordered scan with early exit
@@ -85,8 +169,9 @@ public actor QueryExecutor: Sendable {
             }
         }
 
-        // Get page chain for cost estimation
+        // Get page chain for cost estimation and schema for positional row decoding
         let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
+        let selectSchema = await storageEngine.getTableSchema(table)
 
         // Build index coverage map for cost-based planner
         let indexCoverage = await buildIndexCoverage(table: table)
@@ -127,7 +212,7 @@ public actor QueryExecutor: Sendable {
                 }
                 if let scanLimit = scanLimit { rows = Array(rows.prefix(scanLimit)) }
             } else {
-                rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, transactionContext: transactionContext)
+                rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, schema: selectSchema, transactionContext: transactionContext)
             }
 
         case .indexScan:
@@ -143,11 +228,11 @@ public actor QueryExecutor: Sendable {
                     .filter { evaluateCondition(condition, row: $0) }
                 if let scanLimit = scanLimit { rows = Array(rows.prefix(scanLimit)) }
             } else {
-                rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, transactionContext: transactionContext)
+                rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, schema: selectSchema, transactionContext: transactionContext)
             }
 
         case .tableScan:
-            rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, transactionContext: transactionContext)
+            rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, schema: selectSchema, transactionContext: transactionContext)
         }
 
         // Apply query modifiers: DISTINCT, ORDER BY, OFFSET, LIMIT
@@ -179,14 +264,17 @@ public actor QueryExecutor: Sendable {
         }
 
         if let columns = columns, !columns.isEmpty {
-            return rows.map { row in
+            let projected = rows.map { row in
                 let projectedValues = columns.reduce(into: [String: DBValue]()) { result, column in
                     result[column] = row.values[column] ?? .null
                 }
                 return Row(values: projectedValues)
             }
+            if let key = cacheKey { storeResultCache(key: key, rows: projected) }
+            return projected
         }
 
+        if let key = cacheKey { storeResultCache(key: key, rows: rows) }
         return rows
     }
 
@@ -200,12 +288,33 @@ public actor QueryExecutor: Sendable {
             primaryRowCount: planner.registry.getTableInfo(name: table)?.recordCount ?? 100
         )
 
-        // Parallel scan: load left table and first right table concurrently
+        // Predicate pushdown: decompose WHERE into per-table filters applied during scan
+        let allTables = [table] + optimizedJoins.map { $0.table }
+        var pushedPredicates: [String: WhereCondition] = [:]
+        var residualCondition: WhereCondition? = condition
+
+        if let condition = condition {
+            // Build table column map from schemas
+            var tableColumns: [String: Set<String>] = [:]
+            for t in allTables {
+                if let schema = await storageEngine.getTableSchema(t) {
+                    tableColumns[t] = Set(schema.columns.map { $0.name })
+                }
+            }
+
+            let (perTable, residual) = decomposePredicates(condition, tables: allTables, tableColumns: tableColumns)
+            pushedPredicates = perTable
+            residualCondition = residual
+        }
+
+        // Parallel scan: load left table and first right table concurrently (with pushed filters)
         let firstRightTable = optimizedJoins.first?.table
+        let leftFilter = pushedPredicates[table]
+        let firstRightFilter = firstRightTable.flatMap { pushedPredicates[$0] }
         let (leftRows, firstRightRows) = try await withThrowingTaskGroup(of: (String, [Row]).self) { group -> ([Row], [Row]) in
-            group.addTask { ("left", try await self.scanAllRows(table: table, transactionContext: transactionContext)) }
+            group.addTask { ("left", try await self.scanAllRows(table: table, filter: leftFilter, transactionContext: transactionContext)) }
             if let rightTable = firstRightTable {
-                group.addTask { ("right", try await self.scanAllRows(table: rightTable, transactionContext: transactionContext)) }
+                group.addTask { ("right", try await self.scanAllRows(table: rightTable, filter: firstRightFilter, transactionContext: transactionContext)) }
             }
             var left = [Row](), right = [Row]()
             for try await (tag, rows) in group {
@@ -227,7 +336,8 @@ public actor QueryExecutor: Sendable {
             if i == 0 {
                 rightRows = firstRightRows
             } else {
-                rightRows = try await scanAllRows(table: join.table, transactionContext: transactionContext)
+                let rightFilter = pushedPredicates[join.table]
+                rightRows = try await scanAllRows(table: join.table, filter: rightFilter, transactionContext: transactionContext)
             }
 
             // Consult planner for join strategy (hash join with build-side selection)
@@ -249,9 +359,9 @@ public actor QueryExecutor: Sendable {
             }
         }
 
-        // Apply WHERE filter
-        if let condition = condition {
-            result = result.filter { evaluateCondition(condition, row: $0) }
+        // Apply residual WHERE filter (cross-table predicates not pushed down)
+        if let residual = residualCondition {
+            result = result.filter { evaluateCondition(residual, row: $0) }
         }
 
         // Apply modifiers (DISTINCT, ORDER BY, OFFSET, LIMIT)
@@ -448,10 +558,12 @@ public actor QueryExecutor: Sendable {
             }
         }
 
-        let rowData = row.toBytes()
+        let schema = await storageEngine.getTableSchema(table)
+        let rowData = schema != nil ? row.toBytesPositional(schema: schema!) : row.toBytes()
         let recordID = generateRecordID()
         let record = Record(id: recordID, data: rowData)
         try await storageEngine.insertRecord(record, tableName: table, row: row, transactionContext: transactionContext)
+        invalidateResultCache(forTable: table)
     }
 
     /// Bulk insert: inserts all rows with deferred index updates for better throughput.
@@ -488,11 +600,12 @@ public actor QueryExecutor: Sendable {
         }
 
         // Phase 1: Insert all records without index updates
+        let bulkSchema = await storageEngine.getTableSchema(table)
         var insertedPairs: [(Record, Row)] = []
         insertedPairs.reserveCapacity(rows.count)
 
         for row in rows {
-            let rowData = row.toBytes()
+            let rowData = bulkSchema != nil ? row.toBytesPositional(schema: bulkSchema!) : row.toBytes()
             let recordID = generateRecordID()
             let record = Record(id: recordID, data: rowData)
             _ = try await storageEngine.insertRecordSkipIndex(record, tableName: table, transactionContext: transactionContext)
@@ -503,6 +616,7 @@ public actor QueryExecutor: Sendable {
         for (record, row) in insertedPairs {
             try await indexManager.updateIndexes(record: record, row: row, tableName: table)
         }
+        invalidateResultCache(forTable: table)
     }
 
     // MARK: - UPDATE
@@ -520,6 +634,7 @@ public actor QueryExecutor: Sendable {
         }
 
         // Use cost-based planner to decide index vs scan
+        let updateSchema = await storageEngine.getTableSchema(table)
         let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
         let plan = planner.chooseAccessPlan(table: table, condition: condition, pageCount: pageIDs.count)
 
@@ -537,12 +652,13 @@ public actor QueryExecutor: Sendable {
                 for (key, value) in values { updatedValues[key] = value }
                 let updatedRow = Row(values: updatedValues)
 
-                let rowData = updatedRow.toBytes()
+                let rowData = updateSchema != nil ? updatedRow.toBytesPositional(schema: updateSchema!) : updatedRow.toBytes()
                 let newRecord = Record(id: record.id, data: rowData)
                 try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
                 try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
                 updatedCount += 1
             }
+            if updatedCount > 0 { invalidateResultCache(forTable: table) }
             return updatedCount
         }
 
@@ -551,7 +667,7 @@ public actor QueryExecutor: Sendable {
         var updatedCount = 0
 
         for (record, data) in rawRecords {
-            guard let row = Row.fromBytes(data) else { continue }
+            guard let row = Row.fromBytesAuto(data, schema: updateSchema) else { continue }
             if condition == nil || evaluateCondition(condition!, row: row) {
                 var updatedValues = row.values
                 for (key, value) in values {
@@ -559,7 +675,7 @@ public actor QueryExecutor: Sendable {
                 }
                 let updatedRow = Row(values: updatedValues)
 
-                let rowData = updatedRow.toBytes()
+                let rowData = updateSchema != nil ? updatedRow.toBytesPositional(schema: updateSchema!) : updatedRow.toBytes()
                 let newRecord = Record(id: record.id, data: rowData)
                 try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
                 try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
@@ -567,6 +683,7 @@ public actor QueryExecutor: Sendable {
             }
         }
 
+        if updatedCount > 0 { invalidateResultCache(forTable: table) }
         return updatedCount
     }
 
@@ -590,10 +707,12 @@ public actor QueryExecutor: Sendable {
                 try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
                 deletedCount += 1
             }
+            if deletedCount > 0 { invalidateResultCache(forTable: table) }
             return deletedCount
         }
 
         // Table scan path
+        let deleteSchema = await storageEngine.getTableSchema(table)
         let rawRecords = try await storageEngine.scanTableRaw(table, transactionContext: transactionContext)
         var deletedCount = 0
 
@@ -601,12 +720,13 @@ public actor QueryExecutor: Sendable {
             if condition == nil {
                 try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
                 deletedCount += 1
-            } else if let row = Row.fromBytes(data), evaluateCondition(condition!, row: row) {
+            } else if let row = Row.fromBytesAuto(data, schema: deleteSchema), evaluateCondition(condition!, row: row) {
                 try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
                 deletedCount += 1
             }
         }
 
+        if deletedCount > 0 { invalidateResultCache(forTable: table) }
         return deletedCount
     }
 
@@ -867,9 +987,179 @@ public actor QueryExecutor: Sendable {
         }
     }
 
+    // MARK: - Join Predicate Pushdown
+
+    /// Decompose a WHERE condition into per-table predicates and residual cross-table predicates.
+    /// Columns can be qualified ("table.col") or unqualified ("col").
+    /// An unqualified column is assigned to a table if it exists in that table's schema and no other.
+    /// Only top-level AND conjuncts are pushed down; OR conditions are kept as residual.
+    private nonisolated func decomposePredicates(
+        _ condition: WhereCondition,
+        tables: [String],
+        tableColumns: [String: Set<String>]
+    ) -> (perTable: [String: WhereCondition], residual: WhereCondition?) {
+        // Flatten top-level AND into conjuncts
+        let conjuncts: [WhereCondition]
+        if case .and(let subs) = condition {
+            conjuncts = subs
+        } else {
+            conjuncts = [condition]
+        }
+
+        var perTable: [String: [WhereCondition]] = [:]
+        var residual: [WhereCondition] = []
+
+        for predicate in conjuncts {
+            let cols = columnsReferenced(in: predicate)
+            // Resolve each column to a table
+            var resolvedTable: String? = nil
+            var ambiguous = false
+            for col in cols {
+                let table = resolveColumnTable(col, tables: tables, tableColumns: tableColumns)
+                if let table = table {
+                    if resolvedTable == nil {
+                        resolvedTable = table
+                    } else if resolvedTable != table {
+                        // Predicate spans multiple tables — can't push down
+                        ambiguous = true
+                        break
+                    }
+                } else {
+                    ambiguous = true
+                    break
+                }
+            }
+
+            if ambiguous || resolvedTable == nil {
+                residual.append(predicate)
+            } else {
+                // Strip table prefix from columns so the scan can evaluate them
+                let stripped = stripTablePrefix(predicate, table: resolvedTable!)
+                perTable[resolvedTable!, default: []].append(stripped)
+            }
+        }
+
+        // Combine per-table predicates into single conditions
+        var result: [String: WhereCondition] = [:]
+        for (table, preds) in perTable {
+            if preds.count == 1 {
+                result[table] = preds[0]
+            } else {
+                result[table] = .and(preds)
+            }
+        }
+
+        let residualCondition: WhereCondition?
+        if residual.isEmpty {
+            residualCondition = nil
+        } else if residual.count == 1 {
+            residualCondition = residual[0]
+        } else {
+            residualCondition = .and(residual)
+        }
+
+        return (result, residualCondition)
+    }
+
+    /// Resolve a column name to its table. Handles "table.col" qualified names
+    /// and unqualified names (matched if unique across tables).
+    private nonisolated func resolveColumnTable(
+        _ column: String,
+        tables: [String],
+        tableColumns: [String: Set<String>]
+    ) -> String? {
+        // Check for qualified name "table.col"
+        if let dotIdx = column.firstIndex(of: ".") {
+            let tableName = String(column[column.startIndex..<dotIdx])
+            if tables.contains(tableName) { return tableName }
+        }
+
+        // Unqualified: find which table owns this column (must be unique)
+        var owner: String? = nil
+        for table in tables {
+            if tableColumns[table]?.contains(column) == true {
+                if owner != nil { return nil } // ambiguous
+                owner = table
+            }
+        }
+        return owner
+    }
+
+    /// Strip "table." prefix from column references in a predicate so it can be evaluated
+    /// against raw (unprefixed) rows during a table scan.
+    private nonisolated func stripTablePrefix(_ condition: WhereCondition, table: String) -> WhereCondition {
+        let prefix = "\(table)."
+        func strip(_ col: String) -> String {
+            col.hasPrefix(prefix) ? String(col.dropFirst(prefix.count)) : col
+        }
+        switch condition {
+        case .equals(let col, let val): return .equals(column: strip(col), value: val)
+        case .notEquals(let col, let val): return .notEquals(column: strip(col), value: val)
+        case .lessThan(let col, let val): return .lessThan(column: strip(col), value: val)
+        case .greaterThan(let col, let val): return .greaterThan(column: strip(col), value: val)
+        case .lessThanOrEqual(let col, let val): return .lessThanOrEqual(column: strip(col), value: val)
+        case .greaterThanOrEqual(let col, let val): return .greaterThanOrEqual(column: strip(col), value: val)
+        case .in(let col, let vals): return .in(column: strip(col), values: vals)
+        case .between(let col, let min, let max): return .between(column: strip(col), min: min, max: max)
+        case .like(let col, let pattern): return .like(column: strip(col), pattern: pattern)
+        case .isNull(let col): return .isNull(column: strip(col))
+        case .isNotNull(let col): return .isNotNull(column: strip(col))
+        case .and(let subs): return .and(subs.map { stripTablePrefix($0, table: table) })
+        case .or(let subs): return .or(subs.map { stripTablePrefix($0, table: table) })
+        }
+    }
+
+    // MARK: - Query Signature Helpers (for result caching)
+
+    /// Generate a structural signature of a WhereCondition for cache keying.
+    /// Same shape but different literal values produce the same signature.
+    private nonisolated func queryConditionSignature(_ condition: WhereCondition) -> String {
+        switch condition {
+        case .equals(let col, let val): return "eq(\(col),\(dbValueSignature(val)))"
+        case .notEquals(let col, let val): return "ne(\(col),\(dbValueSignature(val)))"
+        case .lessThan(let col, let val): return "lt(\(col),\(dbValueSignature(val)))"
+        case .greaterThan(let col, let val): return "gt(\(col),\(dbValueSignature(val)))"
+        case .lessThanOrEqual(let col, let val): return "le(\(col),\(dbValueSignature(val)))"
+        case .greaterThanOrEqual(let col, let val): return "ge(\(col),\(dbValueSignature(val)))"
+        case .in(let col, let vals): return "in(\(col),\(vals.map { dbValueSignature($0) }.joined(separator: ",")))"
+        case .between(let col, let min, let max): return "bw(\(col),\(dbValueSignature(min)),\(dbValueSignature(max)))"
+        case .like(let col, let pattern): return "lk(\(col),\(pattern))"
+        case .isNull(let col): return "nu(\(col))"
+        case .isNotNull(let col): return "nn(\(col))"
+        case .and(let subs): return "and[\(subs.map { queryConditionSignature($0) }.joined(separator: ","))]"
+        case .or(let subs): return "or[\(subs.map { queryConditionSignature($0) }.joined(separator: ","))]"
+        }
+    }
+
+    /// Include actual values in the signature since we cache exact results
+    private nonisolated func dbValueSignature(_ val: DBValue) -> String {
+        switch val {
+        case .null: return "N"
+        case .integer(let v): return "i\(v)"
+        case .double(let v): return "d\(v)"
+        case .string(let v): return "s\(v.hashValue)"
+        case .boolean(let v): return "b\(v)"
+        case .blob(let v): return "B\(v.hashValue)"
+        case .compound(let vals): return "c[\(vals.map { dbValueSignature($0) }.joined(separator: ","))]"
+        }
+    }
+
+    private nonisolated func queryModifiersSignature(_ mods: QueryModifiers) -> String {
+        var parts: [String] = []
+        if let orderBy = mods.orderBy {
+            parts.append("o:\(orderBy.map { "\($0.column)\($0.direction == .ascending ? "a" : "d")" }.joined(separator: ","))")
+        }
+        if let limit = mods.limit { parts.append("l:\(limit)") }
+        if let offset = mods.offset { parts.append("f:\(offset)") }
+        if mods.distinct { parts.append("D") }
+        return parts.joined(separator: ";")
+    }
+
     /// Evaluate a WHERE condition against raw binary data using partial column extraction.
     /// Returns nil if the condition type is too complex for lazy eval.
     private nonisolated func evaluateConditionLazy(_ condition: WhereCondition, data: Data) -> Bool? {
+        // Positional encoding (0xFF magic) doesn't embed column names — can't use columnValue
+        if data.count >= 1, data[data.startIndex] == 0xFF { return nil }
         switch condition {
         case .equals(let col, let value):
             if value == .null { return false }
@@ -918,13 +1208,18 @@ public actor QueryExecutor: Sendable {
 
     // MARK: - JOIN Helpers
 
-    private func scanAllRows(table: String, transactionContext: TransactionContext? = nil) async throws -> [Row] {
+    private func scanAllRows(table: String, filter: WhereCondition? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {
         let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
+        let scanSchema = await storageEngine.getTableSchema(table)
         return try await withThrowingTaskGroup(of: (Int, [Row]).self) { group in
             for (index, pageID) in pageIDs.enumerated() {
-                group.addTask { [storageEngine] in
+                group.addTask { [storageEngine, filter, scanSchema] in
                     let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
-                    return (index, page.records.compactMap { Row.fromBytes($0.data) })
+                    let rows = page.records.compactMap { Row.fromBytesAuto($0.data, schema: scanSchema) }
+                    if let filter = filter {
+                        return (index, rows.filter { self.evaluateCondition(filter, row: $0) })
+                    }
+                    return (index, rows)
                 }
             }
             var indexed: [(Int, [Row])] = []
@@ -1073,7 +1368,7 @@ public actor QueryExecutor: Sendable {
 
     // MARK: - Parallel Table Scan
 
-    private func parallelTableScan(pageIDs: [Int], condition: WhereCondition?, limit: Int? = nil, neededColumns: Set<String>? = nil, transactionContext: TransactionContext?) async throws -> [Row] {
+    private func parallelTableScan(pageIDs: [Int], condition: WhereCondition?, limit: Int? = nil, neededColumns: Set<String>? = nil, schema: PantryTableSchema? = nil, transactionContext: TransactionContext?) async throws -> [Row] {
         if let condition = condition {
             let conditionColumns = columnsReferenced(in: condition)
             let useLazy = conditionColumns.count <= 3
@@ -1098,11 +1393,11 @@ public actor QueryExecutor: Sendable {
                             record = try await storageEngine.reassembleOverflowRecord(record)
                         }
                         if useLazy, let result = evaluateConditionLazy(condition, data: record.data) {
-                            if result, let row = Row.fromBytes(record.data) {
+                            if result, let row = Row.fromBytesAuto(record.data, schema: schema) {
                                 rows.append(row)
                                 if rows.count >= limit { return rows }
                             }
-                        } else if let row = Row.fromBytes(record.data), evaluateCondition(condition, row: row) {
+                        } else if let row = Row.fromBytesAuto(record.data, schema: schema), evaluateCondition(condition, row: row) {
                             rows.append(row)
                             if rows.count >= limit { return rows }
                         }
@@ -1129,10 +1424,10 @@ public actor QueryExecutor: Sendable {
                                 record = try await storageEngine.reassembleOverflowRecord(record)
                             }
                             if useLazy, let result = self.evaluateConditionLazy(condition, data: record.data) {
-                                if result, let row = Row.fromBytes(record.data) {
+                                if result, let row = Row.fromBytesAuto(record.data, schema: schema) {
                                     pageRows.append(row)
                                 }
-                            } else if let row = Row.fromBytes(record.data), self.evaluateCondition(condition, row: row) {
+                            } else if let row = Row.fromBytesAuto(record.data, schema: schema), self.evaluateCondition(condition, row: row) {
                                 pageRows.append(row)
                             }
                         }
@@ -1160,7 +1455,7 @@ public actor QueryExecutor: Sendable {
                             }
                             record = try await storageEngine.reassembleOverflowRecord(record)
                         }
-                        if let row = Row.fromBytes(record.data) {
+                        if let row = Row.fromBytesAuto(record.data, schema: schema) {
                             rows.append(row)
                             if rows.count >= limit { return rows }
                         }
@@ -1171,7 +1466,7 @@ public actor QueryExecutor: Sendable {
 
             return try await withThrowingTaskGroup(of: (Int, [Row]).self) { group in
                 for (index, pageID) in pageIDs.enumerated() {
-                    group.addTask { [storageEngine] in
+                    group.addTask { [storageEngine, schema] in
                         let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
                         var pageRows: [Row] = []
                         for var record in page.records {
@@ -1183,7 +1478,7 @@ public actor QueryExecutor: Sendable {
                                 }
                                 record = try await storageEngine.reassembleOverflowRecord(record)
                             }
-                            if let row = Row.fromBytes(record.data) {
+                            if let row = Row.fromBytesAuto(record.data, schema: schema) {
                                 pageRows.append(row)
                             }
                         }
