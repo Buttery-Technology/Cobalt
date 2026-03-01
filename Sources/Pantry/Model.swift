@@ -7,9 +7,17 @@ import PantryCore
 /// Models are value types (structs) with a string ID and Codable properties.
 public protocol PantryModel: Codable, Sendable {
     /// The database table name for this model type.
+    /// Defaults to the lowercased type name + "s" (e.g., `User` → `"users"`).
     static var tableName: String { get }
     /// The unique identifier for this model instance.
     var id: String { get set }
+}
+
+extension PantryModel {
+    /// Default table name: lowercased type name + "s" (e.g., `User` → `"users"`).
+    public static var tableName: String {
+        String(describing: Self.self).lowercased() + "s"
+    }
 }
 
 // MARK: - Column (Type-Safe Column Reference)
