@@ -653,6 +653,9 @@ struct Widget: PantryModel, Equatable {
 // MARK: - Convenience Init Tests
 
 @Test func testConvenienceInit() async throws {
+    let dbPath = PantryConfiguration.databasePath(name: "default")
+    try? FileManager.default.removeItem(atPath: dbPath)
+
     let db = try await PantryDatabase()
 
     try await db.save(User(name: "Alice", age: 30))
@@ -661,6 +664,7 @@ struct Widget: PantryModel, Equatable {
     #expect(found[0].name == "Alice")
 
     try await db.close()
+    try? FileManager.default.removeItem(atPath: dbPath)
 }
 
 @Test func testNamedInit() async throws {
