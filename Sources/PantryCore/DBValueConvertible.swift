@@ -29,7 +29,9 @@ extension Int: DBValueConvertible {
     public static func fromDBValue(_ value: DBValue) -> Int? {
         switch value {
         case .integer(let v): return Int(exactly: v)
-        case .double(let v) where v == v.rounded(.towardZero): return Int(exactly: Int64(v))
+        case .double(let v):
+            guard let i64 = Int64(exactly: v) else { return nil }
+            return Int(exactly: i64)
         default: return nil
         }
     }
@@ -43,7 +45,7 @@ extension Int64: DBValueConvertible {
     public static func fromDBValue(_ value: DBValue) -> Int64? {
         switch value {
         case .integer(let v): return v
-        case .double(let v) where v == v.rounded(.towardZero): return Int64(exactly: v)
+        case .double(let v): return Int64(exactly: v)
         default: return nil
         }
     }
@@ -57,7 +59,9 @@ extension Int32: DBValueConvertible {
     public static func fromDBValue(_ value: DBValue) -> Int32? {
         switch value {
         case .integer(let v): return Int32(exactly: v)
-        case .double(let v) where v == v.rounded(.towardZero): return Int32(exactly: Int64(v))
+        case .double(let v):
+            guard let i64 = Int64(exactly: v) else { return nil }
+            return Int32(exactly: i64)
         default: return nil
         }
     }
@@ -71,7 +75,9 @@ extension Int16: DBValueConvertible {
     public static func fromDBValue(_ value: DBValue) -> Int16? {
         switch value {
         case .integer(let v): return Int16(exactly: v)
-        case .double(let v) where v == v.rounded(.towardZero): return Int16(exactly: Int64(v))
+        case .double(let v):
+            guard let i64 = Int64(exactly: v) else { return nil }
+            return Int16(exactly: i64)
         default: return nil
         }
     }
@@ -85,7 +91,9 @@ extension Int8: DBValueConvertible {
     public static func fromDBValue(_ value: DBValue) -> Int8? {
         switch value {
         case .integer(let v): return Int8(exactly: v)
-        case .double(let v) where v == v.rounded(.towardZero): return Int8(exactly: Int64(v))
+        case .double(let v):
+            guard let i64 = Int64(exactly: v) else { return nil }
+            return Int8(exactly: i64)
         default: return nil
         }
     }
