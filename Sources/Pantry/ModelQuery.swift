@@ -121,6 +121,11 @@ public struct ModelQuery<M: PantryModel>: Sendable {
         return try await database.delete(from: M.tableName, where: condition)
     }
 
+    /// Returns true if any rows match the query.
+    public func exists() async throws -> Bool {
+        try await count() > 0
+    }
+
     // MARK: - Internal
 
     private func combinedCondition() -> WhereCondition? {
@@ -175,6 +180,13 @@ extension PantryDatabase {
     public func delete<M: PantryModel>(_ model: M) async throws -> Int {
         guard await tableExists(M.tableName) else { return 0 }
         return try await delete(from: M.tableName, where: .equals(column: "id", value: .string(model.id)))
+    }
+
+    /// Save multiple model instances at once (upsert each).
+    public func saveAll<M: PantryModel>(_ models: [M]) async throws {
+        for model in models {
+            try await save(model)
+        }
     }
 
     /// Create a type-safe query builder for a model type.

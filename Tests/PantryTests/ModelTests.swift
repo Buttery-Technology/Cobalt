@@ -552,6 +552,73 @@ private func makeDB() async throws -> PantryDatabase {
     try await db.close()
 }
 
+// MARK: - Default Table Name
+
+struct Widget: PantryModel, Equatable {
+    var id: String = UUID().uuidString
+    var label: String
+    // No explicit tableName — should default to "widgets"
+}
+
+@Test func testDefaultTableName() async throws {
+    #expect(Widget.tableName == "widgets")
+
+    let db = try await makeDB()
+    try await db.save(Widget(label: "Gear"))
+
+    let found = try await db.findAll(Widget.self)
+    #expect(found.count == 1)
+    #expect(found[0].label == "Gear")
+
+    // Verify the actual table name used
+    let exists = await db.tableExists("widgets")
+    #expect(exists)
+
+    try await db.close()
+}
+
+// MARK: - Batch Save
+
+@Test func testSaveAll() async throws {
+    let db = try await makeDB()
+
+    let users = [
+        User(name: "Alice", age: 30),
+        User(name: "Bob", age: 25),
+        User(name: "Charlie", age: 35),
+    ]
+    try await db.saveAll(users)
+
+    let all = try await db.findAll(User.self)
+    #expect(all.count == 3)
+
+    let names = Set(all.map { $0.name })
+    #expect(names == Set(["Alice", "Bob", "Charlie"]))
+
+    try await db.close()
+}
+
+// MARK: - Exists
+
+@Test func testQueryExists() async throws {
+    let db = try await makeDB()
+
+    try await db.save(User(name: "Alice", age: 30))
+    try await db.save(User(name: "Bob", age: 25))
+
+    let hasAlice = try await db.query(User.self)
+        .filter(User._name == "Alice")
+        .exists()
+    #expect(hasAlice)
+
+    let hasNoOne = try await db.query(User.self)
+        .filter(User._age == 999)
+        .exists()
+    #expect(!hasNoOne)
+
+    try await db.close()
+}
+
 // MARK: - Nil Optional First Save Regression
 
 @Test func testNilOptionalFirstSaveThenNonNil() async throws {
