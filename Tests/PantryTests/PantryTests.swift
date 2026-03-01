@@ -2088,6 +2088,28 @@ import Foundation
     try await db.close()
 }
 
+// MARK: - Exists Shorthand
+
+@Test func testExistsShorthand() async throws {
+    let path = NSTemporaryDirectory() + "pantry_exists_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    try await db.createTable(PantryTableSchema(name: "t", columns: [
+        PantryColumn(name: "id", type: .integer, isPrimaryKey: true, isNullable: false),
+        PantryColumn(name: "name", type: .string),
+    ]))
+    try await db.insert(into: "t", values: ["id": .integer(1), "name": .string("Alice")])
+
+    let found = try await db.exists(in: "t", where: .column("name", equals: "Alice"))
+    #expect(found == true)
+
+    let missing = try await db.exists(in: "t", where: .column("name", equals: "Nobody"))
+    #expect(missing == false)
+
+    try await db.close()
+}
+
 // MARK: - Batch Insert
 
 @Test func testBatchInsert() async throws {
