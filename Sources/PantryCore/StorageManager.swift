@@ -39,7 +39,7 @@ public actor StorageManager: Sendable {
         return fh
     }
 
-    /// Write a page to disk, encrypting if configured
+    /// Write a page to disk, encrypting if configured (does NOT fsync — call sync() at durability points)
     public func writePage(_ page: inout DatabasePage) throws {
         let fh = try requireHandle()
         try page.saveRecords()
@@ -55,7 +55,6 @@ public actor StorageManager: Sendable {
 
         try fh.seek(toOffset: offset)
         try fh.write(contentsOf: dataToWrite)
-        try fh.synchronize()
     }
 
     /// Read a page from disk, decrypting if configured
@@ -114,9 +113,13 @@ public actor StorageManager: Sendable {
         }
 
         try fh.write(contentsOf: dataToWrite)
-        try fh.synchronize()
 
         return page
+    }
+
+    /// Flush pending writes to disk. Call at durability points: WAL commit, checkpoint, close.
+    public func sync() throws {
+        try requireHandle().synchronize()
     }
 
     /// Get total number of pages in the file

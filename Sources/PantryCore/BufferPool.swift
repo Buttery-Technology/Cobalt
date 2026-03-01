@@ -100,6 +100,13 @@ public actor BufferPoolManager: Sendable {
         }
     }
 
+    /// Evict a specific page from cache (used after rollback to discard stale data)
+    public func evictPage(pageID: Int) {
+        pageCache.removeValue(forKey: pageID)
+        accessOrder.removeValue(forKey: pageID)
+        dirtyPages.remove(pageID)
+    }
+
     // MARK: - Flushing
 
     public func flushAllDirtyPages() async throws {
@@ -112,6 +119,8 @@ public actor BufferPoolManager: Sendable {
             // Always clear dirty flag — if page is not in cache, it's an orphaned entry
             dirtyPages.remove(pageID)
         }
+        // Single fsync after all pages are written
+        try await storageManager.sync()
     }
 
     public func flushPage(pageID: Int) async throws {

@@ -8,6 +8,7 @@ public enum DBValue: Codable, Comparable, Hashable, Sendable {
     case string(String)
     case blob(Data)
     case boolean(Bool)
+    case compound([DBValue])
 
     public static func < (lhs: DBValue, rhs: DBValue) -> Bool {
         switch (lhs, rhs) {
@@ -36,6 +37,12 @@ public enum DBValue: Codable, Comparable, Hashable, Sendable {
             return !a && b
         case let (.blob(a), .blob(b)):
             return a.lexicographicallyPrecedes(b)
+        case let (.compound(a), .compound(b)):
+            for (va, vb) in zip(a, b) {
+                if va < vb { return true }
+                if vb < va { return false }
+            }
+            return a.count < b.count
         default:
             return lhs.typeOrder < rhs.typeOrder
         }
@@ -54,6 +61,7 @@ public enum DBValue: Codable, Comparable, Hashable, Sendable {
         case let (.string(a), .string(b)): return a == b
         case let (.boolean(a), .boolean(b)): return a == b
         case let (.blob(a), .blob(b)): return a == b
+        case let (.compound(a), .compound(b)): return a == b
         default: return false
         }
     }
@@ -78,6 +86,9 @@ public enum DBValue: Codable, Comparable, Hashable, Sendable {
         case .blob(let v):
             hasher.combine(5)
             hasher.combine(v)
+        case .compound(let values):
+            hasher.combine(6)
+            for v in values { v.hash(into: &hasher) }
         }
     }
 
@@ -89,6 +100,7 @@ public enum DBValue: Codable, Comparable, Hashable, Sendable {
         case .double: return 3
         case .string: return 4
         case .blob: return 5
+        case .compound: return 6
         }
     }
 }

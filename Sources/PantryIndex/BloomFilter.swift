@@ -2,8 +2,9 @@ import Foundation
 
 /// Probabilistic data structure for fast negative lookups.
 /// A negative result is definitive; a positive result may be a false positive.
+/// Uses a packed UInt64 bitset for ~8x memory reduction over [Bool].
 public struct BloomFilter: Sendable, Codable {
-    private var bitArray: [Bool]
+    private var bitArray: [UInt64]
     private let hashFunctions: Int
     private let size: Int
 
@@ -16,14 +17,15 @@ public struct BloomFilter: Sendable, Codable {
         let m = -Double(n) * log(falsePositiveRate) / pow(log(2), 2)
         self.size = max(Int(ceil(m)), 1)
         self.hashFunctions = max(Int(ceil(Double(size) / Double(n) * log(2))), 1)
-        self.bitArray = Array(repeating: false, count: size)
+        // Allocate packed bit array: ceil(size / 64) words
+        self.bitArray = Array(repeating: 0, count: (size + 63) / 64)
     }
 
     /// Add an element to the filter
     public mutating func add(_ element: String) {
         for i in 0..<hashFunctions {
-            let hash = getHash(element, seed: i) % size
-            bitArray[hash] = true
+            let bit = getHash(element, seed: i) % size
+            bitArray[bit / 64] |= (1 << (bit % 64))
         }
     }
 
@@ -31,8 +33,8 @@ public struct BloomFilter: Sendable, Codable {
     /// Returns false → definitely not present. Returns true → possibly present.
     public func contains(_ element: String) -> Bool {
         for i in 0..<hashFunctions {
-            let hash = getHash(element, seed: i) % size
-            if !bitArray[hash] {
+            let bit = getHash(element, seed: i) % size
+            if bitArray[bit / 64] & (1 << (bit % 64)) == 0 {
                 return false
             }
         }

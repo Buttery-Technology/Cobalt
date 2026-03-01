@@ -9,6 +9,7 @@ public actor PantryDatabase: Sendable {
     private let queryExecutor: QueryExecutor
     private let indexManager: IndexManager
     private let configuration: PantryConfiguration
+    private var currentTransactionContext: TransactionContext?
 
     /// Create or open a Pantry database
     public init(configuration: PantryConfiguration) async throws {
@@ -42,6 +43,12 @@ public actor PantryDatabase: Sendable {
 
         // Initialize query executor
         self.queryExecutor = QueryExecutor(storageEngine: engine, indexManager: im)
+
+        // Restore persisted indexes
+        if let indexData = try await engine.loadIndexRegistry() {
+            let entries = try JSONDecoder().decode([IndexRegistryEntry].self, from: indexData)
+            try await im.loadIndexRegistry(entries: entries)
+        }
     }
 
     // MARK: - Tables
@@ -75,34 +82,71 @@ public actor PantryDatabase: Sendable {
         }
     }
 
+    public func createCompoundIndex(table: String, columns: [String]) async throws {
+        let columnIndex = try await indexManager.createCompoundIndex(tableName: table, columns: columns)
+
+        // Populate the index from existing data
+        let rows = try await storageEngine.scanTable(table)
+        for (_, row) in rows {
+            let keyValues = columns.map { row.values[$0] ?? .null }
+            let compoundKey = DBValue.compound(keyValues)
+            try await columnIndex.insert(key: compoundKey, row: row)
+        }
+    }
+
     // MARK: - Queries
 
     public func select(from table: String, columns: [String]? = nil, where condition: WhereCondition? = nil) async throws -> [Row] {
-        try await queryExecutor.executeSelect(from: table, columns: columns, where: condition)
+        try await queryExecutor.executeSelect(from: table, columns: columns, where: condition, transactionContext: currentTransactionContext)
     }
 
     public func insert(into table: String, values: [String: DBValue]) async throws {
         let row = Row(values: values)
-        try await queryExecutor.executeInsert(into: table, row: row)
+        try await queryExecutor.executeInsert(into: table, row: row, transactionContext: currentTransactionContext)
     }
 
     public func update(table: String, set values: [String: DBValue], where condition: WhereCondition? = nil) async throws -> Int {
-        try await queryExecutor.executeUpdate(table: table, set: values, where: condition)
+        try await queryExecutor.executeUpdate(table: table, set: values, where: condition, transactionContext: currentTransactionContext)
     }
 
     public func delete(from table: String, where condition: WhereCondition? = nil) async throws -> Int {
-        try await queryExecutor.executeDelete(from: table, where: condition)
+        try await queryExecutor.executeDelete(from: table, where: condition, transactionContext: currentTransactionContext)
+    }
+
+    public func aggregate(from table: String, _ function: AggregateFunction, where condition: WhereCondition? = nil) async throws -> DBValue {
+        try await queryExecutor.executeAggregate(from: table, function, where: condition, transactionContext: currentTransactionContext)
+    }
+
+    /// Stream rows from a table, yielding one row at a time for memory-efficient processing.
+    public func stream(from table: String) async throws -> AsyncStream<Row> {
+        let rawStream = try await storageEngine.scanTableStream(table)
+        return AsyncStream { continuation in
+            Task {
+                for await (_, row) in rawStream {
+                    continuation.yield(row)
+                }
+                continuation.finish()
+            }
+        }
     }
 
     // MARK: - Transactions
 
     public func transaction<T: Sendable>(isolationLevel: IsolationLevel? = nil, body: @Sendable (PantryDatabase) async throws -> T) async throws -> T {
+        // Support nested transaction calls — if already in a transaction, just execute the body
+        if currentTransactionContext != nil {
+            return try await body(self)
+        }
+
         let txContext = try await storageEngine.beginTransaction(isolationLevel: isolationLevel ?? configuration.isolationLevel)
+        currentTransactionContext = txContext
         do {
             let result = try await body(self)
+            currentTransactionContext = nil
             try await storageEngine.commitTransaction(txContext)
             return result
         } catch {
+            currentTransactionContext = nil
             do {
                 try await storageEngine.rollbackTransaction(txContext)
             } catch {
@@ -115,6 +159,12 @@ public actor PantryDatabase: Sendable {
     // MARK: - Lifecycle
 
     public func close() async throws {
+        // Persist index registry before closing
+        let entries = try await indexManager.saveIndexRegistry()
+        if !entries.isEmpty {
+            let data = try JSONEncoder().encode(entries)
+            try await storageEngine.saveIndexRegistry(data)
+        }
         try await storageEngine.close()
     }
 

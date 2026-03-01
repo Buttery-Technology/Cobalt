@@ -51,6 +51,7 @@ internal struct DBValueEncoder {
         case .blob: return .blob
         case .boolean: return .boolean
         case .null: return .string // Default nullable columns to string
+        case .compound: return .blob // Compound values stored as blob
         }
     }
 

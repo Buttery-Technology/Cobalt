@@ -18,6 +18,16 @@ public actor StorageEngine: Sendable {
     /// Optional index hook wired by PantryIndex
     public var indexHook: (any IndexHook)?
 
+    /// Head of the free page list (0 = empty)
+    private var freeListHead: Int = 0
+
+    /// Page ID storing the index registry (0 = not allocated)
+    private var indexRegistryPageID: Int = 0
+
+    /// Free space map: table name → set of page IDs known to have free space.
+    /// Lazily populated as pages are accessed; provides O(1) insert targeting.
+    private var freeSpaceMap: [String: Set<Int>] = [:]
+
     public init(databasePath: String, bufferPoolCapacity: Int = 1000, encryptionProvider: EncryptionProvider? = nil) async throws {
         let sm = try StorageManager(databasePath: databasePath, encryptionProvider: encryptionProvider)
         self.storageManager = sm
@@ -35,6 +45,18 @@ public actor StorageEngine: Sendable {
                     await bufferPoolManager.clearDirtyFlag(pageID: pageID)
                 }
             }
+        }
+
+        // Wire page invalidator so rollback evicts stale pages from buffer pool
+        await transactionManager.setPageInvalidator { [bufferPoolManager] modifiedPages in
+            for pageID in modifiedPages {
+                await bufferPoolManager.evictPage(pageID: pageID)
+            }
+        }
+
+        // Wire all-page flusher for checkpoint
+        await transactionManager.setAllPageFlusher { [bufferPoolManager] in
+            try await bufferPoolManager.flushAllDirtyPages()
         }
 
         // Ensure system pages exist (page 0 = DB metadata, page 1 = table registry)
@@ -56,6 +78,14 @@ public actor StorageEngine: Sendable {
 
         // Load table registry
         try await tableRegistry.load()
+
+        // Load free list head and index registry page ID from page 0 metadata record
+        let metaPage = try await sm.readPage(pageID: PantryConstants.SYSTEM_PAGE_DB_METADATA)
+        if let metaRecord = metaPage.records.first,
+           let meta = try? JSONDecoder().decode(DBMetadata.self, from: metaRecord.data) {
+            freeListHead = meta.freeListHead
+            indexRegistryPageID = meta.indexRegistryPageID
+        }
     }
 
     // MARK: - Page Operations
@@ -81,6 +111,18 @@ public actor StorageEngine: Sendable {
         if let txContext = transactionContext {
             await txContext.markModified(pageID: page.pageID)
             await txContext.recordAccess(pageID: page.pageID, isWrite: true)
+
+            // Capture before-image for WAL rollback (only once per page per transaction)
+            let alreadyLogged = await txContext.beforeImagePages.contains(page.pageID)
+            if !alreadyLogged {
+                // Read the current on-disk version of this page
+                let totalPages = try await storageManager.totalPageCount()
+                if page.pageID < totalPages {
+                    let beforePage = try await storageManager.readPage(pageID: page.pageID)
+                    try await logManager.logPageBeforeImage(txID: txContext.transactionID, page: beforePage)
+                }
+                await txContext.recordBeforeImage(pageID: page.pageID)
+            }
         }
 
         // Serialize before caching so the data buffer is current
@@ -89,6 +131,11 @@ public actor StorageEngine: Sendable {
 
         await bufferPoolManager.updatePage(serializedPage)
         await bufferPoolManager.markDirty(pageID: page.pageID)
+
+        if let txContext = transactionContext {
+            // Log after-image
+            try await logManager.logPageAfterImage(txID: txContext.transactionID, page: serializedPage)
+        }
 
         if transactionContext == nil {
             try await storageManager.writePage(&serializedPage)
@@ -181,6 +228,9 @@ public actor StorageEngine: Sendable {
 
         try await savePage(page, transactionContext: transactionContext)
 
+        // Page now has more free space — add back to free space map
+        freeSpaceMap[tableName, default: []].insert(pageID)
+
         if let row = deletedRow {
             try await indexHook?.removeFromIndexes(id: id, row: row, tableName: tableName)
         }
@@ -223,6 +273,41 @@ public actor StorageEngine: Sendable {
         return results
     }
 
+    /// Stream records from a table page-at-a-time, yielding (Record, Row) pairs.
+    public func scanTableStream(_ tableName: String) async throws -> AsyncStream<(Record, Row)> {
+        guard let tableInfo = await tableRegistry.getTableInfo(name: tableName) else {
+            throw PantryError.tableNotFound(name: tableName)
+        }
+
+        let firstPageID = tableInfo.firstPageID
+        let engine = self
+
+        return AsyncStream { continuation in
+            Task {
+                var currentPageID = firstPageID
+                var visited: Set<Int> = []
+                let decoder = JSONDecoder()
+                decoder.nonConformingFloatDecodingStrategy = .convertFromString(positiveInfinity: "+inf", negativeInfinity: "-inf", nan: "nan")
+
+                while currentPageID != 0 {
+                    guard visited.insert(currentPageID).inserted else { break }
+                    do {
+                        let page = try await engine.getPage(pageID: currentPageID)
+                        for record in page.records {
+                            if let row = try? decoder.decode(Row.self, from: record.data) {
+                                continuation.yield((record, row))
+                            }
+                        }
+                        currentPageID = page.nextPageID
+                    } catch {
+                        break
+                    }
+                }
+                continuation.finish()
+            }
+        }
+    }
+
     /// Check if a table exists
     public func tableExists(_ name: String) async -> Bool {
         await tableRegistry.getTableInfo(name: name) != nil
@@ -249,22 +334,30 @@ public actor StorageEngine: Sendable {
             throw PantryError.tableNotFound(name: name)
         }
 
-        // Remove from registry first so a crash won't leave a dangling reference
-        // to zeroed pages (orphaned pages are a space leak, not data corruption)
+        // Remove from registry and free space map first
         await tableRegistry.removeTable(name: name)
+        freeSpaceMap.removeValue(forKey: name)
         try await tableRegistry.save()
 
-        // Then clear the data pages
+        // Chain freed data pages into the free list
         var currentPageID = tableInfo.firstPageID
         var visited: Set<Int> = []
         while currentPageID != 0 {
             guard visited.insert(currentPageID).inserted else { break }
             let page = try await getPage(pageID: currentPageID)
-            let nextID = page.nextPageID
-            let clearedPage = DatabasePage(pageID: currentPageID)
-            try await savePage(clearedPage)
-            currentPageID = nextID
+            let nextDataPageID = page.nextPageID
+
+            // Push this page onto the free list
+            var freedPage = DatabasePage(pageID: currentPageID)
+            freedPage.nextPageID = freeListHead
+            try await savePage(freedPage)
+            freeListHead = currentPageID
+
+            currentPageID = nextDataPageID
         }
+
+        // Persist the updated free list head to page 0
+        try await saveFreeListHead()
     }
 
     // MARK: - Transaction Passthrough
@@ -284,6 +377,22 @@ public actor StorageEngine: Sendable {
     // MARK: - Helpers
 
     private func findTargetPageForInsert(tableInfo: TableInfo, recordSize: Int) async throws -> Int {
+        let requiredSpace = recordSize + PantryConstants.SLOT_SIZE
+
+        // O(1) path: check free space map first
+        if var candidates = freeSpaceMap[tableInfo.name] {
+            while let pageID = candidates.first {
+                let page = try await getPage(pageID: pageID)
+                if page.getFreeSpace() > requiredSpace {
+                    return pageID
+                }
+                // Page is full — remove from map
+                candidates.remove(pageID)
+                freeSpaceMap[tableInfo.name]?.remove(pageID)
+            }
+        }
+
+        // Fallback: walk the page chain (populates free space map for future calls)
         var currentPageID = tableInfo.firstPageID
         var visited: Set<Int> = []
 
@@ -292,7 +401,9 @@ public actor StorageEngine: Sendable {
                 throw PantryError.corruptPage(pageID: currentPageID)
             }
             let page = try await getPage(pageID: currentPageID)
-            if page.getFreeSpace() > recordSize + PantryConstants.SLOT_SIZE {
+            if page.getFreeSpace() > requiredSpace {
+                // Add to free space map for future lookups
+                freeSpaceMap[tableInfo.name, default: []].insert(currentPageID)
                 return currentPageID
             }
             currentPageID = page.nextPageID
@@ -302,11 +413,25 @@ public actor StorageEngine: Sendable {
         var info = tableInfo
         let newPage = try await createNewPageForTable(tableInfo: &info)
         await tableRegistry.updateTableInfo(info)
+        // New page has full free space
+        freeSpaceMap[tableInfo.name, default: []].insert(newPage.pageID)
         return newPage.pageID
     }
 
     private func createNewPageForTable(tableInfo: inout TableInfo) async throws -> DatabasePage {
-        let newPage = try await storageManager.createNewPage()
+        // Pop from free list if available, otherwise extend file
+        let newPage: DatabasePage
+        if freeListHead != 0 {
+            let freePage = try await storageManager.readPage(pageID: freeListHead)
+            freeListHead = freePage.nextPageID
+            var reusedPage = DatabasePage(pageID: freePage.pageID)
+            try reusedPage.saveRecords()
+            await bufferPoolManager.updatePage(reusedPage)
+            try await saveFreeListHead()
+            newPage = reusedPage
+        } else {
+            newPage = try await storageManager.createNewPage()
+        }
         await bufferPoolManager.cachePage(newPage)
 
         if tableInfo.firstPageID == 0 {
@@ -377,6 +502,100 @@ public actor StorageEngine: Sendable {
         throw PantryError.recordNotFound(id: id)
     }
 
+    // MARK: - Index Registry Persistence
+
+    /// Load index registry entries from the dedicated page chain
+    public func loadIndexRegistry() async throws -> Data? {
+        guard indexRegistryPageID != 0 else { return nil }
+        // Follow the page chain to collect all chunks
+        var allData = Data()
+        var currentPageID = indexRegistryPageID
+        var visited: Set<Int> = []
+        while currentPageID != 0 {
+            guard visited.insert(currentPageID).inserted else { break }
+            let page = try await storageManager.readPage(pageID: currentPageID)
+            guard page.pageFlags.contains(.system) else { break }
+            if let record = page.records.first {
+                allData.append(record.data)
+            }
+            currentPageID = page.nextPageID
+        }
+        return allData.isEmpty ? nil : allData
+    }
+
+    /// Save index registry entries across a chain of dedicated pages
+    public func saveIndexRegistry(_ data: Data) async throws {
+        let maxRecordDataSize = PantryConstants.PAGE_SIZE - PantryConstants.PAGE_HEADER_SIZE - PantryConstants.SLOT_SIZE - 12 - 1 // 12 = record header (id + length), -1 for strict >= check in addRecord
+
+        // Split data into chunks that fit in one page
+        var chunks: [Data] = []
+        var offset = 0
+        while offset < data.count {
+            let end = min(offset + maxRecordDataSize, data.count)
+            chunks.append(data.subdata(in: offset..<end))
+            offset = end
+        }
+        if chunks.isEmpty {
+            chunks.append(Data())
+        }
+
+        // Allocate or reuse the first page
+        if indexRegistryPageID == 0 {
+            let firstPage = try await storageManager.createNewPage()
+            indexRegistryPageID = firstPage.pageID
+            try await saveDBMetadata()
+        }
+
+        var currentPageID = indexRegistryPageID
+        for (i, chunk) in chunks.enumerated() {
+            var page = DatabasePage(pageID: currentPageID)
+            page.pageFlags = [.system]
+            let record = Record(id: UInt64(i + 1), data: chunk)
+            guard page.addRecord(record) else {
+                throw PantryError.schemaSerializationError
+            }
+
+            if i < chunks.count - 1 {
+                // Need a next page
+                let nextPage = try await storageManager.createNewPage()
+                page.nextPageID = nextPage.pageID
+                currentPageID = nextPage.pageID
+            } else {
+                page.nextPageID = 0
+            }
+
+            try await storageManager.writePage(&page)
+            await bufferPoolManager.updatePage(page)
+        }
+    }
+
+    // MARK: - DB Metadata Persistence (page 0 record)
+
+    /// Save freeListHead and indexRegistryPageID as a record on page 0
+    private func saveDBMetadata() async throws {
+        let meta = DBMetadata(freeListHead: freeListHead, indexRegistryPageID: indexRegistryPageID)
+        let data = try JSONEncoder().encode(meta)
+        let record = Record(id: 1, data: data)
+
+        var metaPage = try await storageManager.readPage(pageID: PantryConstants.SYSTEM_PAGE_DB_METADATA)
+        metaPage.records = [record]
+        metaPage.recordCount = 1
+        metaPage.freeSpaceOffset = PantryConstants.PAGE_SIZE - record.serialize().count
+        try await storageManager.writePage(&metaPage)
+        await bufferPoolManager.updatePage(metaPage)
+    }
+
+    private func saveFreeListHead() async throws {
+        try await saveDBMetadata()
+    }
+
+    // MARK: - Checkpoint
+
+    /// Flush all dirty pages and truncate the WAL
+    public func checkpoint() async throws {
+        try await transactionManager.createCheckpoint()
+    }
+
     // MARK: - Lifecycle
 
     public func close() async throws {
@@ -384,6 +603,8 @@ public actor StorageEngine: Sendable {
 
         do { try await bufferPoolManager.flushAllDirtyPages() } catch { if firstError == nil { firstError = error } }
         do { try await tableRegistry.save() } catch { if firstError == nil { firstError = error } }
+        // Checkpoint WAL (flush + truncate) — ignore failure if active txns exist
+        do { try await transactionManager.createCheckpoint() } catch { /* checkpoint is best-effort on close */ }
         do { try await logManager.close() } catch { if firstError == nil { firstError = error } }
         do { try await storageManager.close() } catch { if firstError == nil { firstError = error } }
 
@@ -395,9 +616,17 @@ public actor StorageEngine: Sendable {
     }
 }
 
-// Extension on TransactionManager to wire the page flusher
+// Extension on TransactionManager to wire closures
 extension TransactionManager {
     public func setPageFlusher(_ flusher: @escaping @Sendable (Set<Int>) async throws -> Void) {
         self.pageFlusher = flusher
+    }
+
+    public func setPageInvalidator(_ invalidator: @escaping @Sendable (Set<Int>) async -> Void) {
+        self.pageInvalidator = invalidator
+    }
+
+    public func setAllPageFlusher(_ flusher: @escaping @Sendable () async throws -> Void) {
+        self.allPageFlusher = flusher
     }
 }

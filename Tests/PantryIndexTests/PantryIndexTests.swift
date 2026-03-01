@@ -105,7 +105,7 @@ import Foundation
     let bp = BufferPoolManager(capacity: 100, storageManager: sm)
     let nodeStore = PageBackedNodeStore(bufferPool: bp, storageManager: sm)
     let btree = BTree(order: 64, nodeStore: nodeStore)
-    let idx = ColumnIndex(tableName: "users", columnName: "age", btree: btree)
+    let idx = ColumnIndex(tableName: "users", columnName: "age", btree: btree, nodeStore: nodeStore)
 
     try await idx.insert(key: .integer(25), row: Row(values: ["name": .string("Alice"), "age": .integer(25)]))
     try await idx.insert(key: .integer(30), row: Row(values: ["name": .string("Bob"), "age": .integer(30)]))
@@ -433,7 +433,7 @@ import Foundation
     let bp = BufferPoolManager(capacity: 100, storageManager: sm)
     let nodeStore = PageBackedNodeStore(bufferPool: bp, storageManager: sm)
     let btree = BTree(order: 16, nodeStore: nodeStore)
-    let idx = ColumnIndex(tableName: "sales", columnName: "amount", btree: btree)
+    let idx = ColumnIndex(tableName: "sales", columnName: "amount", btree: btree, nodeStore: nodeStore)
 
     for i in 1...100 {
         try await idx.insert(

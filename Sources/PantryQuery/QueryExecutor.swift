@@ -2,6 +2,15 @@ import Foundation
 import PantryCore
 import PantryIndex
 
+/// Aggregate functions supported by the query executor.
+public enum AggregateFunction: Sendable {
+    case count(column: String?)
+    case sum(column: String)
+    case avg(column: String)
+    case min(column: String)
+    case max(column: String)
+}
+
 /// Executes SELECT, INSERT, UPDATE, DELETE queries against the storage engine.
 /// Uses IndexManager for index-accelerated lookups before falling back to table scan.
 public actor QueryExecutor: Sendable {
@@ -23,17 +32,17 @@ public actor QueryExecutor: Sendable {
 
     // MARK: - SELECT
 
-    public func executeSelect(from table: String, columns: [String]? = nil, where condition: WhereCondition? = nil) async throws -> [Row] {
+    public func executeSelect(from table: String, columns: [String]? = nil, where condition: WhereCondition? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {
         let rows: [Row]
 
         // Attempt index lookup before falling back to table scan
         if let condition = condition,
            let indexed = try await indexManager.attemptIndexLookup(tableName: table, condition: condition) {
-            // Index returned results; apply remaining in-memory filtering
-            rows = indexed.filter { evaluateCondition(condition, row: $0) }
+            // Index returned results; apply remaining in-memory filtering and strip __rid
+            rows = indexed.filter { evaluateCondition(condition, row: $0) }.map { stripRID($0) }
         } else {
             // Full table scan
-            let scanned = try await storageEngine.scanTable(table)
+            let scanned = try await storageEngine.scanTable(table, transactionContext: transactionContext)
             let allRows = scanned.map { $0.1 }
             rows = condition != nil ? allRows.filter { evaluateCondition(condition!, row: $0) } : allRows
         }
@@ -53,17 +62,40 @@ public actor QueryExecutor: Sendable {
 
     // MARK: - INSERT
 
-    public func executeInsert(into table: String, row: Row) async throws {
+    public func executeInsert(into table: String, row: Row, transactionContext: TransactionContext? = nil) async throws {
         let rowData = try encoder.encode(row)
         let recordID = generateRecordID()
         let record = Record(id: recordID, data: rowData)
-        try await storageEngine.insertRecord(record, tableName: table, row: row)
+        try await storageEngine.insertRecord(record, tableName: table, row: row, transactionContext: transactionContext)
     }
 
     // MARK: - UPDATE
 
-    public func executeUpdate(table: String, set values: [String: DBValue], where condition: WhereCondition?) async throws -> Int {
-        let scanned = try await storageEngine.scanTable(table)
+    public func executeUpdate(table: String, set values: [String: DBValue], where condition: WhereCondition?, transactionContext: TransactionContext? = nil) async throws -> Int {
+        // Try index-accelerated path when a condition with __rid-enabled index results is available
+        if let condition = condition,
+           let indexedRows = try await indexManager.attemptIndexLookup(tableName: table, condition: condition) {
+            var updatedCount = 0
+            for indexRow in indexedRows where evaluateCondition(condition, row: indexRow) {
+                guard case .integer(let ridSigned) = indexRow.values["__rid"] else { continue }
+                let recordId = UInt64(bitPattern: ridSigned)
+
+                var updatedValues = indexRow.values
+                updatedValues.removeValue(forKey: "__rid")
+                for (key, value) in values { updatedValues[key] = value }
+                let updatedRow = Row(values: updatedValues)
+
+                let rowData = try encoder.encode(updatedRow)
+                let newRecord = Record(id: recordId, data: rowData)
+                try await storageEngine.deleteRecord(id: recordId, tableName: table, transactionContext: transactionContext)
+                try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
+                updatedCount += 1
+            }
+            return updatedCount
+        }
+
+        // Fallback: full table scan
+        let scanned = try await storageEngine.scanTable(table, transactionContext: transactionContext)
         var updatedCount = 0
 
         for (record, row) in scanned {
@@ -74,11 +106,10 @@ public actor QueryExecutor: Sendable {
                 }
                 let updatedRow = Row(values: updatedValues)
 
-                // Encode first so a failure doesn't lose the old record
                 let rowData = try encoder.encode(updatedRow)
                 let newRecord = Record(id: record.id, data: rowData)
-                try await storageEngine.deleteRecord(id: record.id, tableName: table)
-                try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow)
+                try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
+                try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
                 updatedCount += 1
             }
         }
@@ -88,18 +119,99 @@ public actor QueryExecutor: Sendable {
 
     // MARK: - DELETE
 
-    public func executeDelete(from table: String, where condition: WhereCondition?) async throws -> Int {
-        let scanned = try await storageEngine.scanTable(table)
+    public func executeDelete(from table: String, where condition: WhereCondition?, transactionContext: TransactionContext? = nil) async throws -> Int {
+        // Try index-accelerated path
+        if let condition = condition,
+           let indexedRows = try await indexManager.attemptIndexLookup(tableName: table, condition: condition) {
+            var deletedCount = 0
+            for indexRow in indexedRows where evaluateCondition(condition, row: indexRow) {
+                guard case .integer(let ridSigned) = indexRow.values["__rid"] else { continue }
+                let recordId = UInt64(bitPattern: ridSigned)
+                try await storageEngine.deleteRecord(id: recordId, tableName: table, transactionContext: transactionContext)
+                deletedCount += 1
+            }
+            return deletedCount
+        }
+
+        // Fallback: full table scan
+        let scanned = try await storageEngine.scanTable(table, transactionContext: transactionContext)
         var deletedCount = 0
 
         for (record, row) in scanned {
             if condition == nil || evaluateCondition(condition!, row: row) {
-                try await storageEngine.deleteRecord(id: record.id, tableName: table)
+                try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
                 deletedCount += 1
             }
         }
 
         return deletedCount
+    }
+
+    // MARK: - AGGREGATE
+
+    public func executeAggregate(from table: String, _ function: AggregateFunction, where condition: WhereCondition? = nil, transactionContext: TransactionContext? = nil) async throws -> DBValue {
+        let rows = try await executeSelect(from: table, where: condition, transactionContext: transactionContext)
+
+        switch function {
+        case .count(let column):
+            if let column = column {
+                // Count non-null values in the column
+                let count = rows.filter { $0.values[column] != nil && $0.values[column] != .null }.count
+                return .integer(Int64(count))
+            }
+            return .integer(Int64(rows.count))
+
+        case .sum(let column):
+            var sum: Double = 0
+            var hasValue = false
+            for row in rows {
+                if let value = numericValue(row.values[column]) {
+                    sum += value
+                    hasValue = true
+                }
+            }
+            return hasValue ? .double(sum) : .null
+
+        case .avg(let column):
+            var sum: Double = 0
+            var count = 0
+            for row in rows {
+                if let value = numericValue(row.values[column]) {
+                    sum += value
+                    count += 1
+                }
+            }
+            return count > 0 ? .double(sum / Double(count)) : .null
+
+        case .min(let column):
+            var result: DBValue = .null
+            for row in rows {
+                guard let value = row.values[column], value != .null else { continue }
+                if result == .null || value < result {
+                    result = value
+                }
+            }
+            return result
+
+        case .max(let column):
+            var result: DBValue = .null
+            for row in rows {
+                guard let value = row.values[column], value != .null else { continue }
+                if result == .null || value > result {
+                    result = value
+                }
+            }
+            return result
+        }
+    }
+
+    private func numericValue(_ value: DBValue?) -> Double? {
+        guard let value = value else { return nil }
+        switch value {
+        case .integer(let v): return Double(v)
+        case .double(let v): return v
+        default: return nil
+        }
     }
 
     // MARK: - Condition Evaluation
@@ -149,6 +261,14 @@ public actor QueryExecutor: Sendable {
     }
 
     // MARK: - Helpers
+
+    /// Strip the internal __rid field from index-returned rows before returning to users
+    private func stripRID(_ row: Row) -> Row {
+        guard row.values["__rid"] != nil else { return row }
+        var values = row.values
+        values.removeValue(forKey: "__rid")
+        return Row(values: values)
+    }
 
     private var nextRecordID: UInt64 = UInt64.random(in: 1...(UInt64.max / 2))
 

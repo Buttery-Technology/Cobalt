@@ -27,15 +27,16 @@ extension PantryDatabase {
             throw PantryError.schemaSerializationError
         }
 
-        // Remove existing entry with same ID to prevent duplicates
-        _ = try await delete(from: collection, where: .equals(column: "_id", value: .string(actualID)))
-
-        try await insert(into: collection, values: [
-            "_id": .string(actualID),
-            "_data": .string(jsonString),
-            "_type": .string(String(describing: T.self)),
-            "_timestamp": .double(Date().timeIntervalSince1970)
-        ])
+        // Atomic upsert: delete + insert in a transaction
+        try await transaction { tx in
+            _ = try await tx.delete(from: collection, where: .equals(column: "_id", value: .string(actualID)))
+            try await tx.insert(into: collection, values: [
+                "_id": .string(actualID),
+                "_data": .string(jsonString),
+                "_type": .string(String(describing: T.self)),
+                "_timestamp": .double(Date().timeIntervalSince1970)
+            ])
+        }
 
         return actualID
     }

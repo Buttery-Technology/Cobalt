@@ -20,14 +20,15 @@ extension PantryDatabase {
     public func set(_ key: String, value: DBValue) async throws {
         try await ensureKVTable()
 
-        // Delete existing key if present
-        _ = try await delete(from: Self.kvTableName, where: .equals(column: "_key", value: .string(key)))
-
-        try await insert(into: Self.kvTableName, values: [
-            "_key": .string(key),
-            "_value": value,
-            "_timestamp": .double(Date().timeIntervalSince1970)
-        ])
+        // Atomic upsert: delete + insert in a transaction
+        try await transaction { tx in
+            _ = try await tx.delete(from: Self.kvTableName, where: .equals(column: "_key", value: .string(key)))
+            try await tx.insert(into: Self.kvTableName, values: [
+                "_key": .string(key),
+                "_value": value,
+                "_timestamp": .double(Date().timeIntervalSince1970)
+            ])
+        }
     }
 
     /// Get a value by key

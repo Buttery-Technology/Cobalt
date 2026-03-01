@@ -415,6 +415,23 @@ public actor WriteAheadLog: Sendable {
         return records
     }
 
+    // MARK: - Truncation
+
+    /// Truncate the WAL by replacing it with a header-only file
+    public func truncate() throws {
+        try logFileHandle?.synchronize()
+        try logFileHandle?.close()
+        logFileHandle = nil
+
+        // Replace file with empty WAL (header only)
+        try Data().write(to: URL(fileURLWithPath: logFilePath))
+        logFileHandle = try FileHandle(forUpdating: URL(fileURLWithPath: logFilePath))
+        currentLogPosition = 0
+        logCache.removeAll()
+        nextLSN = 1
+        try writeLogHeader()
+    }
+
     // MARK: - Cleanup
 
     public func close() throws {

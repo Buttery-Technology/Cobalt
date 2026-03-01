@@ -10,6 +10,12 @@ public actor TransactionManager: Sendable {
     /// Closure injected by StorageEngine to flush modified pages
     public var pageFlusher: (@Sendable (Set<Int>) async throws -> Void)?
 
+    /// Closure injected by StorageEngine to evict rolled-back pages from buffer pool
+    public var pageInvalidator: (@Sendable (Set<Int>) async -> Void)?
+
+    /// Closure injected by StorageEngine to flush all dirty pages (for checkpoint)
+    public var allPageFlusher: (@Sendable () async throws -> Void)?
+
     public init(logManager: WriteAheadLog, defaultIsolationLevel: IsolationLevel = .readCommitted) async throws {
         self.logManager = logManager
         self.defaultIsolationLevel = defaultIsolationLevel
@@ -69,6 +75,13 @@ public actor TransactionManager: Sendable {
 
         try await logManager.undoTransaction(txID: txContext.transactionID)
         try await logManager.logTransactionRollback(txID: txContext.transactionID, isolationLevel: txContext.isolationLevel)
+
+        // Evict rolled-back pages from buffer pool so subsequent reads get the restored on-disk version
+        let modifiedPages = await txContext.modifiedPages
+        if let invalidator = pageInvalidator {
+            await invalidator(modifiedPages)
+        }
+
         await txContext.rollback()
         activeTransactions.removeValue(forKey: txContext.transactionID)
     }
@@ -103,8 +116,19 @@ public actor TransactionManager: Sendable {
     // MARK: - Checkpointing
 
     public func createCheckpoint() async throws {
+        guard activeTransactions.isEmpty else {
+            throw PantryError.invalidTransactionState
+        }
+
+        // Flush all dirty pages to disk first
+        if let flusher = allPageFlusher {
+            try await flusher()
+        }
+
+        // Write checkpoint record then truncate WAL
         let count = UInt32(activeTransactions.count)
         try await logManager.createCheckpoint(activeTransactionCount: count)
+        try await logManager.truncate()
     }
 
     // MARK: - Deadlock Detection
