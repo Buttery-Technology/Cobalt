@@ -162,15 +162,28 @@ public actor QueryExecutor: Sendable {
             return .integer(Int64(rows.count))
 
         case .sum(let column):
-            var sum: Double = 0
+            var intSum: Int64 = 0
+            var doubleSum: Double = 0
+            var allIntegers = true
             var hasValue = false
             for row in rows {
-                if let value = numericValue(row.values[column]) {
-                    sum += value
+                guard let dbValue = row.values[column] else { continue }
+                switch dbValue {
+                case .integer(let v):
                     hasValue = true
+                    let (result, overflow) = intSum.addingReportingOverflow(v)
+                    if overflow { allIntegers = false }
+                    intSum = result
+                    doubleSum += Double(v)
+                case .double(let v):
+                    hasValue = true
+                    allIntegers = false
+                    doubleSum += v
+                default: break
                 }
             }
-            return hasValue ? .double(sum) : .null
+            if !hasValue { return .null }
+            return allIntegers ? .integer(intSum) : .double(doubleSum)
 
         case .avg(let column):
             var sum: Double = 0
