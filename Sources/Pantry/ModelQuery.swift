@@ -200,6 +200,9 @@ extension PantryDatabase {
             } catch PantryError.tableAlreadyExists {
                 // Race condition: another call created it
             }
+        } else {
+            // Table exists — check for schema drift and auto-migrate additive changes
+            try await autoMigrate(for: models[0])
         }
 
         // Batch all upserts in one transaction
