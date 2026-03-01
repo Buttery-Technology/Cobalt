@@ -432,7 +432,7 @@ private struct _KeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerPr
             guard let result = I(exactly: v) else { throw decodingError(type, key) }
             return result
         case .double(let v):
-            guard v == v.rounded(.towardZero), let result = I(exactly: Int64(v)) else {
+            guard let i64 = Int64(exactly: v), let result = I(exactly: i64) else {
                 throw decodingError(type, key)
             }
             return result
