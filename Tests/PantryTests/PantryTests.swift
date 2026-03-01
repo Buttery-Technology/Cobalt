@@ -1577,3 +1577,189 @@ import Foundation
         try await db.close()
     }
 }
+
+// MARK: - Schema Migration Tests
+
+@Test func testMigrationAddColumn() async throws {
+    let path = NSTemporaryDirectory() + "pantry_migrate_add_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+
+    // Create table with initial schema
+    let schema = PantryTableSchema(name: "items", columns: [
+        PantryColumn(name: "id", type: .string, isPrimaryKey: true, isNullable: false),
+        PantryColumn(name: "name", type: .string),
+    ])
+    try await db.createTable(schema)
+
+    // Insert some data
+    try await db.insert(into: "items", values: ["id": "1", "name": "Widget"])
+    try await db.insert(into: "items", values: ["id": "2", "name": "Gadget"])
+
+    // Migrate: add a new nullable column
+    try await db.migrate(table: "items", migrations: [
+        Migration(version: 1, operations: [
+            .addColumn(PantryColumn(name: "price", type: .double, isNullable: true))
+        ])
+    ])
+
+    // Verify schema was updated
+    let updatedSchema = await db.getTableSchema("items")!
+    #expect(updatedSchema.columns.count == 3)
+    #expect(updatedSchema.columns.map { $0.name }.contains("price"))
+
+    // Existing rows should still be queryable (price is null for them)
+    let rows = try await db.select(from: "items")
+    #expect(rows.count == 2)
+
+    // New inserts can use the new column
+    try await db.insert(into: "items", values: ["id": "3", "name": "Doohickey", "price": .double(9.99)])
+    let newItem = try await db.select(from: "items", where: .equals(column: "id", value: "3"))
+    #expect(newItem[0].values["price"] == .double(9.99))
+
+    try await db.close()
+}
+
+@Test func testMigrationAddColumnWithDefault() async throws {
+    let path = NSTemporaryDirectory() + "pantry_migrate_default_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+
+    let schema = PantryTableSchema(name: "settings", columns: [
+        PantryColumn(name: "id", type: .string, isPrimaryKey: true, isNullable: false),
+        PantryColumn(name: "key", type: .string),
+    ])
+    try await db.createTable(schema)
+    try await db.insert(into: "settings", values: ["id": "1", "key": "theme"])
+    try await db.insert(into: "settings", values: ["id": "2", "key": "lang"])
+
+    // Migrate: add column with default value — existing rows get backfilled
+    try await db.migrate(table: "settings", migrations: [
+        Migration(version: 1, operations: [
+            .addColumn(PantryColumn(name: "value", type: .string, isNullable: true, defaultValue: .string("default")))
+        ])
+    ])
+
+    let rows = try await db.select(from: "settings")
+    for row in rows {
+        #expect(row.values["value"] == .string("default"))
+    }
+
+    try await db.close()
+}
+
+@Test func testMigrationDropColumn() async throws {
+    let path = NSTemporaryDirectory() + "pantry_migrate_drop_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+
+    let schema = PantryTableSchema(name: "profiles", columns: [
+        PantryColumn(name: "id", type: .string, isPrimaryKey: true, isNullable: false),
+        PantryColumn(name: "name", type: .string),
+        PantryColumn(name: "legacy_field", type: .string),
+    ])
+    try await db.createTable(schema)
+    try await db.insert(into: "profiles", values: ["id": "1", "name": "Alice", "legacy_field": "old_data"])
+
+    // Drop the legacy column
+    try await db.migrate(table: "profiles", migrations: [
+        Migration(version: 1, operations: [
+            .dropColumn("legacy_field")
+        ])
+    ])
+
+    // Schema should no longer have the column
+    let updatedSchema = await db.getTableSchema("profiles")!
+    #expect(!updatedSchema.columns.map { $0.name }.contains("legacy_field"))
+
+    // Row should no longer have the column data
+    let rows = try await db.select(from: "profiles")
+    #expect(rows.count == 1)
+    #expect(rows[0].values["legacy_field"] == nil)
+    #expect(rows[0].values["name"] == "Alice")
+
+    try await db.close()
+}
+
+@Test func testMigrationRenameColumn() async throws {
+    let path = NSTemporaryDirectory() + "pantry_migrate_rename_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+
+    let schema = PantryTableSchema(name: "logs", columns: [
+        PantryColumn(name: "id", type: .string, isPrimaryKey: true, isNullable: false),
+        PantryColumn(name: "msg", type: .string),
+    ])
+    try await db.createTable(schema)
+    try await db.insert(into: "logs", values: ["id": "1", "msg": "hello world"])
+
+    // Rename msg -> message
+    try await db.migrate(table: "logs", migrations: [
+        Migration(version: 1, operations: [
+            .renameColumn(from: "msg", to: "message")
+        ])
+    ])
+
+    let updatedSchema = await db.getTableSchema("logs")!
+    #expect(updatedSchema.columns.map { $0.name }.contains("message"))
+    #expect(!updatedSchema.columns.map { $0.name }.contains("msg"))
+
+    let rows = try await db.select(from: "logs")
+    #expect(rows[0].values["message"] == "hello world")
+    #expect(rows[0].values["msg"] == nil)
+
+    try await db.close()
+}
+
+@Test func testAutoMigrationNewOptionalProperty() async throws {
+    let path = NSTemporaryDirectory() + "pantry_automigrate_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+
+    // First, create the table with the "old" schema (V1 model)
+    // Simulate saving a model that only has id, name, age
+    struct UserV1: PantryModel, Equatable {
+        static let tableName = "evolving_users"
+        var id: String = UUID().uuidString
+        var name: String
+        var age: Int
+    }
+
+    let oldUser = UserV1(name: "Alice", age: 30)
+    try await db.save(oldUser)
+
+    // Verify initial schema
+    let initialSchema = await db.getTableSchema("evolving_users")!
+    let initialNames = Set(initialSchema.columns.map { $0.name })
+    #expect(initialNames.contains("name"))
+    #expect(initialNames.contains("age"))
+    #expect(!initialNames.contains("bio"))
+
+    // Now save a V2 model with a new optional property
+    struct UserV2: PantryModel, Equatable {
+        static let tableName = "evolving_users"
+        var id: String = UUID().uuidString
+        var name: String
+        var age: Int
+        var bio: String?
+    }
+
+    let newUser = UserV2(name: "Bob", age: 25, bio: "Developer")
+    try await db.save(newUser)
+
+    // Schema should now include the new column
+    let updatedSchema = await db.getTableSchema("evolving_users")!
+    let updatedNames = Set(updatedSchema.columns.map { $0.name })
+    #expect(updatedNames.contains("bio"))
+
+    // Old user should still be retrievable
+    let allRows = try await db.select(from: "evolving_users")
+    #expect(allRows.count == 2)
+
+    try await db.close()
+}

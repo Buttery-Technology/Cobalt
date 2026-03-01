@@ -70,6 +70,14 @@ public actor PantryDatabase: Sendable {
         await storageEngine.listTables()
     }
 
+    public func getTableSchema(_ name: String) async -> PantryTableSchema? {
+        await storageEngine.getTableSchema(name)
+    }
+
+    internal func updateTableSchema(_ name: String, schema: PantryTableSchema) async throws {
+        try await storageEngine.updateTableSchema(name, schema: schema)
+    }
+
     public func createIndex(table: String, column: String) async throws {
         let columnIndex = try await indexManager.createIndex(tableName: table, columnName: column)
 

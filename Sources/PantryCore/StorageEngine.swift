@@ -318,6 +318,21 @@ public actor StorageEngine: Sendable {
         await tableRegistry.allTables().map { $0.name }
     }
 
+    /// Get a table's schema
+    public func getTableSchema(_ name: String) async -> PantryTableSchema? {
+        await tableRegistry.getTableInfo(name: name)?.schema
+    }
+
+    /// Update a table's schema in the registry (does not modify existing rows)
+    public func updateTableSchema(_ name: String, schema: PantryTableSchema) async throws {
+        guard var info = await tableRegistry.getTableInfo(name: name) else {
+            throw PantryError.tableNotFound(name: name)
+        }
+        info.schema = schema
+        await tableRegistry.updateTableInfo(info)
+        try await tableRegistry.save()
+    }
+
     // MARK: - Table Management
 
     public func createTable(_ schema: PantryTableSchema) async throws {
