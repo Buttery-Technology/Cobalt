@@ -30,6 +30,18 @@ extension WhereCondition {
         .lessThan(column: name, value: value)
     }
 
+    public static func column(_ name: String, notEquals value: DBValue) -> WhereCondition {
+        .notEquals(column: name, value: value)
+    }
+
+    public static func column(_ name: String, greaterThanOrEqual value: DBValue) -> WhereCondition {
+        .greaterThanOrEqual(column: name, value: value)
+    }
+
+    public static func column(_ name: String, lessThanOrEqual value: DBValue) -> WhereCondition {
+        .lessThanOrEqual(column: name, value: value)
+    }
+
     public static func column(_ name: String, like pattern: String) -> WhereCondition {
         .like(column: name, pattern: pattern)
     }
@@ -40,6 +52,14 @@ extension WhereCondition {
 
     public static func column(_ name: String, between min: DBValue, and max: DBValue) -> WhereCondition {
         .between(column: name, min: min, max: max)
+    }
+
+    public static func columnIsNull(_ name: String) -> WhereCondition {
+        .isNull(column: name)
+    }
+
+    public static func columnIsNotNull(_ name: String) -> WhereCondition {
+        .isNotNull(column: name)
     }
 }
 
