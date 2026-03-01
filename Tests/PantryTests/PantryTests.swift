@@ -1873,6 +1873,101 @@ import Foundation
     try await db.close()
 }
 
+@Test func testWhereConditionColumnNotEquals() async throws {
+    let path = NSTemporaryDirectory() + "pantry_wc_neq_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    try await db.createTable(PantryTableSchema(name: "t", columns: [
+        PantryColumn(name: "id", type: .integer, isPrimaryKey: true, isNullable: false),
+        PantryColumn(name: "name", type: .string),
+    ]))
+    try await db.insert(into: "t", values: ["id": .integer(1), "name": .string("Alice")])
+    try await db.insert(into: "t", values: ["id": .integer(2), "name": .string("Bob")])
+
+    let rows = try await db.select(from: "t", where: .column("name", notEquals: .string("Alice")))
+    #expect(rows.count == 1)
+    #expect(rows[0].string("name") == "Bob")
+
+    try await db.close()
+}
+
+@Test func testWhereConditionColumnGreaterThanOrEqual() async throws {
+    let path = NSTemporaryDirectory() + "pantry_wc_gte_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    try await db.createTable(PantryTableSchema(name: "t", columns: [
+        PantryColumn(name: "id", type: .integer, isPrimaryKey: true, isNullable: false),
+        PantryColumn(name: "val", type: .integer),
+    ]))
+    try await db.insert(into: "t", values: ["id": .integer(1), "val": .integer(10)])
+    try await db.insert(into: "t", values: ["id": .integer(2), "val": .integer(20)])
+    try await db.insert(into: "t", values: ["id": .integer(3), "val": .integer(30)])
+
+    let rows = try await db.select(from: "t", where: .column("val", greaterThanOrEqual: .integer(20)))
+    #expect(rows.count == 2)
+
+    try await db.close()
+}
+
+@Test func testWhereConditionColumnLessThanOrEqual() async throws {
+    let path = NSTemporaryDirectory() + "pantry_wc_lte_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    try await db.createTable(PantryTableSchema(name: "t", columns: [
+        PantryColumn(name: "id", type: .integer, isPrimaryKey: true, isNullable: false),
+        PantryColumn(name: "val", type: .integer),
+    ]))
+    try await db.insert(into: "t", values: ["id": .integer(1), "val": .integer(10)])
+    try await db.insert(into: "t", values: ["id": .integer(2), "val": .integer(20)])
+    try await db.insert(into: "t", values: ["id": .integer(3), "val": .integer(30)])
+
+    let rows = try await db.select(from: "t", where: .column("val", lessThanOrEqual: .integer(20)))
+    #expect(rows.count == 2)
+
+    try await db.close()
+}
+
+@Test func testWhereConditionColumnIsNull() async throws {
+    let path = NSTemporaryDirectory() + "pantry_wc_null_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    try await db.createTable(PantryTableSchema(name: "t", columns: [
+        PantryColumn(name: "id", type: .integer, isPrimaryKey: true, isNullable: false),
+        PantryColumn(name: "name", type: .string),
+    ]))
+    try await db.insert(into: "t", values: ["id": .integer(1), "name": .string("Alice")])
+    try await db.insert(into: "t", values: ["id": .integer(2), "name": .null])
+
+    let rows = try await db.select(from: "t", where: .columnIsNull("name"))
+    #expect(rows.count == 1)
+    #expect(rows[0].int("id") == 2)
+
+    try await db.close()
+}
+
+@Test func testWhereConditionColumnIsNotNull() async throws {
+    let path = NSTemporaryDirectory() + "pantry_wc_notnull_\(UUID().uuidString).pantry"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let db = try await PantryDatabase(configuration: PantryConfiguration(path: path))
+    try await db.createTable(PantryTableSchema(name: "t", columns: [
+        PantryColumn(name: "id", type: .integer, isPrimaryKey: true, isNullable: false),
+        PantryColumn(name: "name", type: .string),
+    ]))
+    try await db.insert(into: "t", values: ["id": .integer(1), "name": .string("Alice")])
+    try await db.insert(into: "t", values: ["id": .integer(2), "name": .null])
+
+    let rows = try await db.select(from: "t", where: .columnIsNotNull("name"))
+    #expect(rows.count == 1)
+    #expect(rows[0].string("name") == "Alice")
+
+    try await db.close()
+}
+
 @Test func testWhereConditionColumnLike() async throws {
     let path = NSTemporaryDirectory() + "pantry_wc_like_\(UUID().uuidString).pantry"
     defer { try? FileManager.default.removeItem(atPath: path) }
