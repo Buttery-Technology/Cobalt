@@ -3,21 +3,21 @@ import PantryCore
 
 /// Per-index state: B-tree + bloom filter for a single or compound column index
 public actor ColumnIndex: Sendable {
-    public let tableName: String
-    public let columnName: String
+    public nonisolated let tableName: String
+    public nonisolated let columnName: String
     /// For compound indexes, the ordered list of columns that form the key
-    public let compoundColumns: [String]?
+    public nonisolated let compoundColumns: [String]?
     /// Extra non-key columns stored in index for covering index scans (INCLUDE columns)
-    public let includeColumns: [String]?
+    public nonisolated let includeColumns: [String]?
     /// Optional WHERE condition for partial indexes — only rows matching this are indexed
-    public let partialCondition: WhereCondition?
-    public let btree: BTree
+    public nonisolated let partialCondition: WhereCondition?
+    public nonisolated let btree: BTree
     private var bloomFilter: BloomFilter
     /// Hash-based key existence set for O(1) definitive negative lookups (supplements bloom filter)
     private var keyHashSet: Set<Int> = []
     /// Maximum size for hash set before it stops growing (memory bound)
     private static let maxHashSetSize = 1_000_000
-    public let nodeStore: PageBackedNodeStore
+    public nonisolated let nodeStore: PageBackedNodeStore
 
     public init(tableName: String, columnName: String, compoundColumns: [String]? = nil, includeColumns: [String]? = nil, partialCondition: WhereCondition? = nil, btree: BTree, nodeStore: PageBackedNodeStore, expectedElements: Int = 10000) {
         self.tableName = tableName

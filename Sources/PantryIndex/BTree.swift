@@ -3,10 +3,11 @@ import PantryCore
 
 /// B-tree backed by PantryCore pages via PageBackedNodeStore.
 /// Algorithm logic preserved from SwiftDB; persistence layer swapped.
-public actor BTree: Sendable {
+/// Converted from actor to class — access is serialized by the owning ColumnIndex actor.
+public final class BTree: @unchecked Sendable {
     private let order: Int
     private var rootId: UUID?
-    private let nodeStore: PageBackedNodeStore
+    public let nodeStore: PageBackedNodeStore
 
     public init(order: Int = 64, nodeStore: PageBackedNodeStore) {
         self.order = order
@@ -257,10 +258,10 @@ public actor BTree: Sendable {
             if root.isLeaf {
                 // Tree is now empty — reset rootId
                 self.rootId = nil
-                await nodeStore.removeNode(nodeId: rootId)
+                nodeStore.removeNode(nodeId: rootId)
             } else if let newRootId = root.children?.first {
                 self.rootId = newRootId
-                await nodeStore.removeNode(nodeId: rootId)
+                nodeStore.removeNode(nodeId: rootId)
             }
         } else {
             try await nodeStore.saveNode(root)
@@ -270,7 +271,7 @@ public actor BTree: Sendable {
     // MARK: - Binary Search Helpers
 
     /// Binary search for the first index where keys[index] >= key (lower bound)
-    private nonisolated func lowerBound(_ keys: [DBValue], _ key: DBValue) -> Int {
+    private func lowerBound(_ keys: [DBValue], _ key: DBValue) -> Int {
         var lo = 0, hi = keys.count
         while lo < hi {
             let mid = lo + (hi - lo) / 2
@@ -280,7 +281,7 @@ public actor BTree: Sendable {
     }
 
     /// Binary search for the first index where keys[index] > key (upper bound)
-    private nonisolated func upperBound(_ keys: [DBValue], _ key: DBValue) -> Int {
+    private func upperBound(_ keys: [DBValue], _ key: DBValue) -> Int {
         var lo = 0, hi = keys.count
         while lo < hi {
             let mid = lo + (hi - lo) / 2
@@ -628,7 +629,7 @@ public actor BTree: Sendable {
         try await nodeStore.saveNode(parent)
 
         // Clean up the absorbed right child from cache/page map
-        await nodeStore.removeNode(nodeId: rightChildId)
+        nodeStore.removeNode(nodeId: rightChildId)
     }
 
     // MARK: - Helpers
