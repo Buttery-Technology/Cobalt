@@ -57,12 +57,12 @@ public actor TransactionManager: Sendable {
 
     public func commitTransaction(_ txContext: TransactionContext) async throws {
         guard let activeContext = activeTransactions[txContext.transactionID],
-              await activeContext.isActive else {
+              activeContext.isActive else {
             throw PantryError.invalidTransactionState
         }
 
         if txContext.isolationLevel == .serializable {
-            try await validateSerializableTransaction(txContext)
+            try validateSerializableTransaction(txContext)
         }
 
         // MVCC: write-write conflict detection for repeatable read and above
@@ -75,8 +75,8 @@ public actor TransactionManager: Sendable {
 
         // Transaction is committed in WAL — mark it committed and remove from active
         // BEFORE flushing pages, so a pageFlusher failure doesn't leave it in limbo
-        await txContext.commit()
-        cleanupConflictIndex(txID: txContext.transactionID, writtenIDs: await txContext.writtenRecordIDs)
+        txContext.commit()
+        cleanupConflictIndex(txID: txContext.transactionID, writtenIDs: txContext.writtenRecordIDs)
         activeTransactions.removeValue(forKey: txContext.transactionID)
 
         // MVCC: advance global version and recompute minimum snapshot
@@ -84,7 +84,7 @@ public actor TransactionManager: Sendable {
         recomputeMinSnapshotVersion()
 
         // Now safe to flush modified pages to disk
-        let modifiedPages = await txContext.modifiedPages
+        let modifiedPages = txContext.modifiedPages
         if let flusher = pageFlusher {
             try await flusher(modifiedPages)
         }
@@ -107,7 +107,7 @@ public actor TransactionManager: Sendable {
 
     public func rollbackTransaction(_ txContext: TransactionContext) async throws {
         guard let activeContext = activeTransactions[txContext.transactionID],
-              await activeContext.isActive else {
+              activeContext.isActive else {
             throw PantryError.invalidTransactionState
         }
 
@@ -115,13 +115,13 @@ public actor TransactionManager: Sendable {
         try await logManager.logTransactionRollback(txID: txContext.transactionID, isolationLevel: txContext.isolationLevel)
 
         // Evict rolled-back pages from buffer pool so subsequent reads get the restored on-disk version
-        let modifiedPages = await txContext.modifiedPages
+        let modifiedPages = txContext.modifiedPages
         if let invalidator = pageInvalidator {
             await invalidator(modifiedPages)
         }
 
-        await txContext.rollback()
-        cleanupConflictIndex(txID: txContext.transactionID, writtenIDs: await txContext.writtenRecordIDs)
+        txContext.rollback()
+        cleanupConflictIndex(txID: txContext.transactionID, writtenIDs: txContext.writtenRecordIDs)
         activeTransactions.removeValue(forKey: txContext.transactionID)
         recomputeMinSnapshotVersion()
     }
@@ -137,11 +137,11 @@ public actor TransactionManager: Sendable {
 
     // MARK: - Validation
 
-    private func validateSerializableTransaction(_ txContext: TransactionContext) async throws {
-        for pageID in await txContext.readPages {
+    private func validateSerializableTransaction(_ txContext: TransactionContext) throws {
+        for pageID in txContext.readPages {
             for (otherTxID, otherTx) in activeTransactions {
                 if otherTxID == txContext.transactionID { continue }
-                if await otherTx.writePages.contains(pageID) {
+                if otherTx.writePages.contains(pageID) {
                     throw PantryError.serializationConflict
                 }
             }
@@ -154,8 +154,8 @@ public actor TransactionManager: Sendable {
         activeTransactions.count
     }
 
-    public func isTransactionActive(txID: UInt64) async -> Bool {
-        await activeTransactions[txID]?.isActive ?? false
+    public func isTransactionActive(txID: UInt64) -> Bool {
+        activeTransactions[txID]?.isActive ?? false
     }
 
     public func getActiveTransactionIDs() -> [UInt64] {

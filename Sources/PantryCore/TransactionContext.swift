@@ -1,73 +1,121 @@
 import Foundation
 
 /// Tracks the state and resources of a single transaction
-public actor TransactionContext: Sendable {
+/// Converted from actor to class with internal locking to eliminate actor hops.
+public final class TransactionContext: @unchecked Sendable {
     public let transactionID: UInt64
-    public private(set) var state: TransactionState = .active
-    public private(set) var modifiedPages = Set<Int>()
     public let startTime: Date
-    public private(set) var endTime: Date?
     public let isolationLevel: IsolationLevel
-    public private(set) var heldLocks = [ResourceLock]()
-    public private(set) var readPages = Set<Int>()
-    public private(set) var writePages = Set<Int>()
-    public private(set) var beforeImagePages = Set<Int>()
-
     /// MVCC: snapshot version captured at transaction start for repeatable reads
     public let snapshotVersion: UInt64
 
-    /// MVCC: set of record IDs written by this transaction (for write-write conflict detection)
-    public private(set) var writtenRecordIDs = Set<UInt64>()
+    private struct State {
+        var state: TransactionState = .active
+        var modifiedPages = Set<Int>()
+        var endTime: Date?
+        var heldLocks = [ResourceLock]()
+        var readPages = Set<Int>()
+        var writePages = Set<Int>()
+        var beforeImagePages = Set<Int>()
+        var writtenRecordIDs = Set<UInt64>()
+    }
+    private let _state: PantryLock<State>
 
     public init(transactionID: UInt64, isolationLevel: IsolationLevel = .readCommitted, snapshotVersion: UInt64 = 0) {
         self.transactionID = transactionID
         self.startTime = Date()
         self.isolationLevel = isolationLevel
         self.snapshotVersion = snapshotVersion
+        self._state = PantryLock(State())
+    }
+
+    public var state: TransactionState {
+        _state.withLock { $0.state }
+    }
+
+    public var modifiedPages: Set<Int> {
+        _state.withLock { $0.modifiedPages }
+    }
+
+    public var endTime: Date? {
+        _state.withLock { $0.endTime }
+    }
+
+    public var heldLocks: [ResourceLock] {
+        _state.withLock { $0.heldLocks }
+    }
+
+    public var readPages: Set<Int> {
+        _state.withLock { $0.readPages }
+    }
+
+    public var writePages: Set<Int> {
+        _state.withLock { $0.writePages }
+    }
+
+    public var beforeImagePages: Set<Int> {
+        _state.withLock { $0.beforeImagePages }
+    }
+
+    public var writtenRecordIDs: Set<UInt64> {
+        _state.withLock { $0.writtenRecordIDs }
     }
 
     public func recordAccess(pageID: Int, isWrite: Bool) {
-        if isWrite {
-            writePages.insert(pageID)
-        } else {
-            readPages.insert(pageID)
+        _state.withLock { s in
+            if isWrite {
+                s.writePages.insert(pageID)
+            } else {
+                s.readPages.insert(pageID)
+            }
         }
     }
 
     public func markModified(pageID: Int) {
-        modifiedPages.insert(pageID)
+        _state.withLock { $0.modifiedPages.insert(pageID) }
     }
 
     public func recordBeforeImage(pageID: Int) {
-        beforeImagePages.insert(pageID)
+        _state.withLock { $0.beforeImagePages.insert(pageID) }
     }
 
     public func addLock(_ lock: ResourceLock) {
-        heldLocks.append(lock)
+        _state.withLock { $0.heldLocks.append(lock) }
     }
 
     /// MVCC: track a record ID as written by this transaction
     public func recordWrite(recordID: UInt64) {
-        writtenRecordIDs.insert(recordID)
+        _state.withLock { $0.writtenRecordIDs.insert(recordID) }
     }
 
     public func commit() {
-        state = .committed
-        endTime = Date()
+        _state.withLock { s in
+            s.state = .committed
+            s.endTime = Date()
+        }
     }
 
     public func rollback() {
-        state = .rolledBack
-        endTime = Date()
+        _state.withLock { s in
+            s.state = .rolledBack
+            s.endTime = Date()
+        }
     }
 
     public var isActive: Bool {
-        state == .active
+        _state.withLock { $0.state == .active }
     }
 
     public var duration: TimeInterval? {
-        guard let end = endTime else { return nil }
-        return end.timeIntervalSince(startTime)
+        _state.withLock { s in
+            guard let end = s.endTime else { return nil }
+            return end.timeIntervalSince(startTime)
+        }
+    }
+
+    /// Check if a before image has been recorded for this page (non-mutating)
+    public func hasBeforeImage(pageID: Int) -> Bool {
+        _state.withLock { $0.beforeImagePages.contains(pageID) }
     }
 }
 
