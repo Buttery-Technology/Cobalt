@@ -199,6 +199,7 @@ public struct DatabasePage: Sendable {
     }
 
     /// Replace a record in-place if the new record fits. Returns true on success.
+    /// Sets `lastPatchIndex` for fast single-record serialization via `saveRecordPatch()`.
     public mutating func replaceRecord(id: UInt64, with newRecord: Record) -> Bool {
         guard let index = records.firstIndex(where: { $0.id == id }) else {
             return false
@@ -214,6 +215,32 @@ public struct DatabasePage: Sendable {
         }
         records[index] = newRecord
         freeSpaceOffset = newFreeOffset
+        lastPatchIndex = (index, oldSize, newSize)
+        return true
+    }
+
+    /// Tracks the last replaceRecord operation for fast patching: (recordIndex, oldSize, newSize)
+    public var lastPatchIndex: (index: Int, oldSize: Int, newSize: Int)?
+
+    /// Fast save when a single record was replaced and its size didn't change.
+    /// Patches the data buffer in-place instead of re-serializing all records.
+    /// Returns true if the fast path was used, false if full saveRecords() is needed.
+    public mutating func saveRecordPatch() -> Bool {
+        guard let patch = lastPatchIndex,
+              patch.oldSize == patch.newSize,
+              patch.index < recordSlots.count else {
+            lastPatchIndex = nil
+            return false
+        }
+        let slot = recordSlots[patch.index]
+        let newData = records[patch.index].serialize()
+        guard newData.count == slot.length else {
+            lastPatchIndex = nil
+            return false
+        }
+        // Patch the record data directly in the buffer
+        data.replaceSubrange(slot.offset..<(slot.offset + slot.length), with: newData)
+        lastPatchIndex = nil
         return true
     }
 

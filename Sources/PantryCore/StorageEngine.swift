@@ -159,6 +159,12 @@ public actor StorageEngine: Sendable {
         return page
     }
 
+    /// Batch read pages: checks cache, batch-reads misses in contiguous I/O.
+    /// Nonisolated for parallel scan use.
+    public nonisolated func getPagesConcurrent(pageIDs: [Int]) async throws -> [DatabasePage] {
+        try await bufferPoolManager.getPages(pageIDs: pageIDs)
+    }
+
     public func savePage(_ page: DatabasePage, transactionContext: TransactionContext? = nil, skipAfterImage: Bool = false) async throws {
         var beforePageData: Data? = nil
 
@@ -441,6 +447,71 @@ public actor StorageEngine: Sendable {
         tableRegistry.updateTableInfo(freshInfo)
     }
 
+    /// Batch-delete multiple records grouped by page. Loads each page once, removes
+    /// all matching records, saves once. Much faster than N individual deleteRecord calls.
+    /// - Parameter records: Array of (recordID, pageID, decodedRow) tuples.
+    public func deleteRecordsBatch(_ records: [(id: UInt64, pageID: Int, row: Row?)], tableName: String, transactionContext: TransactionContext? = nil) async throws {
+        guard !records.isEmpty else { return }
+
+        // Group by pageID for single-load-per-page
+        var byPage = [Int: [(id: UInt64, row: Row?)]]()
+        for r in records {
+            byPage[r.pageID, default: []].append((id: r.id, row: r.row))
+        }
+
+        let deleteSchema = tableRegistry.getTableInfo(name: tableName)?.schema
+        var totalDeleted = 0
+
+        // Process pages in sorted order for sequential I/O
+        for pageID in byPage.keys.sorted() {
+            let group = byPage[pageID]!
+            var page = try await getPage(pageID: pageID, transactionContext: transactionContext)
+            var deletedFromPage = 0
+
+            for (recordID, row) in group {
+                // Check for overflow pages to free
+                var overflowPageIDToFree: Int? = nil
+                if let record = page.records.first(where: { $0.id == recordID }), record.isOverflow {
+                    overflowPageIDToFree = record.overflowPageID
+                }
+
+                // WAL logging
+                if let txContext = transactionContext,
+                   let record = page.records.first(where: { $0.id == recordID }) {
+                    try await logManager.logRecordDelete(txID: txContext.transactionID, pageID: pageID, recordID: recordID, data: record.data)
+                }
+
+                if page.deleteRecord(id: recordID) {
+                    deletedFromPage += 1
+
+                    if let overflowStart = overflowPageIDToFree {
+                        try await freeOverflowPages(startingAt: overflowStart)
+                    }
+
+                    if let row = row {
+                        try await indexHook?.removeFromIndexes(id: recordID, row: row, tableName: tableName)
+                    }
+                }
+            }
+
+            if deletedFromPage > 0 {
+                if transactionContext != nil {
+                    try await savePage(page, transactionContext: transactionContext, skipAfterImage: true)
+                } else {
+                    try await savePage(page, transactionContext: transactionContext)
+                }
+                totalDeleted += deletedFromPage
+            }
+        }
+
+        // Update registry once
+        if totalDeleted > 0 {
+            guard var freshInfo = tableRegistry.getTableInfo(name: tableName) else { return }
+            freshInfo.recordCount = max(0, freshInfo.recordCount - totalDeleted)
+            tableRegistry.updateTableInfo(freshInfo)
+        }
+    }
+
     /// Try to replace a record in-place on its current page. Returns true if successful.
     /// Falls back to false when: record not found, new data doesn't fit, or record is overflow.
     /// Pass `knownPageID` to skip the sequential scan for the record's page.
@@ -464,12 +535,26 @@ public actor StorageEngine: Sendable {
             return false
         }
 
-        if let txContext = transactionContext {
-            try await logManager.logRecordDelete(txID: txContext.transactionID, pageID: pageID, recordID: id, data: newRecord.data)
-            try await logManager.logRecordInsert(txID: txContext.transactionID, pageID: pageID, recordID: id, data: newRecord.data)
-            try await savePage(page, transactionContext: transactionContext, skipAfterImage: true)
+        // Fast path: if the record size didn't change, patch the data buffer directly
+        // instead of full saveRecords() reserialization
+        if page.saveRecordPatch() {
+            bufferPoolManager.updatePage(page)
+            bufferPoolManager.markDirty(pageID: pageID)
+            if let txContext = transactionContext {
+                try await logManager.logRecordDelete(txID: txContext.transactionID, pageID: pageID, recordID: id, data: newRecord.data)
+                try await logManager.logRecordInsert(txID: txContext.transactionID, pageID: pageID, recordID: id, data: newRecord.data)
+            } else {
+                var writablePage = page
+                try storageManager.writePage(&writablePage, alreadySerialized: true)
+            }
         } else {
-            try await savePage(page, transactionContext: transactionContext)
+            if let txContext = transactionContext {
+                try await logManager.logRecordDelete(txID: txContext.transactionID, pageID: pageID, recordID: id, data: newRecord.data)
+                try await logManager.logRecordInsert(txID: txContext.transactionID, pageID: pageID, recordID: id, data: newRecord.data)
+                try await savePage(page, transactionContext: transactionContext, skipAfterImage: true)
+            } else {
+                try await savePage(page, transactionContext: transactionContext)
+            }
         }
 
         return true

@@ -178,6 +178,64 @@ extension Row {
         return Row(values: values)
     }
 
+    /// Projected decode from v3: only decode columns in neededColumns set using offset table.
+    /// O(needed) instead of O(all columns). Falls back to full decode for non-v3 data.
+    public static func fromBytesProjectedV3(_ data: Data, schema: PantryTableSchema, neededColumns: Set<String>) -> Row? {
+        guard data.count >= 4,
+              data[data.startIndex] == 0xFF,
+              data[data.startIndex + 1] == 0x03 else {
+            // Not v3 — fall back to full decode then project
+            guard let full = fromBytesAuto(data, schema: schema) else { return nil }
+            var projected = [String: DBValue]()
+            projected.reserveCapacity(neededColumns.count)
+            for col in neededColumns {
+                projected[col] = full.values[col] ?? .null
+            }
+            return Row(values: projected)
+        }
+
+        var off = 2
+        guard let colCount = data.readUInt16(at: &off) else { return nil }
+        let encodedCount = Int(colCount)
+        let bitmapBytes = (encodedCount + 7) / 8
+        guard off + bitmapBytes <= data.count else { return nil }
+        let bitmapStart = off
+        off += bitmapBytes
+
+        let offsetTableStart = off
+        let offsetTableSize = encodedCount * 2
+        guard off + offsetTableSize <= data.count else { return nil }
+        let valuesStart = offsetTableStart + offsetTableSize
+
+        var values = [String: DBValue]()
+        values.reserveCapacity(neededColumns.count)
+
+        for colName in neededColumns {
+            guard let idx = schema.columnOrdinals[colName], idx < encodedCount else {
+                values[colName] = .null
+                continue
+            }
+            // Check NULL bitmap
+            let isNull = (data[data.startIndex + bitmapStart + idx / 8] & (1 << (idx % 8))) != 0
+            if isNull {
+                values[colName] = .null
+                continue
+            }
+            // Use offset table for O(1) jump
+            let offsetPos = offsetTableStart + idx * 2
+            guard offsetPos + 2 <= data.count else { values[colName] = .null; continue }
+            let relOffset = data.withUnsafeBytes {
+                UInt16(littleEndian: $0.loadUnaligned(fromByteOffset: offsetPos, as: UInt16.self))
+            }
+            guard relOffset != 0xFFFF else { values[colName] = .null; continue }
+            var decodeOff = valuesStart + Int(relOffset)
+            guard let value = decodeDBValue(from: data, at: &decodeOff) else { values[colName] = .null; continue }
+            values[colName] = value
+        }
+
+        return Row(values: values)
+    }
+
     /// Decode from positional format v2 (NULL bitmap) using schema for column names.
     public static func fromBytesPositionalV2(_ data: Data, schema: PantryTableSchema) -> Row? {
         guard data.count >= 4,
