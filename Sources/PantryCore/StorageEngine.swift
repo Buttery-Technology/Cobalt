@@ -233,10 +233,16 @@ public actor StorageEngine: Sendable {
     /// Call `flushDirtyPages` after a batch of deferred saves to write them all at once.
     public func savePageDeferred(_ page: DatabasePage) async throws {
         var serializedPage = page
-        // Fast path: if a single record was replaced with same-size data, patch in-place
-        if !serializedPage.saveRecordPatch() {
-            try serializedPage.saveRecords()
+        // Fast path: if all modifications were same-size patches, data buffer is already correct
+        if !serializedPage.allPatched {
+            // Try single-record patch, else full serialization
+            if !serializedPage.saveRecordPatch() {
+                try serializedPage.saveRecords()
+            }
         }
+        serializedPage.allPatched = false
+        serializedPage.patchInvalidated = false
+        serializedPage.lastPatchIndex = nil
         bufferPoolManager.updatePage(serializedPage)
         bufferPoolManager.markDirty(pageID: page.pageID)
         if !systemPageIDs.contains(page.pageID) {

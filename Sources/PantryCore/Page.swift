@@ -218,32 +218,65 @@ public struct DatabasePage: Sendable {
         }
         records[index] = newRecord
         freeSpaceOffset = newFreeOffset
-        lastPatchIndex = (index, oldSize, newSize)
+        // If a previous replace wasn't patched, invalidate (multi-replace needs full save)
+        if lastPatchIndex != nil {
+            lastPatchIndex = nil
+            patchInvalidated = true
+        } else {
+            lastPatchIndex = (index, oldSize, newSize)
+        }
         return true
     }
 
+    /// Replace a same-size record AND immediately patch the data buffer in-place.
+    /// Returns true only when the new record is exactly the same serialized size as the old one.
+    /// When true, the page's `data` buffer is already up-to-date — no `saveRecords()` needed,
+    /// just update the buffer pool and flush.
+    public mutating func replaceRecordAndPatch(id: UInt64, with newRecord: Record) -> Bool {
+        guard let index = records.firstIndex(where: { $0.id == id }),
+              index < recordSlots.count else { return false }
+        let slot = recordSlots[index]
+        let newData = newRecord.serialize()
+        guard newData.count == slot.length else { return false }
+        // Update records array and patch data buffer in-place
+        records[index] = newRecord
+        data.replaceSubrange(slot.offset..<(slot.offset + slot.length), with: newData)
+        allPatched = true
+        return true
+    }
+
+    /// True when all modifications since last save were applied via replaceRecordAndPatch.
+    /// When set, saveRecords() can be skipped — the data buffer is already correct.
+    public var allPatched = false
+
     /// Tracks the last replaceRecord operation for fast patching: (recordIndex, oldSize, newSize)
     public var lastPatchIndex: (index: Int, oldSize: Int, newSize: Int)?
+    /// Set when multiple replaceRecord calls happen without patching — forces full save
+    public var patchInvalidated = false
 
     /// Fast save when a single record was replaced and its size didn't change.
     /// Patches the data buffer in-place instead of re-serializing all records.
     /// Returns true if the fast path was used, false if full saveRecords() is needed.
     public mutating func saveRecordPatch() -> Bool {
-        guard let patch = lastPatchIndex,
+        guard !patchInvalidated,
+              let patch = lastPatchIndex,
               patch.oldSize == patch.newSize,
               patch.index < recordSlots.count else {
             lastPatchIndex = nil
+            patchInvalidated = false
             return false
         }
         let slot = recordSlots[patch.index]
         let newData = records[patch.index].serialize()
         guard newData.count == slot.length else {
             lastPatchIndex = nil
+            patchInvalidated = false
             return false
         }
         // Patch the record data directly in the buffer
         data.replaceSubrange(slot.offset..<(slot.offset + slot.length), with: newData)
         lastPatchIndex = nil
+        patchInvalidated = false
         return true
     }
 
