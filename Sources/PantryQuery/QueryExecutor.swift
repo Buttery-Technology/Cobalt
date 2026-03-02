@@ -170,22 +170,41 @@ public actor QueryExecutor: Sendable {
             let ascending = orderBy[0].direction == .ascending
             if let index = await indexManager.getIndex(tableName: table, columnName: orderCol) {
                 let totalNeeded = limit + (mods.offset ?? 0)
+
+                // Check if this is a covering index (has all needed columns)
+                let coveredCols = index.coveredColumns
+                let neededCols: Set<String>
+                if let columns = columns, !columns.isEmpty {
+                    var needed = Set(columns)
+                    if let cond = condition { needed.formUnion(columnsReferenced(in: cond)) }
+                    neededCols = needed
+                } else {
+                    neededCols = [] // SELECT * — not coverable unless we know all table columns
+                }
+                let isCovering = !neededCols.isEmpty && neededCols.isSubset(of: coveredCols)
+
                 // With WHERE, overfetch to account for filtered-out rows
                 let fetchLimit = condition != nil ? totalNeeded * 4 : totalNeeded
                 let indexRows = try await index.searchRangeWithLimit(from: nil, to: nil, limit: fetchLimit, ascending: ascending)
 
-                // Fetch full rows by RID
-                let rids = Set(indexRows.compactMap { row -> UInt64? in
-                    guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
-                    return UInt64(bitPattern: ridSigned)
-                })
-                let fullRecords = try await storageEngine.getRecordsByIDs(rids, tableName: table, transactionContext: transactionContext)
+                var orderedRows: [Row]
+                if isCovering {
+                    // Covering index: use index rows directly, skip full record fetch
+                    orderedRows = indexRows
+                } else {
+                    // Non-covering: fetch full rows by RID
+                    let rids = Set(indexRows.compactMap { row -> UInt64? in
+                        guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
+                        return UInt64(bitPattern: ridSigned)
+                    })
+                    let fullRecords = try await storageEngine.getRecordsByIDs(rids, tableName: table, transactionContext: transactionContext)
 
-                // Re-sort by the index order (getRecordsByIDs doesn't preserve order)
-                let ridToRow = Dictionary(fullRecords.map { (record, row) in (record.id, row) }, uniquingKeysWith: { a, _ in a })
-                var orderedRows = indexRows.compactMap { indexRow -> Row? in
-                    guard case .integer(let ridSigned) = indexRow.values["__rid"] else { return nil }
-                    return ridToRow[UInt64(bitPattern: ridSigned)]
+                    // Re-sort by the index order (getRecordsByIDs doesn't preserve order)
+                    let ridToRow = Dictionary(fullRecords.map { (record, row) in (record.id, row) }, uniquingKeysWith: { a, _ in a })
+                    orderedRows = indexRows.compactMap { indexRow -> Row? in
+                        guard case .integer(let ridSigned) = indexRow.values["__rid"] else { return nil }
+                        return ridToRow[UInt64(bitPattern: ridSigned)]
+                    }
                 }
 
                 // Apply WHERE filter if present
@@ -858,12 +877,19 @@ public actor QueryExecutor: Sendable {
             // Group updates by page for batched writes
             var updatesByPage = [Int: [(Record, Row)]]()
             for (record, row, recordPageID) in fullRecords where evaluateCondition(condition, row: row) {
-                var updatedValues = row.values
-                for (key, value) in values { updatedValues[key] = value }
-                let updatedRow = Row(values: updatedValues)
-                let rowData = updateSchema != nil ? updatedRow.toBytesPositional(schema: updateSchema!) : updatedRow.toBytes()
-                let newRecord = Record(id: record.id, data: rowData)
-                updatesByPage[recordPageID, default: []].append((newRecord, updatedRow))
+                // Fast path: patch raw bytes in-place (skips Row copy + merge + serialize)
+                if let schema = updateSchema,
+                   let patchedData = Row.patchPositionalData(record.data, schema: schema, updates: values) {
+                    let newRecord = Record(id: record.id, data: patchedData)
+                    updatesByPage[recordPageID, default: []].append((newRecord, row))
+                } else {
+                    var updatedValues = row.values
+                    for (key, value) in values { updatedValues[key] = value }
+                    let updatedRow = Row(values: updatedValues)
+                    let rowData = updateSchema != nil ? updatedRow.toBytesPositional(schema: updateSchema!) : updatedRow.toBytes()
+                    let newRecord = Record(id: record.id, data: rowData)
+                    updatesByPage[recordPageID, default: []].append((newRecord, updatedRow))
+                }
             }
 
             var updatedCount = 0
@@ -934,11 +960,20 @@ public actor QueryExecutor: Sendable {
                 }
                 guard let row = Row.fromBytesAuto(data, schema: updateSchema) else { continue }
                 if condition == nil || evaluateCondition(condition!, row: row) {
-                    var updatedValues = row.values
-                    for (key, value) in values { updatedValues[key] = value }
-                    let updatedRow = Row(values: updatedValues)
-                    let rowData = updateSchema != nil ? updatedRow.toBytesPositional(schema: updateSchema!) : updatedRow.toBytes()
-                    let newRecord = Record(id: record.id, data: rowData)
+                    let newRecord: Record
+                    let updatedRow: Row
+                    // Fast path: patch raw bytes in-place (skips Row copy + merge + serialize)
+                    if let schema = updateSchema,
+                       let patchedData = Row.patchPositionalData(data, schema: schema, updates: values) {
+                        newRecord = Record(id: record.id, data: patchedData)
+                        updatedRow = row // original row for overflow fallback
+                    } else {
+                        var updatedValues = row.values
+                        for (key, value) in values { updatedValues[key] = value }
+                        updatedRow = Row(values: updatedValues)
+                        let rowData = updateSchema != nil ? updatedRow.toBytesPositional(schema: updateSchema!) : updatedRow.toBytes()
+                        newRecord = Record(id: record.id, data: rowData)
+                    }
 
                     if page.replaceRecordAndPatch(id: record.id, with: newRecord) {
                         pageModified = true

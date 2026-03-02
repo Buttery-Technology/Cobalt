@@ -156,6 +156,41 @@ public final class StorageManager: Sendable {
         return page
     }
 
+    /// Create multiple new pages in one operation, extending the file once.
+    /// Pages are NOT written to disk — they exist only in memory until flushed via the buffer pool.
+    public func createNewPages(count: Int) throws -> [DatabasePage] {
+        guard count > 0 else { return [] }
+        let fileFD = try requireFD()
+
+        let currentSize = lseek(fileFD, 0, SEEK_END)
+        guard currentSize >= 0 else {
+            throw PantryError.pageWriteError(description: "lseek failed: errno \(errno)")
+        }
+        let firstPageID = Int(currentSize) / diskPageSize
+
+        // Extend the file to accommodate all new pages in one operation
+        let newSize = off_t(firstPageID + count) * off_t(diskPageSize)
+        if ftruncate(fileFD, newSize) < 0 {
+            throw PantryError.pageWriteError(description: "ftruncate failed: errno \(errno)")
+        }
+
+        var pages = [DatabasePage]()
+        pages.reserveCapacity(count)
+        for i in 0..<count {
+            var page = DatabasePage(
+                pageID: firstPageID + i,
+                nextPageID: 0,
+                recordCount: 0,
+                freeSpaceOffset: pageSize,
+                flags: 0,
+                data: Data(count: pageSize)
+            )
+            try page.saveRecords()
+            pages.append(page)
+        }
+        return pages
+    }
+
     /// Read multiple pages in a single I/O operation when they are contiguous.
     /// Groups page IDs into contiguous runs and issues one pread per run.
     public func readPages(pageIDs: [Int]) throws -> [DatabasePage] {

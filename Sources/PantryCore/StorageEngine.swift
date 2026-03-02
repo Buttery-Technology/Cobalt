@@ -1193,6 +1193,25 @@ public actor StorageEngine: Sendable {
         tableRegistry.updateTableInfo(info)
     }
 
+    /// Mark a column as indexed in the table stats (for query planner)
+    public func markColumnIndexed(_ tableName: String, column: String) {
+        guard var info = tableRegistry.getTableInfo(name: tableName) else { return }
+        var stats = info.columnStats[column] ?? ColumnStats()
+        stats.isIndexed = true
+        info.columnStats[column] = stats
+        tableRegistry.updateTableInfo(info)
+    }
+
+    /// Mark a column as no longer indexed
+    public func markColumnNotIndexed(_ tableName: String, column: String) {
+        guard var info = tableRegistry.getTableInfo(name: tableName) else { return }
+        if var stats = info.columnStats[column] {
+            stats.isIndexed = false
+            info.columnStats[column] = stats
+            tableRegistry.updateTableInfo(info)
+        }
+    }
+
     /// Get column statistics for query optimization (nonisolated — reads from Mutex-protected registry)
     public nonisolated func getColumnStats(_ tableName: String, column: String) -> ColumnStats? {
         tableRegistry.getTableInfo(name: tableName)?.columnStats[column]
