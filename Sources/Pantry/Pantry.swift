@@ -166,12 +166,47 @@ public actor PantryDatabase: Sendable {
 
         // Single table scan — collect pairs for all indexes
         let rawRecords = try await storageEngine.scanTableRaw(table)
-        var allPairs: [[(key: DBValue, row: Row)]] = Array(repeating: [], count: columns.count)
-        for i in 0..<columns.count { allPairs[i].reserveCapacity(rawRecords.count) }
 
-        for (record, data) in rawRecords {
-            let rid: DBValue = .integer(Int64(bitPattern: record.id))
-            for (i, (_, column, colIdx)) in columnIndexes.enumerated() {
+        // Build pairs for each index in parallel (independent column extraction)
+        let colCount = columns.count
+        let recCount = rawRecords.count
+        var allPairs: [[(key: DBValue, row: Row)]] = Array(repeating: [], count: colCount)
+
+        if colCount > 1 {
+            // Parallel: each index gets its own task
+            let results = await withTaskGroup(of: (Int, [(key: DBValue, row: Row)]).self) { group in
+                for (i, (_, column, colIdx)) in columnIndexes.enumerated() {
+                    let localSchema = schema
+                    group.addTask {
+                        var pairs: [(key: DBValue, row: Row)] = []
+                        pairs.reserveCapacity(recCount)
+                        for (record, data) in rawRecords {
+                            let rid: DBValue = .integer(Int64(bitPattern: record.id))
+                            let value: DBValue?
+                            if let idx = colIdx {
+                                value = Row.extractColumnValue(from: data, columnIndex: idx)
+                                if value == nil || value == .null { continue }
+                            } else {
+                                guard let row = Row.fromBytesAuto(data, schema: localSchema) else { continue }
+                                value = row.values[column]
+                                if value == nil { continue }
+                            }
+                            pairs.append((key: value!, row: Row(values: ["__rid": rid, column: value!])))
+                        }
+                        return (i, pairs)
+                    }
+                }
+                var result = [Int: [(key: DBValue, row: Row)]]()
+                for await (i, pairs) in group { result[i] = pairs }
+                return result
+            }
+            for i in 0..<colCount { allPairs[i] = results[i] ?? [] }
+        } else {
+            // Single index: no parallelization overhead
+            allPairs[0].reserveCapacity(recCount)
+            let (_, column, colIdx) = columnIndexes[0]
+            for (record, data) in rawRecords {
+                let rid: DBValue = .integer(Int64(bitPattern: record.id))
                 let value: DBValue?
                 if let idx = colIdx {
                     value = Row.extractColumnValue(from: data, columnIndex: idx)
@@ -181,8 +216,7 @@ public actor PantryDatabase: Sendable {
                     value = row.values[column]
                     if value == nil { continue }
                 }
-                let slimValues: [String: DBValue] = ["__rid": rid, column: value!]
-                allPairs[i].append((key: value!, row: Row(values: slimValues)))
+                allPairs[0].append((key: value!, row: Row(values: ["__rid": rid, column: value!])))
             }
         }
 
