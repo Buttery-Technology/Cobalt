@@ -10,48 +10,37 @@ public protocol IndexHook: Sendable {
 }
 
 /// Main storage engine coordinating pages, buffer pool, WAL, transactions, and table registry
-public actor StorageEngine: Sendable {
+public final class StorageEngine: @unchecked Sendable {
     public let bufferPoolManager: BufferPoolManager
     public let storageManager: StorageManager
     public let transactionManager: TransactionManager
     public let tableRegistry: TableRegistry
     private let logManager: WriteAheadLog
 
-    /// Optional index hook wired by PantryIndex
-    public var indexHook: (any IndexHook)?
-
-    /// Head of the free page list (0 = empty)
-    private var freeListHead: Int = 0
-
-    /// Page ID storing the index registry (0 = not allocated)
-    private var indexRegistryPageID: Int = 0
-
-    /// Page ID storing the free space bitmap (0 = not allocated)
-    private var freeSpaceBitmapPageID: Int = 0
-
-    /// LSN of the last completed checkpoint (persisted in page 0 metadata)
-    private var checkpointLSN: UInt64 = 0
-
     /// Persisted free space bitmap for O(1) page selection
     private let freeSpaceBitmap = FreeSpaceBitmap()
-
-    /// Per-table extent reserve: pre-allocated contiguous pages for reduced fragmentation
-    private var extentReserve: [String: [DatabasePage]] = [:]
     private let extentSize = 8
 
-    /// Auto-checkpoint: WAL size threshold in bytes (0 = disabled)
-    private var autoCheckpointThreshold: Int = 0
+    private struct MutableState {
+        var indexHook: (any IndexHook)?
+        var freeListHead: Int = 0
+        var indexRegistryPageID: Int = 0
+        var freeSpaceBitmapPageID: Int = 0
+        var checkpointLSN: UInt64 = 0
+        var extentReserve: [String: [DatabasePage]] = [:]
+        var autoCheckpointThreshold: Int = 0
+        var systemPageIDs: Set<Int> = [0, 1]
+        var ridPageMap: [String: [UInt64: Int]] = [:]
+    }
+    private let _state: PantryLock<MutableState>
 
     public func setAutoCheckpointThreshold(_ threshold: Int) {
-        autoCheckpointThreshold = threshold
+        _state.withLock { $0.autoCheckpointThreshold = threshold }
     }
 
-    /// Set of system/reserved page IDs that should not be used for data
-    private var systemPageIDs: Set<Int> = [0, 1]
-
-    /// Per-table RID-to-page cache for O(1) record lookup by ID.
-    /// Populated during table scans, updated on insert/delete.
-    private var ridPageMap: [String: [UInt64: Int]] = [:]
+    public func setIndexHook(_ hook: any IndexHook) {
+        _state.withLock { $0.indexHook = hook }
+    }
 
     public init(databasePath: String, bufferPoolCapacity: Int = 1000, encryptionProvider: EncryptionProvider? = nil, bufferPoolStripeCount: Int = 8, bgWriterIntervalMs: Int = 100) async throws {
         let sm = try StorageManager(databasePath: databasePath, encryptionProvider: encryptionProvider)
@@ -60,6 +49,7 @@ public actor StorageEngine: Sendable {
         self.logManager = try await WriteAheadLog(databasePath: databasePath, storageManager: sm, encryptionProvider: encryptionProvider)
         self.transactionManager = try await TransactionManager(logManager: logManager)
         self.tableRegistry = TableRegistry(storageManager: sm, bufferPool: bufferPoolManager)
+        self._state = PantryLock(MutableState())
 
         // Wire page flusher to break circular reference
         await transactionManager.setPageFlusher { [bufferPoolManager, storageManager] modifiedPages in
@@ -108,25 +98,28 @@ public actor StorageEngine: Sendable {
         let metaPage = try await sm.readPage(pageID: PantryConstants.SYSTEM_PAGE_DB_METADATA)
         if let metaRecord = metaPage.records.first,
            let meta = try? JSONDecoder().decode(DBMetadata.self, from: metaRecord.data) {
-            freeListHead = meta.freeListHead
-            indexRegistryPageID = meta.indexRegistryPageID
-            freeSpaceBitmapPageID = meta.freeSpaceBitmapPageID
-            checkpointLSN = meta.checkpointLSN
+            _state.withLock { s in
+                s.freeListHead = meta.freeListHead
+                s.indexRegistryPageID = meta.indexRegistryPageID
+                s.freeSpaceBitmapPageID = meta.freeSpaceBitmapPageID
+                s.checkpointLSN = meta.checkpointLSN
+            }
             // Pass checkpoint LSN to WAL so recovery skips already-checkpointed records
-            await logManager.setCheckpointLSN(checkpointLSN)
+            await logManager.setCheckpointLSN(_state.withLock { $0.checkpointLSN })
         }
 
         // Load or initialize the free space bitmap
-        if freeSpaceBitmapPageID != 0 {
-            try await freeSpaceBitmap.load(storageManager: sm, bitmapPageID: freeSpaceBitmapPageID)
-            systemPageIDs.insert(freeSpaceBitmapPageID)
+        let bitmapPageID = _state.withLock { $0.freeSpaceBitmapPageID }
+        if bitmapPageID != 0 {
+            try await freeSpaceBitmap.load(storageManager: sm, bitmapPageID: bitmapPageID)
+            _state.withLock { $0.systemPageIDs.insert(bitmapPageID) }
         } else {
             // One-time migration: scan all data pages to populate bitmap
             try await populateBitmapFromPages()
         }
 
-        if indexRegistryPageID != 0 {
-            systemPageIDs.insert(indexRegistryPageID)
+        if _state.withLock({ $0.indexRegistryPageID }) != 0 {
+            _state.withLock { $0.systemPageIDs.insert($0.indexRegistryPageID) }
         }
 
         // Start background dirty page writer
@@ -155,7 +148,7 @@ public actor StorageEngine: Sendable {
     /// Non-actor read path: reads from buffer pool or storage manager directly.
     /// No actor hop needed — both bufferPoolManager and storageManager are Sendable with internal locking.
     /// Use for read-only parallel scans where transaction tracking is not needed.
-    public nonisolated func getPageConcurrent(pageID: Int) async throws -> DatabasePage {
+    public func getPageConcurrent(pageID: Int) async throws -> DatabasePage {
         if let cachedPage = bufferPoolManager.getCachedPage(pageID: pageID) {
             return cachedPage
         }
@@ -167,7 +160,7 @@ public actor StorageEngine: Sendable {
 
     /// Batch read pages: checks cache, batch-reads misses in contiguous I/O.
     /// Nonisolated for parallel scan use.
-    public nonisolated func getPagesConcurrent(pageIDs: [Int]) async throws -> [DatabasePage] {
+    public func getPagesConcurrent(pageIDs: [Int]) async throws -> [DatabasePage] {
         try await bufferPoolManager.getPages(pageIDs: pageIDs)
     }
 
@@ -225,7 +218,7 @@ public actor StorageEngine: Sendable {
         }
 
         // Update free space bitmap for data pages
-        if !systemPageIDs.contains(page.pageID) {
+        if !_state.withLock({ $0.systemPageIDs.contains(page.pageID) }) {
             freeSpaceBitmap.setCategory(pageID: page.pageID, category: serializedPage.spaceCategory())
         }
     }
@@ -246,7 +239,7 @@ public actor StorageEngine: Sendable {
         serializedPage.lastPatchIndex = nil
         bufferPoolManager.updatePage(serializedPage)
         bufferPoolManager.markDirty(pageID: page.pageID)
-        if !systemPageIDs.contains(page.pageID) {
+        if !_state.withLock({ $0.systemPageIDs.contains(page.pageID) }) {
             freeSpaceBitmap.setCategory(pageID: page.pageID, category: serializedPage.spaceCategory())
         }
     }
@@ -285,7 +278,8 @@ public actor StorageEngine: Sendable {
             tableRegistry.updateTableInfo(updatedInfo)
 
             if let row = row {
-                try await indexHook?.updateIndexes(record: insertedRecord, row: row, tableName: tableName)
+                let hook = _state.withLock { $0.indexHook }
+                try await hook?.updateIndexes(record: insertedRecord, row: row, tableName: tableName)
             }
             return insertedRecord.id
         }
@@ -330,10 +324,11 @@ public actor StorageEngine: Sendable {
         tableRegistry.updateTableInfo(updatedInfo)
 
         // Update RID-to-page cache
-        ridPageMap[tableName, default: [:]][record.id] = page.pageID
+        _state.withLock { $0.ridPageMap[tableName, default: [:]][record.id] = page.pageID }
 
         if let row = row {
-            try await indexHook?.updateIndexes(record: record, row: row, tableName: tableName)
+            let hook = _state.withLock { $0.indexHook }
+            try await hook?.updateIndexes(record: record, row: row, tableName: tableName)
         }
 
         return record.id
@@ -482,7 +477,8 @@ public actor StorageEngine: Sendable {
 
     public func getRecord(id: UInt64, tableName: String, transactionContext: TransactionContext? = nil) async throws -> Record {
         // Try index lookup first
-        if let pageID = try await indexHook?.lookupRecord(id: id, tableName: tableName) {
+        let hook = _state.withLock { $0.indexHook }
+        if let pageID = try await hook?.lookupRecord(id: id, tableName: tableName) {
             let page = try await getPage(pageID: pageID, transactionContext: transactionContext)
             if var record = page.records.first(where: { $0.id == id }) {
                 if record.isOverflow {
@@ -558,11 +554,12 @@ public actor StorageEngine: Sendable {
         }
 
         if let row = deletedRow {
-            try await indexHook?.removeFromIndexes(id: id, row: row, tableName: tableName)
+            let hook = _state.withLock { $0.indexHook }
+            try await hook?.removeFromIndexes(id: id, row: row, tableName: tableName)
         }
 
         // Remove from RID cache
-        ridPageMap[tableName]?.removeValue(forKey: id)
+        _state.withLock { $0.ridPageMap[tableName]?.removeValue(forKey: id) }
 
         guard var freshInfo = tableRegistry.getTableInfo(name: tableName) else {
             throw PantryError.tableNotFound(name: tableName)
@@ -621,7 +618,7 @@ public actor StorageEngine: Sendable {
                     }
 
                     // Remove from RID cache
-                    ridPageMap[tableName]?.removeValue(forKey: recordID)
+                    _state.withLock { $0.ridPageMap[tableName]?.removeValue(forKey: recordID) }
                 }
             }
 
@@ -637,7 +634,8 @@ public actor StorageEngine: Sendable {
 
         // Batch index removal — one pass per index instead of per record
         if !indexRemovals.isEmpty {
-            try await indexHook?.removeFromIndexesBatch(records: indexRemovals, tableName: tableName)
+            let hook = _state.withLock { $0.indexHook }
+            try await hook?.removeFromIndexesBatch(records: indexRemovals, tableName: tableName)
         }
 
         // Flush all dirty pages at once for non-transactional deletes
@@ -691,7 +689,7 @@ public actor StorageEngine: Sendable {
                     if let data = rawData {
                         rawIndexRemovals.append((id: recordID, data: data))
                     }
-                    ridPageMap[tableName]?.removeValue(forKey: recordID)
+                    _state.withLock { $0.ridPageMap[tableName]?.removeValue(forKey: recordID) }
                 }
             }
 
@@ -706,7 +704,8 @@ public actor StorageEngine: Sendable {
         }
 
         if !rawIndexRemovals.isEmpty, let schema = schema {
-            try await indexHook?.removeFromIndexesBatchRaw(records: rawIndexRemovals, tableName: tableName, schema: schema)
+            let hook = _state.withLock { $0.indexHook }
+            try await hook?.removeFromIndexesBatchRaw(records: rawIndexRemovals, tableName: tableName, schema: schema)
         }
 
         if transactionContext == nil && totalDeleted > 0 {
@@ -735,7 +734,8 @@ public actor StorageEngine: Sendable {
         // Group RIDs by page using the cache
         var idsByPage = [Int: [UInt64]]()
         var uncached = [UInt64]()
-        if let cache = ridPageMap[tableName], !cache.isEmpty {
+        let ridCache = _state.withLock { $0.ridPageMap[tableName] }
+        if let cache = ridCache, !cache.isEmpty {
             for id in ids {
                 if let pageID = cache[id] { idsByPage[pageID, default: []].append(id) }
                 else { uncached.append(id) }
@@ -768,7 +768,7 @@ public actor StorageEngine: Sendable {
                         try await freeOverflowPages(startingAt: overflowStart)
                     }
                     rawIndexRemovals.append((id: record.id, data: data))
-                    ridPageMap[tableName]?.removeValue(forKey: record.id)
+                    _state.withLock { $0.ridPageMap[tableName]?.removeValue(forKey: record.id) }
                     remaining.remove(record.id)
                 }
             }
@@ -798,7 +798,7 @@ public actor StorageEngine: Sendable {
                         let reassembled = try await reassembleOverflowRecord(record)
                         data = reassembled.data
                     }
-                    ridPageMap[tableName, default: [:]][record.id] = currentPageID
+                    _state.withLock { $0.ridPageMap[tableName, default: [:]][record.id] = currentPageID }
 
                     if let txContext = transactionContext {
                         try await logManager.logRecordDelete(txID: txContext.transactionID, pageID: currentPageID, recordID: record.id, data: data)
@@ -810,7 +810,7 @@ public actor StorageEngine: Sendable {
                             try await freeOverflowPages(startingAt: overflowStart)
                         }
                         rawIndexRemovals.append((id: record.id, data: data))
-                        ridPageMap[tableName]?.removeValue(forKey: record.id)
+                        _state.withLock { $0.ridPageMap[tableName]?.removeValue(forKey: record.id) }
                         remaining.remove(record.id)
                     }
                 }
@@ -989,7 +989,8 @@ public actor StorageEngine: Sendable {
         var results: [(Record, Row)] = []
 
         // Fast path: use RID-to-page cache for direct page lookups
-        if let cache = ridPageMap[tableName], !cache.isEmpty {
+        let ridCache1 = _state.withLock { $0.ridPageMap[tableName] }
+        if let cache = ridCache1, !cache.isEmpty {
             // Group IDs by page for efficient batch loading
             var idsByPage = [Int: [UInt64]]()
             var uncached = [UInt64]()
@@ -1043,7 +1044,7 @@ public actor StorageEngine: Sendable {
                     : try await getPage(pageID: currentPageID, transactionContext: transactionContext)
                 for var record in page.records {
                     // Populate RID cache for all records we see
-                    ridPageMap[tableName, default: [:]][record.id] = currentPageID
+                    _state.withLock { $0.ridPageMap[tableName, default: [:]][record.id] = currentPageID }
                     guard remaining.contains(record.id) else { continue }
                     if record.isOverflow {
                         if let needed = neededColumns,
@@ -1069,7 +1070,7 @@ public actor StorageEngine: Sendable {
                 }
                 let page = try await getPage(pageID: currentPageID, transactionContext: transactionContext)
                 for var record in page.records {
-                    ridPageMap[tableName, default: [:]][record.id] = currentPageID
+                    _state.withLock { $0.ridPageMap[tableName, default: [:]][record.id] = currentPageID }
                     guard remaining.contains(record.id) else { continue }
                     if record.isOverflow {
                         if let needed = neededColumns,
@@ -1104,7 +1105,8 @@ public actor StorageEngine: Sendable {
         var results: [(Record, Row, Int)] = []
 
         // Fast path: use RID-to-page cache
-        if let cache = ridPageMap[tableName], !cache.isEmpty {
+        let ridCache2 = _state.withLock { $0.ridPageMap[tableName] }
+        if let cache = ridCache2, !cache.isEmpty {
             var idsByPage = [Int: [UInt64]]()
             var uncached = [UInt64]()
             for id in ids {
@@ -1147,7 +1149,7 @@ public actor StorageEngine: Sendable {
                     ? try await getPageConcurrent(pageID: currentPageID)
                     : try await getPage(pageID: currentPageID, transactionContext: transactionContext)
                 for var record in page.records {
-                    ridPageMap[tableName, default: [:]][record.id] = currentPageID
+                    _state.withLock { $0.ridPageMap[tableName, default: [:]][record.id] = currentPageID }
                     guard remaining.contains(record.id) else { continue }
                     if record.isOverflow {
                         if let needed = neededColumns,
@@ -1173,7 +1175,7 @@ public actor StorageEngine: Sendable {
                 }
                 let page = try await getPage(pageID: currentPageID, transactionContext: transactionContext)
                 for var record in page.records {
-                    ridPageMap[tableName, default: [:]][record.id] = currentPageID
+                    _state.withLock { $0.ridPageMap[tableName, default: [:]][record.id] = currentPageID }
                     guard remaining.contains(record.id) else { continue }
                     if record.isOverflow {
                         if let needed = neededColumns,
@@ -1201,7 +1203,8 @@ public actor StorageEngine: Sendable {
     public func getRIDPageMapping(_ ids: Set<UInt64>, tableName: String) -> (cached: [Int: [UInt64]], uncached: [UInt64]) {
         var byPage = [Int: [UInt64]]()
         var uncached = [UInt64]()
-        if let cache = ridPageMap[tableName], !cache.isEmpty {
+        let ridCache3 = _state.withLock { $0.ridPageMap[tableName] }
+        if let cache = ridCache3, !cache.isEmpty {
             for id in ids {
                 if let pageID = cache[id] { byPage[pageID, default: []].append(id) }
                 else { uncached.append(id) }
@@ -1224,7 +1227,8 @@ public actor StorageEngine: Sendable {
         results.reserveCapacity(ids.count)
 
         // Fast path: use RID-to-page cache
-        if let cache = ridPageMap[tableName], !cache.isEmpty {
+        let ridCache4 = _state.withLock { $0.ridPageMap[tableName] }
+        if let cache = ridCache4, !cache.isEmpty {
             var idsByPage = [Int: [UInt64]]()
             var uncached = [UInt64]()
             for id in ids {
@@ -1259,7 +1263,7 @@ public actor StorageEngine: Sendable {
                     ? try await getPageConcurrent(pageID: currentPageID)
                     : try await getPage(pageID: currentPageID, transactionContext: transactionContext)
                 for var record in page.records {
-                    ridPageMap[tableName, default: [:]][record.id] = currentPageID
+                    _state.withLock { $0.ridPageMap[tableName, default: [:]][record.id] = currentPageID }
                     guard remaining.contains(record.id) else { continue }
                     if record.isOverflow {
                         record = try await reassembleOverflowRecord(record)
@@ -1277,7 +1281,7 @@ public actor StorageEngine: Sendable {
                 }
                 let page = try await getPage(pageID: currentPageID, transactionContext: transactionContext)
                 for var record in page.records {
-                    ridPageMap[tableName, default: [:]][record.id] = currentPageID
+                    _state.withLock { $0.ridPageMap[tableName, default: [:]][record.id] = currentPageID }
                     guard remaining.contains(record.id) else { continue }
                     if record.isOverflow {
                         record = try await reassembleOverflowRecord(record)
@@ -1324,7 +1328,7 @@ public actor StorageEngine: Sendable {
 
     /// Non-actor page chain read: reads from registry cache or walks pages via getPageConcurrent.
     /// No actor hop needed — all accessed components are Sendable with internal locking.
-    public nonisolated func getPageChainConcurrent(tableName: String) async throws -> [Int] {
+    public func getPageChainConcurrent(tableName: String) async throws -> [Int] {
         guard var tableInfo = tableRegistry.getTableInfo(name: tableName) else {
             throw PantryError.tableNotFound(name: tableName)
         }
@@ -1488,22 +1492,22 @@ public actor StorageEngine: Sendable {
     }
 
     /// Get column statistics for query optimization (nonisolated — reads from Mutex-protected registry)
-    public nonisolated func getColumnStats(_ tableName: String, column: String) -> ColumnStats? {
+    public func getColumnStats(_ tableName: String, column: String) -> ColumnStats? {
         tableRegistry.getTableInfo(name: tableName)?.columnStats[column]
     }
 
     /// Check if a table exists (nonisolated — reads from Mutex-protected registry)
-    public nonisolated func tableExists(_ name: String) -> Bool {
+    public func tableExists(_ name: String) -> Bool {
         tableRegistry.getTableInfo(name: name) != nil
     }
 
     /// List all table names (nonisolated — reads from Mutex-protected registry)
-    public nonisolated func listTables() -> [String] {
+    public func listTables() -> [String] {
         tableRegistry.allTables().map { $0.name }
     }
 
     /// Get a table's schema (nonisolated — reads from Mutex-protected registry)
-    public nonisolated func getTableSchema(_ name: String) -> PantryTableSchema? {
+    public func getTableSchema(_ name: String) -> PantryTableSchema? {
         tableRegistry.getTableInfo(name: name)?.schema
     }
 
@@ -1535,7 +1539,7 @@ public actor StorageEngine: Sendable {
 
         // Remove from registry and RID cache
         tableRegistry.removeTable(name: name)
-        ridPageMap.removeValue(forKey: name)
+        _state.withLock { $0.ridPageMap.removeValue(forKey: name) }
         try await tableRegistry.save()
 
         // Chain freed data pages into the free list
@@ -1556,9 +1560,9 @@ public actor StorageEngine: Sendable {
         }
         for pageID in pagesToFree {
             var freedPage = DatabasePage(pageID: pageID)
-            freedPage.nextPageID = freeListHead
+            freedPage.nextPageID = _state.withLock { $0.freeListHead }
             try await savePage(freedPage)
-            freeListHead = pageID
+            _state.withLock { $0.freeListHead = pageID }
             freeSpaceBitmap.setCategory(pageID: pageID, category: .empty)
         }
 
@@ -1576,9 +1580,10 @@ public actor StorageEngine: Sendable {
         try await transactionManager.commitTransaction(txContext)
 
         // Auto-checkpoint: if WAL exceeds threshold and no active transactions, checkpoint
-        if autoCheckpointThreshold > 0 {
+        let threshold = _state.withLock { $0.autoCheckpointThreshold }
+        if threshold > 0 {
             let walBytes = await logManager.walSize
-            if walBytes >= UInt64(autoCheckpointThreshold),
+            if walBytes >= UInt64(threshold),
                await transactionManager.getActiveTransactionCount() == 0 {
                 try? await transactionManager.createCheckpoint()
             }
@@ -1657,21 +1662,24 @@ public actor StorageEngine: Sendable {
     private func createNewPageForTable(tableInfo: inout TableInfo) async throws -> DatabasePage {
         // Pop from free list if available, check extent reserve, or extend file with extent allocation
         let newPage: DatabasePage
-        if freeListHead != 0 {
-            let freePage = try await storageManager.readPage(pageID: freeListHead)
-            freeListHead = freePage.nextPageID
+        let currentFreeListHead = _state.withLock { $0.freeListHead }
+        if currentFreeListHead != 0 {
+            let freePage = try await storageManager.readPage(pageID: currentFreeListHead)
+            _state.withLock { $0.freeListHead = freePage.nextPageID }
             var reusedPage = DatabasePage(pageID: freePage.pageID)
             try reusedPage.saveRecords()
             bufferPoolManager.updatePage(reusedPage)
             try await saveFreeListHead()
             newPage = reusedPage
-        } else if var reserve = extentReserve[tableInfo.name], !reserve.isEmpty {
+        } else if var reserve = _state.withLock({ $0.extentReserve[tableInfo.name] }), !reserve.isEmpty {
             // Use pre-allocated page from extent reserve
             newPage = reserve.removeFirst()
-            if reserve.isEmpty {
-                extentReserve.removeValue(forKey: tableInfo.name)
-            } else {
-                extentReserve[tableInfo.name] = reserve
+            _state.withLock { s in
+                if reserve.isEmpty {
+                    s.extentReserve.removeValue(forKey: tableInfo.name)
+                } else {
+                    s.extentReserve[tableInfo.name] = reserve
+                }
             }
         } else {
             // Allocate a contiguous extent of pages, use the first, reserve the rest
@@ -1683,7 +1691,7 @@ public actor StorageEngine: Sendable {
                 reserved.append(extraPage)
             }
             if !reserved.isEmpty {
-                extentReserve[tableInfo.name] = reserved
+                _state.withLock { $0.extentReserve[tableInfo.name] = reserved }
             }
         }
         await bufferPoolManager.cachePage(newPage)
@@ -1793,9 +1801,10 @@ public actor StorageEngine: Sendable {
         // Allocate pages for overflow chain
         for i in 0..<overflowPages.count {
             let newPage: DatabasePage
-            if freeListHead != 0 {
-                let freePage = try await storageManager.readPage(pageID: freeListHead)
-                freeListHead = freePage.nextPageID
+            let currentFLH = _state.withLock { $0.freeListHead }
+            if currentFLH != 0 {
+                let freePage = try await storageManager.readPage(pageID: currentFLH)
+                _state.withLock { $0.freeListHead = freePage.nextPageID }
                 newPage = DatabasePage(pageID: freePage.pageID)
                 try await saveFreeListHead()
             } else {
@@ -1942,11 +1951,11 @@ public actor StorageEngine: Sendable {
 
             // Push this page onto the free list
             var freedPage = DatabasePage(pageID: currentPageID)
-            freedPage.nextPageID = freeListHead
+            freedPage.nextPageID = _state.withLock { $0.freeListHead }
             try freedPage.saveRecords()
             try await storageManager.writePage(&freedPage)
             bufferPoolManager.updatePage(freedPage)
-            freeListHead = currentPageID
+            _state.withLock { $0.freeListHead = currentPageID }
             freeSpaceBitmap.setCategory(pageID: currentPageID, category: .empty)
 
             currentPageID = nextOverflowPageID
@@ -1961,7 +1970,7 @@ public actor StorageEngine: Sendable {
     private func populateBitmapFromPages() async throws {
         let totalPages = try await storageManager.totalPageCount()
         for pageID in 0..<totalPages {
-            guard !systemPageIDs.contains(pageID) else { continue }
+            guard !_state.withLock({ $0.systemPageIDs.contains(pageID) }) else { continue }
             let page = try await storageManager.readPage(pageID: pageID)
             if page.isSystemPage { continue }
             freeSpaceBitmap.setCategory(pageID: pageID, category: page.spaceCategory())
@@ -1972,10 +1981,11 @@ public actor StorageEngine: Sendable {
 
     /// Load index registry entries from the dedicated page chain
     public func loadIndexRegistry() async throws -> Data? {
-        guard indexRegistryPageID != 0 else { return nil }
+        let irPageID = _state.withLock { $0.indexRegistryPageID }
+        guard irPageID != 0 else { return nil }
         // Follow the page chain to collect all chunks
         var allData = Data()
-        var currentPageID = indexRegistryPageID
+        var currentPageID = irPageID
         var visited: Set<Int> = []
         while currentPageID != 0 {
             guard visited.insert(currentPageID).inserted else { break }
@@ -2006,13 +2016,13 @@ public actor StorageEngine: Sendable {
         }
 
         // Allocate or reuse the first page
-        if indexRegistryPageID == 0 {
+        if _state.withLock({ $0.indexRegistryPageID }) == 0 {
             let firstPage = try await storageManager.createNewPage()
-            indexRegistryPageID = firstPage.pageID
+            _state.withLock { $0.indexRegistryPageID = firstPage.pageID }
             try await saveDBMetadata()
         }
 
-        var currentPageID = indexRegistryPageID
+        var currentPageID = _state.withLock { $0.indexRegistryPageID }
         for (i, chunk) in chunks.enumerated() {
             var page = DatabasePage(pageID: currentPageID)
             page.pageFlags = [.system]
@@ -2039,7 +2049,9 @@ public actor StorageEngine: Sendable {
 
     /// Save freeListHead, indexRegistryPageID, and freeSpaceBitmapPageID as a record on page 0
     private func saveDBMetadata() async throws {
-        let meta = DBMetadata(freeListHead: freeListHead, indexRegistryPageID: indexRegistryPageID, freeSpaceBitmapPageID: freeSpaceBitmapPageID, checkpointLSN: checkpointLSN)
+        let meta = _state.withLock { s in
+            DBMetadata(freeListHead: s.freeListHead, indexRegistryPageID: s.indexRegistryPageID, freeSpaceBitmapPageID: s.freeSpaceBitmapPageID, checkpointLSN: s.checkpointLSN)
+        }
         let data = try JSONEncoder().encode(meta)
         let record = Record(id: 1, data: data)
 
@@ -2062,8 +2074,8 @@ public actor StorageEngine: Sendable {
         try await transactionManager.createCheckpoint()
         // Persist the checkpoint LSN so recovery skips already-checkpointed records
         let newLSN = await transactionManager.lastCheckpointLSN
-        if newLSN > checkpointLSN {
-            checkpointLSN = newLSN
+        if newLSN > _state.withLock({ $0.checkpointLSN }) {
+            _state.withLock { $0.checkpointLSN = newLSN }
             try await saveDBMetadata()
         }
     }
@@ -2080,10 +2092,13 @@ public actor StorageEngine: Sendable {
         do { try await tableRegistry.save() } catch { if firstError == nil { firstError = error } }
         // Save free space bitmap
         do {
-            let newPageID = try await freeSpaceBitmap.save(storageManager: storageManager, bufferPool: bufferPoolManager, existingPageID: freeSpaceBitmapPageID)
-            if newPageID != freeSpaceBitmapPageID {
-                freeSpaceBitmapPageID = newPageID
-                systemPageIDs.insert(newPageID)
+            let existingBitmapPageID = _state.withLock { $0.freeSpaceBitmapPageID }
+            let newPageID = try await freeSpaceBitmap.save(storageManager: storageManager, bufferPool: bufferPoolManager, existingPageID: existingBitmapPageID)
+            if newPageID != existingBitmapPageID {
+                _state.withLock { s in
+                    s.freeSpaceBitmapPageID = newPageID
+                    s.systemPageIDs.insert(newPageID)
+                }
                 try await saveDBMetadata()
             }
         } catch { if firstError == nil { firstError = error } }

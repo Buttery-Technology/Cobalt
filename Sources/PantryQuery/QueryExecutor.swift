@@ -52,11 +52,11 @@ public final class QueryExecutor: @unchecked Sendable {
         self._cache = PantryLock(CacheState())
     }
 
-    /// Convenience init — resolves tableRegistry from storageEngine (requires await)
-    public init(storageEngine: StorageEngine, indexManager: IndexManager, costWeights: CostModelWeights = .default) async {
+    /// Convenience init — resolves tableRegistry from storageEngine
+    public init(storageEngine: StorageEngine, indexManager: IndexManager, costWeights: CostModelWeights = .default) {
         self.storageEngine = storageEngine
         self.indexManager = indexManager
-        let reg = await storageEngine.tableRegistry
+        let reg = storageEngine.tableRegistry
         self.planner = QueryPlanner(storageEngine: storageEngine, indexManager: indexManager, registry: reg, costWeights: costWeights)
         self._cache = PantryLock(CacheState())
     }
@@ -934,7 +934,7 @@ public final class QueryExecutor: @unchecked Sendable {
 
             // Single-pass: group RIDs by page, load each page once, patch + replace in place
             let colMap = updateSchema?.columnOrdinals
-            let ridPages = await storageEngine.getRIDPageMapping(matchingRIDs, tableName: table)
+            let ridPages = storageEngine.getRIDPageMapping(matchingRIDs, tableName: table)
 
             var updatedCount = 0
             var modifiedPages = Set<Int>()
