@@ -53,7 +53,8 @@ public final class BTreeNode: Codable, @unchecked Sendable {
     ///     [16B UUID (big-endian)]
     /// ```
     public func serialize() throws -> Data {
-        var buf = Data()
+        // Pre-allocate estimated capacity: header(24) + keys(~10 each) + values(~40 each) + children/siblings(~40)
+        var buf = Data(capacity: 64 + keys.count * 50)
 
         // Magic
         buf.append(contentsOf: btnMagic)
