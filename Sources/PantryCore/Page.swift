@@ -180,13 +180,16 @@ public struct DatabasePage: Sendable {
 
     /// Add a record to this page. Returns false if not enough space.
     public mutating func addRecord(_ record: Record) -> Bool {
-        let recordData = record.serialize()
-        let recordSize = recordData.count
+        addRecord(record, knownSerializedSize: record.serialize().count)
+    }
+
+    /// Add a record with a pre-computed serialized size to avoid double serialization.
+    public mutating func addRecord(_ record: Record, knownSerializedSize: Int) -> Bool {
         let slotSize = PantryConstants.SLOT_SIZE
 
         // Account for the new slot entry AND the record data
         let headerEnd = PantryConstants.PAGE_HEADER_SIZE + ((recordCount + 1) * slotSize)
-        let newFreeOffset = freeSpaceOffset - recordSize
+        let newFreeOffset = freeSpaceOffset - knownSerializedSize
 
         if headerEnd >= newFreeOffset {
             return false
