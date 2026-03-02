@@ -34,21 +34,21 @@ public actor PantryDatabase: Sendable {
         self.storageEngine = engine
 
         // Configure auto-checkpoint threshold and long-running TX timeout
-        await engine.setAutoCheckpointThreshold(configuration.autoCheckpointThreshold)
+        engine.setAutoCheckpointThreshold(configuration.autoCheckpointThreshold)
         await engine.transactionManager.setLongRunningTxTimeout(configuration.longRunningTxTimeoutSeconds)
 
         // Initialize index manager
         let im = IndexManager(
-            bufferPool: await engine.bufferPoolManager,
-            storageManager: await engine.storageManager
+            bufferPool: engine.bufferPoolManager,
+            storageManager: engine.storageManager
         )
         self.indexManager = im
 
         // Wire index hook into storage engine
-        await engine.setIndexHook(im)
+        engine.setIndexHook(im)
 
         // Initialize query executor with table registry for cost-based planning
-        self.queryExecutor = QueryExecutor(storageEngine: engine, indexManager: im, tableRegistry: await engine.tableRegistry, costWeights: configuration.costWeights)
+        self.queryExecutor = QueryExecutor(storageEngine: engine, indexManager: im, tableRegistry: engine.tableRegistry, costWeights: configuration.costWeights)
 
         // Restore persisted indexes
         if let indexData = try await engine.loadIndexRegistry() {
@@ -56,9 +56,9 @@ public actor PantryDatabase: Sendable {
             try await im.loadIndexRegistry(entries: entries)
             // Mark restored columns as indexed for the query planner
             for entry in entries {
-                await engine.markColumnIndexed(entry.tableName, column: entry.columnName)
+                engine.markColumnIndexed(entry.tableName, column: entry.columnName)
                 if let cols = entry.compoundColumns {
-                    for col in cols { await engine.markColumnIndexed(entry.tableName, column: col) }
+                    for col in cols { engine.markColumnIndexed(entry.tableName, column: col) }
                 }
             }
         }
@@ -81,15 +81,15 @@ public actor PantryDatabase: Sendable {
     }
 
     public func tableExists(_ name: String) async -> Bool {
-        await storageEngine.tableExists(name)
+        storageEngine.tableExists(name)
     }
 
     public func listTables() async -> [String] {
-        await storageEngine.listTables()
+        storageEngine.listTables()
     }
 
     public func getTableSchema(_ name: String) async -> PantryTableSchema? {
-        await storageEngine.getTableSchema(name)
+        storageEngine.getTableSchema(name)
     }
 
     internal func updateTableSchema(_ name: String, schema: PantryTableSchema) async throws {
@@ -148,7 +148,7 @@ public actor PantryDatabase: Sendable {
         }
 
         // Mark column as indexed for the query planner (lightweight, no full table scan)
-        await storageEngine.markColumnIndexed(table, column: column)
+        storageEngine.markColumnIndexed(table, column: column)
         queryExecutor.invalidatePlanCache(forTable: table)
     }
 
@@ -243,7 +243,7 @@ public actor PantryDatabase: Sendable {
         }
 
         for column in columns {
-            await storageEngine.markColumnIndexed(table, column: column)
+            storageEngine.markColumnIndexed(table, column: column)
         }
         queryExecutor.invalidatePlanCache(forTable: table)
     }
@@ -273,7 +273,7 @@ public actor PantryDatabase: Sendable {
             try await columnIndex.bulkLoad(pairs: pairs)
         }
 
-        await storageEngine.markColumnIndexed(table, column: column)
+        storageEngine.markColumnIndexed(table, column: column)
         queryExecutor.invalidatePlanCache(forTable: table)
     }
 
@@ -315,7 +315,7 @@ public actor PantryDatabase: Sendable {
             try await columnIndex.bulkLoad(pairs: pairs)
         }
         for col in columns {
-            await storageEngine.markColumnIndexed(table, column: col)
+            storageEngine.markColumnIndexed(table, column: col)
         }
         queryExecutor.invalidatePlanCache(forTable: table)
     }
@@ -326,7 +326,7 @@ public actor PantryDatabase: Sendable {
 
     public func dropIndex(table: String, column: String) async {
         indexManager.dropIndex(tableName: table, columnName: column)
-        await storageEngine.markColumnNotIndexed(table, column: column)
+        storageEngine.markColumnNotIndexed(table, column: column)
         queryExecutor.invalidatePlanCache(forTable: table)
     }
 
@@ -558,9 +558,3 @@ extension PantryDatabase {
     }
 }
 
-// Extension to wire index hook
-extension StorageEngine {
-    public func setIndexHook(_ hook: any IndexHook) {
-        self.indexHook = hook
-    }
-}

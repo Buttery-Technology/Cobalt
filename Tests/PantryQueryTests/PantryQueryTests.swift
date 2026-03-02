@@ -9,8 +9,8 @@ import Foundation
     defer { try? FileManager.default.removeItem(atPath: path) }
 
     let engine = try await StorageEngine(databasePath: path, bufferPoolCapacity: 100)
-    let im = IndexManager(bufferPool: await engine.bufferPoolManager, storageManager: await engine.storageManager)
-    let qe = await QueryExecutor(storageEngine: engine, indexManager: im)
+    let im = IndexManager(bufferPool: engine.bufferPoolManager, storageManager: engine.storageManager)
+    let qe = QueryExecutor(storageEngine: engine, indexManager: im)
 
     // Create table
     let schema = PantryTableSchema(name: "items", columns: [
@@ -56,8 +56,8 @@ import Foundation
     defer { try? FileManager.default.removeItem(atPath: path) }
 
     let engine = try await StorageEngine(databasePath: path, bufferPoolCapacity: 100)
-    let im = IndexManager(bufferPool: await engine.bufferPoolManager, storageManager: await engine.storageManager)
-    let qe = await QueryExecutor(storageEngine: engine, indexManager: im)
+    let im = IndexManager(bufferPool: engine.bufferPoolManager, storageManager: engine.storageManager)
+    let qe = QueryExecutor(storageEngine: engine, indexManager: im)
 
     let schema = PantryTableSchema(name: "data", columns: [
         PantryColumn(name: "key", type: .string, isPrimaryKey: true, isNullable: false),
@@ -95,8 +95,8 @@ import Foundation
     defer { try? FileManager.default.removeItem(atPath: path) }
 
     let engine = try await StorageEngine(databasePath: path, bufferPoolCapacity: 100)
-    let im = IndexManager(bufferPool: await engine.bufferPoolManager, storageManager: await engine.storageManager)
-    let qe = await QueryExecutor(storageEngine: engine, indexManager: im)
+    let im = IndexManager(bufferPool: engine.bufferPoolManager, storageManager: engine.storageManager)
+    let qe = QueryExecutor(storageEngine: engine, indexManager: im)
 
     let schema = PantryTableSchema(name: "test", columns: [
         PantryColumn(name: "x", type: .integer),
@@ -135,8 +135,8 @@ import Foundation
     defer { try? FileManager.default.removeItem(atPath: path) }
 
     let engine = try await StorageEngine(databasePath: path, bufferPoolCapacity: 100)
-    let im = IndexManager(bufferPool: await engine.bufferPoolManager, storageManager: await engine.storageManager)
-    let qe = await QueryExecutor(storageEngine: engine, indexManager: im)
+    let im = IndexManager(bufferPool: engine.bufferPoolManager, storageManager: engine.storageManager)
+    let qe = QueryExecutor(storageEngine: engine, indexManager: im)
 
     let schema = PantryTableSchema(name: "strings", columns: [
         PantryColumn(name: "val", type: .string),
@@ -193,8 +193,8 @@ import Foundation
     defer { try? FileManager.default.removeItem(atPath: path) }
 
     let engine = try await StorageEngine(databasePath: path, bufferPoolCapacity: 100)
-    let im = IndexManager(bufferPool: await engine.bufferPoolManager, storageManager: await engine.storageManager)
-    let qe = await QueryExecutor(storageEngine: engine, indexManager: im)
+    let im = IndexManager(bufferPool: engine.bufferPoolManager, storageManager: engine.storageManager)
+    let qe = QueryExecutor(storageEngine: engine, indexManager: im)
 
     let schema = PantryTableSchema(name: "items", columns: [
         PantryColumn(name: "id", type: .integer), PantryColumn(name: "name", type: .string),
@@ -237,8 +237,8 @@ import Foundation
     defer { try? FileManager.default.removeItem(atPath: path) }
 
     let engine = try await StorageEngine(databasePath: path, bufferPoolCapacity: 100)
-    let im = IndexManager(bufferPool: await engine.bufferPoolManager, storageManager: await engine.storageManager)
-    let qe = await QueryExecutor(storageEngine: engine, indexManager: im)
+    let im = IndexManager(bufferPool: engine.bufferPoolManager, storageManager: engine.storageManager)
+    let qe = QueryExecutor(storageEngine: engine, indexManager: im)
 
     let schema = PantryTableSchema(name: "nums", columns: [
         PantryColumn(name: "val", type: .integer),
@@ -274,8 +274,8 @@ import Foundation
     defer { try? FileManager.default.removeItem(atPath: path) }
 
     let engine = try await StorageEngine(databasePath: path, bufferPoolCapacity: 100)
-    let im = IndexManager(bufferPool: await engine.bufferPoolManager, storageManager: await engine.storageManager)
-    let qe = await QueryExecutor(storageEngine: engine, indexManager: im)
+    let im = IndexManager(bufferPool: engine.bufferPoolManager, storageManager: engine.storageManager)
+    let qe = QueryExecutor(storageEngine: engine, indexManager: im)
 
     let schema = PantryTableSchema(name: "people", columns: [
         PantryColumn(name: "name", type: .string),
@@ -337,8 +337,8 @@ import Foundation
     defer { try? FileManager.default.removeItem(atPath: path) }
 
     let engine = try await StorageEngine(databasePath: path, bufferPoolCapacity: 100)
-    let im = IndexManager(bufferPool: await engine.bufferPoolManager, storageManager: await engine.storageManager)
-    let qe = await QueryExecutor(storageEngine: engine, indexManager: im)
+    let im = IndexManager(bufferPool: engine.bufferPoolManager, storageManager: engine.storageManager)
+    let qe = QueryExecutor(storageEngine: engine, indexManager: im)
 
     let schema = PantryTableSchema(name: "nulltest", columns: [
         PantryColumn(name: "a", type: .integer),
@@ -396,8 +396,8 @@ import Foundation
     defer { try? FileManager.default.removeItem(atPath: path) }
 
     let engine = try await StorageEngine(databasePath: path, bufferPoolCapacity: 100)
-    let im = IndexManager(bufferPool: await engine.bufferPoolManager, storageManager: await engine.storageManager)
-    let qe = await QueryExecutor(storageEngine: engine, indexManager: im)
+    let im = IndexManager(bufferPool: engine.bufferPoolManager, storageManager: engine.storageManager)
+    let qe = QueryExecutor(storageEngine: engine, indexManager: im)
 
     let schema = PantryTableSchema(name: "data", columns: [
         PantryColumn(name: "id", type: .integer), PantryColumn(name: "v", type: .string),
@@ -423,8 +423,8 @@ import Foundation
     defer { try? FileManager.default.removeItem(atPath: path) }
 
     let engine = try await StorageEngine(databasePath: path, bufferPoolCapacity: 100)
-    let im = IndexManager(bufferPool: await engine.bufferPoolManager, storageManager: await engine.storageManager)
-    let qe = await QueryExecutor(storageEngine: engine, indexManager: im)
+    let im = IndexManager(bufferPool: engine.bufferPoolManager, storageManager: engine.storageManager)
+    let qe = QueryExecutor(storageEngine: engine, indexManager: im)
 
     let schema = PantryTableSchema(name: "data", columns: [
         PantryColumn(name: "id", type: .integer),
@@ -445,8 +445,8 @@ import Foundation
     defer { try? FileManager.default.removeItem(atPath: path) }
 
     let engine = try await StorageEngine(databasePath: path, bufferPoolCapacity: 100)
-    let im = IndexManager(bufferPool: await engine.bufferPoolManager, storageManager: await engine.storageManager)
-    let qe = await QueryExecutor(storageEngine: engine, indexManager: im)
+    let im = IndexManager(bufferPool: engine.bufferPoolManager, storageManager: engine.storageManager)
+    let qe = QueryExecutor(storageEngine: engine, indexManager: im)
 
     let schema = PantryTableSchema(name: "empty", columns: [
         PantryColumn(name: "x", type: .integer),
@@ -470,8 +470,8 @@ import Foundation
     defer { try? FileManager.default.removeItem(atPath: path) }
 
     let engine = try await StorageEngine(databasePath: path, bufferPoolCapacity: 100)
-    let im = IndexManager(bufferPool: await engine.bufferPoolManager, storageManager: await engine.storageManager)
-    let qe = await QueryExecutor(storageEngine: engine, indexManager: im)
+    let im = IndexManager(bufferPool: engine.bufferPoolManager, storageManager: engine.storageManager)
+    let qe = QueryExecutor(storageEngine: engine, indexManager: im)
 
     let schema = PantryTableSchema(name: "data", columns: [
         PantryColumn(name: "id", type: .integer), PantryColumn(name: "status", type: .string),
