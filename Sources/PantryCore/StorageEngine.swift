@@ -357,6 +357,98 @@ public actor StorageEngine: Sendable {
         return record.id
     }
 
+    /// Bulk insert records with batched page writes: fills pages to capacity before writing.
+    /// Returns the number of records inserted. Much faster than per-record insertRecordSkipIndex.
+    public func bulkInsertRecordsBatched(_ records: [Record], tableName: String, transactionContext: TransactionContext? = nil) async throws -> Int {
+        guard !records.isEmpty else { return 0 }
+        guard var tableInfo = tableRegistry.getTableInfo(name: tableName) else {
+            throw PantryError.tableNotFound(name: tableName)
+        }
+
+        let maxInlineSize = PantryConstants.MAX_INLINE_RECORD_SIZE
+        var inserted = 0
+
+        // Load the last page in the chain (likely has free space)
+        var currentPage: DatabasePage
+        let lastPageID = tableInfo.pageList?.last ?? tableInfo.firstPageID
+        if lastPageID != 0 {
+            currentPage = try await getPage(pageID: lastPageID, transactionContext: transactionContext)
+        } else {
+            currentPage = try await createNewPageForTable(tableInfo: &tableInfo)
+        }
+        var pageDirty = false
+
+        for record in records {
+            let serializedSize = record.serialize().count
+
+            // Handle overflow records individually
+            if serializedSize > maxInlineSize {
+                // Flush current page first
+                if pageDirty {
+                    if let txContext = transactionContext {
+                        try await savePage(currentPage, transactionContext: transactionContext, skipAfterImage: true)
+                    } else {
+                        try await savePage(currentPage, transactionContext: transactionContext)
+                    }
+                    freeSpaceBitmap.setCategory(pageID: currentPage.pageID, category: currentPage.spaceCategory())
+                    pageDirty = false
+                }
+                _ = try await insertOverflowRecord(record, tableName: tableName, transactionContext: transactionContext)
+                // Re-read tableInfo (insertOverflowRecord may have allocated pages)
+                if let refreshed = tableRegistry.getTableInfo(name: tableName) {
+                    tableInfo = refreshed
+                }
+                inserted += 1
+                continue
+            }
+
+            // Try to add to current page
+            if currentPage.addRecord(record) {
+                if let txContext = transactionContext {
+                    try await logManager.logRecordInsert(txID: txContext.transactionID, pageID: currentPage.pageID, recordID: record.id, data: record.data)
+                }
+                pageDirty = true
+                inserted += 1
+            } else {
+                // Page full — write it and get a new one
+                if pageDirty {
+                    if let txContext = transactionContext {
+                        try await savePage(currentPage, transactionContext: transactionContext, skipAfterImage: true)
+                    } else {
+                        try await savePage(currentPage, transactionContext: transactionContext)
+                    }
+                    freeSpaceBitmap.setCategory(pageID: currentPage.pageID, category: currentPage.spaceCategory())
+                }
+
+                currentPage = try await createNewPageForTable(tableInfo: &tableInfo)
+                if !currentPage.addRecord(record) {
+                    throw PantryError.recordTooLarge(size: serializedSize)
+                }
+                if let txContext = transactionContext {
+                    try await logManager.logRecordInsert(txID: txContext.transactionID, pageID: currentPage.pageID, recordID: record.id, data: record.data)
+                }
+                pageDirty = true
+                inserted += 1
+            }
+        }
+
+        // Flush the last page
+        if pageDirty {
+            if let txContext = transactionContext {
+                try await savePage(currentPage, transactionContext: transactionContext, skipAfterImage: true)
+            } else {
+                try await savePage(currentPage, transactionContext: transactionContext)
+            }
+            freeSpaceBitmap.setCategory(pageID: currentPage.pageID, category: currentPage.spaceCategory())
+        }
+
+        // Update record count once
+        tableInfo.recordCount += inserted
+        tableRegistry.updateTableInfo(tableInfo)
+
+        return inserted
+    }
+
     public func getRecord(id: UInt64, tableName: String, transactionContext: TransactionContext? = nil) async throws -> Record {
         // Try index lookup first
         if let pageID = try await indexHook?.lookupRecord(id: id, tableName: tableName) {
