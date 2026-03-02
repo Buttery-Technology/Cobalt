@@ -156,7 +156,6 @@ public actor PantryDatabase: Sendable {
     /// Much faster than calling createIndex multiple times.
     public func createIndexes(table: String, columns: [String], analyze: Bool = false) async throws {
         let schema = storageEngine.getTableSchema(table)
-
         // Create all ColumnIndex objects
         var columnIndexes: [(ColumnIndex, String, Int?)] = []
         for column in columns {
@@ -187,7 +186,7 @@ public actor PantryDatabase: Sendable {
             }
         }
 
-        // Bulk load all indexes concurrently
+        // Bulk load all indexes and analyze concurrently
         try await withThrowingTaskGroup(of: Void.self) { group in
             for (i, (ci, _, _)) in columnIndexes.enumerated() {
                 let pairs = allPairs[i]
@@ -197,6 +196,15 @@ public actor PantryDatabase: Sendable {
                     }
                 }
             }
+            // Run analyze concurrently with bulkLoad (independent of index building)
+            if analyze {
+                let engine = storageEngine
+                let tableName = table
+                let records = rawRecords
+                group.addTask {
+                    try await engine.analyzeTableFromRaw(tableName, rawRecords: records)
+                }
+            }
             try await group.waitForAll()
         }
 
@@ -204,11 +212,6 @@ public actor PantryDatabase: Sendable {
             await storageEngine.markColumnIndexed(table, column: column)
         }
         queryExecutor.invalidatePlanCache(forTable: table)
-
-        // Optionally analyze table using same raw records (avoids duplicate scan)
-        if analyze {
-            try await storageEngine.analyzeTableFromRaw(table, rawRecords: rawRecords)
-        }
     }
 
     /// Create a partial index on a column — only rows matching `where` condition are indexed.
