@@ -101,32 +101,31 @@ public actor QueryExecutor: Sendable {
         guard rows.count <= 10_000 else { return }
 
         if resultCache.count >= maxResultCacheSize {
-            // O(n) eviction: find the median-ish access threshold and remove entries below it
+            // O(n) eviction via single-pass min-k selection (no sort needed).
+            // Maintain array of k smallest-access entries, with tracked max for O(1) skip.
             let evictCount = maxResultCacheSize / 4
-            // Find the Nth smallest lastAccess via single pass collecting candidates
-            var candidates: [(key: QueryResultCacheKey, access: UInt64)] = []
-            candidates.reserveCapacity(resultCache.count)
+            var evictKeys = [QueryResultCacheKey]()
+            evictKeys.reserveCapacity(evictCount)
+            var evictAccesses = [UInt64]()
+            evictAccesses.reserveCapacity(evictCount)
+            var maxInSet: UInt64 = 0
+
             for (key, value) in resultCache {
-                candidates.append((key: key, access: value.lastAccess))
-            }
-            // Partial sort: only need the evictCount smallest values
-            // Use nth_element-style: partition around approximate threshold
-            let threshold: UInt64
-            if candidates.count <= evictCount {
-                threshold = UInt64.max
-            } else {
-                // Find the evictCount-th smallest access value via partial selection
-                var accesses = candidates.map { $0.access }
-                accesses.sort() // O(n log n) but on UInt64 array, not full cache entries
-                threshold = accesses[evictCount - 1]
-            }
-            var removed = 0
-            for (key, access) in candidates {
-                if access <= threshold {
-                    resultCache.removeValue(forKey: key)
-                    removed += 1
-                    if removed >= evictCount { break }
+                if evictKeys.count < evictCount {
+                    evictKeys.append(key)
+                    evictAccesses.append(value.lastAccess)
+                    if value.lastAccess > maxInSet { maxInSet = value.lastAccess }
+                } else if value.lastAccess < maxInSet {
+                    // Replace the max element in our set
+                    if let maxIdx = evictAccesses.firstIndex(of: maxInSet) {
+                        evictKeys[maxIdx] = key
+                        evictAccesses[maxIdx] = value.lastAccess
+                        maxInSet = evictAccesses.max() ?? 0
+                    }
                 }
+            }
+            for key in evictKeys {
+                resultCache.removeValue(forKey: key)
             }
         }
 
@@ -446,9 +445,19 @@ public actor QueryExecutor: Sendable {
                 join: join
             )
 
+            // Compute join limit: push LIMIT down for inner joins when no ORDER BY/DISTINCT
+            let joinLimit: Int?
+            if let mods = modifiers, let limit = mods.limit, limit > 0,
+               (mods.orderBy == nil || mods.orderBy!.isEmpty), !mods.distinct,
+               join.type == .inner {
+                joinLimit = limit + (mods.offset ?? 0)
+            } else {
+                joinLimit = nil
+            }
+
             switch join.type {
             case .inner:
-                result = hashInnerJoin(left: result, right: rightRows, join: join, strategy: strategy)
+                result = hashInnerJoin(left: result, right: rightRows, join: join, strategy: strategy, limit: joinLimit)
             case .left:
                 result = hashLeftJoin(left: result, right: rightRows, join: join, strategy: strategy)
             case .right:
@@ -1474,13 +1483,15 @@ public actor QueryExecutor: Sendable {
             guard let val = lookupColumn(col) else { return false }
             return val != .null
         case .and(let subs):
-            for sub in subs {
+            let ordered = subs.count <= 1 ? subs : subs.sorted { conditionCost($0) < conditionCost($1) }
+            for sub in ordered {
                 guard let result = evaluateConditionLazy(sub, data: data, columnIndexMap: columnIndexMap) else { return nil }
                 if !result { return false }
             }
             return true
         case .or(let subs):
-            for sub in subs {
+            let ordered = subs.count <= 1 ? subs : subs.sorted { conditionCost($0) < conditionCost($1) }
+            for sub in ordered {
                 guard let result = evaluateConditionLazy(sub, data: data, columnIndexMap: columnIndexMap) else { return nil }
                 if result { return true }
             }
@@ -1524,12 +1535,11 @@ public actor QueryExecutor: Sendable {
     }
 
     /// Hash inner join: builds hash table on the smaller side (per planner strategy)
-    private nonisolated func hashInnerJoin(left: [Row], right: [Row], join: JoinClause, strategy: JoinStrategy) -> [Row] {
+    private nonisolated func hashInnerJoin(left: [Row], right: [Row], join: JoinClause, strategy: JoinStrategy, limit: Int? = nil) -> [Row] {
         let buildOnRight: Bool
         if case .hashJoin(let side) = strategy { buildOnRight = (side == .right) } else { buildOnRight = true }
 
         if buildOnRight {
-            // Build on right, probe with left
             var hashTable = [DBValue: [Row]]()
             for row in right {
                 let key = row.values[join.rightColumn] ?? .null
@@ -1543,11 +1553,11 @@ public actor QueryExecutor: Sendable {
                     var combined = leftRow.values
                     for (k, v) in rightRow.values { combined["\(join.table).\(k)"] = v; combined[k] = v }
                     result.append(Row(values: combined))
+                    if let limit, result.count >= limit { return result }
                 }
             }
             return result
         } else {
-            // Build on left, probe with right
             var hashTable = [DBValue: [Row]]()
             for row in left {
                 let key = row.values[join.leftColumn] ?? .null
@@ -1561,6 +1571,7 @@ public actor QueryExecutor: Sendable {
                     var combined = leftRow.values
                     for (k, v) in rightRow.values { combined["\(join.table).\(k)"] = v; combined[k] = v }
                     result.append(Row(values: combined))
+                    if let limit, result.count >= limit { return result }
                 }
             }
             return result

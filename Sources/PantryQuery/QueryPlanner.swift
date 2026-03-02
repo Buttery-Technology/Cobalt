@@ -192,12 +192,27 @@ struct QueryPlanner: Sendable {
         let ac = accessCounter.withLock { $0 += 1; return $0 }
         planCache.withLock { cache in
             if cache.count >= maxCacheSize {
-                // LRU eviction: remove the least recently accessed quarter
+                // O(n) LRU eviction: single-pass min-k selection
                 let evictCount = maxCacheSize / 4
-                let sorted = cache.sorted { $0.value.lastAccess < $1.value.lastAccess }
-                for entry in sorted.prefix(evictCount) {
-                    cache.removeValue(forKey: entry.key)
+                var evictKeys = [PlanCacheKey]()
+                evictKeys.reserveCapacity(evictCount)
+                var evictAccesses = [UInt64]()
+                evictAccesses.reserveCapacity(evictCount)
+                var maxInSet: UInt64 = 0
+                for (key, value) in cache {
+                    if evictKeys.count < evictCount {
+                        evictKeys.append(key)
+                        evictAccesses.append(value.lastAccess)
+                        if value.lastAccess > maxInSet { maxInSet = value.lastAccess }
+                    } else if value.lastAccess < maxInSet {
+                        if let maxIdx = evictAccesses.firstIndex(of: maxInSet) {
+                            evictKeys[maxIdx] = key
+                            evictAccesses[maxIdx] = value.lastAccess
+                            maxInSet = evictAccesses.max() ?? 0
+                        }
+                    }
                 }
+                for key in evictKeys { cache.removeValue(forKey: key) }
             }
             cache[cacheKey] = CachedPlan(plan: bestPlan, generation: gen, lastAccess: ac)
         }
