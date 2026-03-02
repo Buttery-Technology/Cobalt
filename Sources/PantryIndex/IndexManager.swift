@@ -205,6 +205,12 @@ public actor IndexManager: IndexHook, Sendable {
 
     /// Save all index metadata to a registry page
     public func saveIndexRegistry() async throws -> [IndexRegistryEntry] {
+        // Flush all dirty B-tree nodes to pages before saving registry
+        for (_, tableIndexes) in indexes {
+            for (_, columnIndex) in tableIndexes {
+                try await columnIndex.nodeStore.flushDirtyNodes()
+            }
+        }
         var entries: [IndexRegistryEntry] = []
         for (tableName, tableIndexes) in indexes {
             for (columnName, columnIndex) in tableIndexes {

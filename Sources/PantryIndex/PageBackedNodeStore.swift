@@ -10,6 +10,7 @@ public actor PageBackedNodeStore: Sendable {
     private var nodeCache: [UUID: BTreeNode] = [:]
     private var nodeCacheOrder: [UUID: UInt64] = [:]  // LRU: access counter per node
     private var nodeCacheCounter: UInt64 = 0
+    private var dirtyNodes: Set<UUID> = []  // nodes modified since last flush
     private static let maxNodeCacheSize = 10_000
     private let bufferPool: BufferPoolManager
     private let storageManager: StorageManager
@@ -19,42 +20,46 @@ public actor PageBackedNodeStore: Sendable {
         self.storageManager = storageManager
     }
 
-    /// Save a B-tree node to a page
+    /// Save a B-tree node — caches in memory and marks dirty.
+    /// Serialization is deferred until flushDirtyNodes() for batch I/O.
     public func saveNode(_ node: BTreeNode) async throws {
-        let data = try node.serialize()
-        let record = Record(id: nodeId(node.nodeId), data: data)
+        // Allocate a page for new nodes immediately (need page ID for mapping)
+        if nodePageMap[node.nodeId] == nil {
+            var page = try await storageManager.createNewPage()
+            page.pageFlags = [.indexNode]
+            nodePageMap[node.nodeId] = page.pageID
+            await bufferPool.cachePage(page)
+        }
+        // Cache the node directly — no copy needed (actor serializes access)
+        nodeCache[node.nodeId] = node
+        dirtyNodes.insert(node.nodeId)
+        nodeCacheCounter += 1
+        nodeCacheOrder[node.nodeId] = nodeCacheCounter
+        evictNodeCacheIfNeeded()
+    }
 
-        if let existingPageID = nodePageMap[node.nodeId] {
-            // Update existing page — validate serialized node fits
+    /// Serialize and persist all dirty nodes to their pages.
+    /// Called at transaction boundaries or during flush.
+    public func flushDirtyNodes() async throws {
+        for nodeId in dirtyNodes {
+            guard let node = nodeCache[nodeId],
+                  let pageID = nodePageMap[nodeId] else { continue }
+            let data = try node.serialize()
+            let record = Record(id: self.nodeId(nodeId), data: data)
             let recordSize = record.serialize().count
             let maxRecordSize = PantryConstants.PAGE_SIZE - PantryConstants.PAGE_HEADER_SIZE - PantryConstants.SLOT_SIZE
             guard recordSize <= maxRecordSize else {
                 throw PantryError.pageOverflow
             }
-            var page = try await bufferPool.getPage(pageID: existingPageID)
+            var page = try await bufferPool.getPage(pageID: pageID)
             page.records = [record]
             page.recordCount = 1
             page.pageFlags = [.indexNode]
             try page.saveRecords()
             bufferPool.updatePage(page)
-            bufferPool.markDirty(pageID: existingPageID)
-        } else {
-            // Allocate a new page
-            var page = try await storageManager.createNewPage()
-            page.pageFlags = [.indexNode]
-            guard page.addRecord(record) else {
-                throw PantryError.pageOverflow
-            }
-            try page.saveRecords()
-            await bufferPool.cachePage(page)
-            bufferPool.markDirty(pageID: page.pageID)
-            nodePageMap[node.nodeId] = page.pageID
+            bufferPool.markDirty(pageID: pageID)
         }
-        // Cache the node directly — no copy needed (actor serializes access)
-        nodeCache[node.nodeId] = node
-        nodeCacheCounter += 1
-        nodeCacheOrder[node.nodeId] = nodeCacheCounter
-        evictNodeCacheIfNeeded()
+        dirtyNodes.removeAll()
     }
 
     /// Load a B-tree node from its page.
@@ -101,8 +106,9 @@ public actor PageBackedNodeStore: Sendable {
         }
     }
 
-    /// Flush all dirty index pages to disk
+    /// Flush all dirty nodes then flush dirty index pages to disk
     public func flush() async throws {
+        try await flushDirtyNodes()
         try await bufferPool.flushAllDirtyPages()
     }
 
