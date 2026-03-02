@@ -413,6 +413,10 @@ public final class QueryExecutor: @unchecked Sendable {
                 result.reserveCapacity(totalNeeded)
                 let leftJoinColIdx: Int? = leftSchema?.columns.firstIndex { $0.name == join.leftColumn }
 
+                // Pre-compute prefixed column names to avoid string interpolation in hot loop
+                let leftPrefix = table + "."
+                let rightPrefix = join.table + "."
+
                 // Streaming approach: collect batches of left keys, batch-probe index, batch-fetch right records
                 var pendingKeys = [(key: DBValue, recordData: Data)]()
                 let batchSize = max(totalNeeded, 128)
@@ -436,13 +440,13 @@ public final class QueryExecutor: @unchecked Sendable {
 
                         // Flush batch when full
                         if pendingKeys.count >= batchSize {
-                            try await _flushJoinBatch(pendingKeys: &pendingKeys, rightIndex: rightIndex, join: join, table: table, leftSchema: leftSchema, result: &result, totalNeeded: totalNeeded, transactionContext: transactionContext)
+                            try await _flushJoinBatch(pendingKeys: &pendingKeys, rightIndex: rightIndex, join: join, leftPrefix: leftPrefix, rightPrefix: rightPrefix, leftSchema: leftSchema, result: &result, totalNeeded: totalNeeded, transactionContext: transactionContext)
                         }
                     }
                 }
                 // Flush remaining
                 if !pendingKeys.isEmpty && result.count < totalNeeded {
-                    try await _flushJoinBatch(pendingKeys: &pendingKeys, rightIndex: rightIndex, join: join, table: table, leftSchema: leftSchema, result: &result, totalNeeded: totalNeeded, transactionContext: transactionContext)
+                    try await _flushJoinBatch(pendingKeys: &pendingKeys, rightIndex: rightIndex, join: join, leftPrefix: leftPrefix, rightPrefix: rightPrefix, leftSchema: leftSchema, result: &result, totalNeeded: totalNeeded, transactionContext: transactionContext)
                 }
 
                 // Apply OFFSET
@@ -1949,7 +1953,8 @@ public final class QueryExecutor: @unchecked Sendable {
         pendingKeys: inout [(key: DBValue, recordData: Data)],
         rightIndex: ColumnIndex,
         join: JoinClause,
-        table: String,
+        leftPrefix: String,
+        rightPrefix: String,
         leftSchema: PantryTableSchema?,
         result: inout [Row],
         totalNeeded: Int,
@@ -1980,12 +1985,12 @@ public final class QueryExecutor: @unchecked Sendable {
         }
         guard !allRIDs.isEmpty else { return }
         let rightRecords = try await storageEngine.getRecordsByIDs(allRIDs, tableName: join.table, transactionContext: transactionContext)
-        var rightRowsByRID = [UInt64: Row]()
+        var rightRowsByRID = [UInt64: Row](minimumCapacity: rightRecords.count)
         for (record, row) in rightRecords {
             rightRowsByRID[record.id] = row
         }
 
-        // Build combined rows
+        // Build combined rows using pre-computed prefixes
         for (key, recordData) in batch {
             if result.count >= totalNeeded { break }
             guard let rids = ridsByKey[key], !rids.isEmpty else { continue }
@@ -1994,8 +1999,8 @@ public final class QueryExecutor: @unchecked Sendable {
                 if result.count >= totalNeeded { break }
                 guard let rightRow = rightRowsByRID[rid] else { continue }
                 var combined = [String: DBValue](minimumCapacity: leftRow.values.count + rightRow.values.count * 2)
-                for (k, v) in leftRow.values { combined[k] = v; combined["\(table).\(k)"] = v }
-                for (k, v) in rightRow.values { combined["\(join.table).\(k)"] = v; combined[k] = v }
+                for (k, v) in leftRow.values { combined[k] = v; combined[leftPrefix + k] = v }
+                for (k, v) in rightRow.values { combined[rightPrefix + k] = v; combined[k] = v }
                 result.append(Row(values: combined))
             }
         }
