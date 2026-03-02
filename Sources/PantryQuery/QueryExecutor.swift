@@ -872,23 +872,36 @@ public actor QueryExecutor: Sendable {
                 guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
                 return UInt64(bitPattern: ridSigned)
             })
-            let fullRecords = try await storageEngine.getRecordsByIDsWithPages(matchingRIDs, tableName: table, transactionContext: transactionContext)
+
+            // Use raw data path: fetch records without Row deserialization
+            let rawRecords = try await storageEngine.getRecordDataByIDs(matchingRIDs, tableName: table, transactionContext: transactionContext)
+            let colMap = updateSchema?.columnOrdinals
 
             // Group updates by page for batched writes
-            var updatesByPage = [Int: [(Record, Row)]]()
-            for (record, row, recordPageID) in fullRecords where evaluateCondition(condition, row: row) {
-                // Fast path: patch raw bytes in-place (skips Row copy + merge + serialize)
+            var updatesByPage = [Int: [(newRecord: Record, fallbackRow: Row?)]]()
+            for (record, recordPageID) in rawRecords {
+                // Lazy filter: verify condition on raw bytes without full Row decode
+                if let colMap = colMap {
+                    if let lazyResult = evaluateConditionLazy(condition, data: record.data, columnIndexMap: colMap) {
+                        if !lazyResult { continue }
+                    }
+                }
+
+                // Fast path: patch raw bytes in-place (skips Row decode entirely)
                 if let schema = updateSchema,
                    let patchedData = Row.patchPositionalData(record.data, schema: schema, updates: values) {
                     let newRecord = Record(id: record.id, data: patchedData)
-                    updatesByPage[recordPageID, default: []].append((newRecord, row))
+                    updatesByPage[recordPageID, default: []].append((newRecord: newRecord, fallbackRow: nil))
                 } else {
+                    // Slow path: full decode + merge + re-encode
+                    guard let row = Row.fromBytesAuto(record.data, schema: updateSchema) else { continue }
+                    guard evaluateCondition(condition, row: row) else { continue }
                     var updatedValues = row.values
                     for (key, value) in values { updatedValues[key] = value }
                     let updatedRow = Row(values: updatedValues)
                     let rowData = updateSchema != nil ? updatedRow.toBytesPositional(schema: updateSchema!) : updatedRow.toBytes()
                     let newRecord = Record(id: record.id, data: rowData)
-                    updatesByPage[recordPageID, default: []].append((newRecord, updatedRow))
+                    updatesByPage[recordPageID, default: []].append((newRecord: newRecord, fallbackRow: updatedRow))
                 }
             }
 
@@ -900,14 +913,14 @@ public actor QueryExecutor: Sendable {
                     : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
                 var pageModified = false
                 var allPatchable = true
-                for (newRecord, updatedRow) in updates {
-                    // Try same-size patch first (patches data buffer immediately)
+                for (newRecord, fallbackRow) in updates {
                     if page.replaceRecordAndPatch(id: newRecord.id, with: newRecord) {
                         pageModified = true
                     } else if page.replaceRecord(id: newRecord.id, with: newRecord) {
                         pageModified = true
                         allPatchable = false
                     } else {
+                        let updatedRow = fallbackRow ?? Row.fromBytesAuto(newRecord.data, schema: updateSchema)!
                         try await storageEngine.deleteRecord(id: newRecord.id, tableName: table, transactionContext: transactionContext, knownPageID: pageID)
                         try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
                         allPatchable = false

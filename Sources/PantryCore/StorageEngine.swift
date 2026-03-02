@@ -420,17 +420,13 @@ public actor StorageEngine: Sendable {
         var pageDirty = false
 
         for record in records {
-            let serializedSize = record.serialize().count
+            let serializedSize = record.serializedSize
 
             // Handle overflow records individually
             if serializedSize > maxInlineSize {
                 // Flush current page first
                 if pageDirty {
-                    if let txContext = transactionContext {
-                        try await savePage(currentPage, transactionContext: transactionContext, skipAfterImage: true)
-                    } else {
-                        try await savePage(currentPage, transactionContext: transactionContext)
-                    }
+                    try await savePage(currentPage, transactionContext: transactionContext)
                     freeSpaceBitmap.setCategory(pageID: currentPage.pageID, category: currentPage.spaceCategory())
                     pageDirty = false
                 }
@@ -445,15 +441,12 @@ public actor StorageEngine: Sendable {
 
             // Try to add to current page (pass pre-computed size to avoid double serialization)
             if currentPage.addRecord(record, knownSerializedSize: serializedSize) {
-                if let txContext = transactionContext {
-                    try await logManager.logRecordInsert(txID: txContext.transactionID, pageID: currentPage.pageID, recordID: record.id, data: record.data)
-                }
                 pageDirty = true
                 inserted += 1
             } else {
-                // Page full — write it and get a new one
+                // Page full — write it with skipAfterImage (before-image only for undo)
                 if pageDirty {
-                    if let txContext = transactionContext {
+                    if transactionContext != nil {
                         try await savePage(currentPage, transactionContext: transactionContext, skipAfterImage: true)
                     } else {
                         try await savePage(currentPage, transactionContext: transactionContext)
@@ -465,9 +458,6 @@ public actor StorageEngine: Sendable {
                 if !currentPage.addRecord(record, knownSerializedSize: serializedSize) {
                     throw PantryError.recordTooLarge(size: serializedSize)
                 }
-                if let txContext = transactionContext {
-                    try await logManager.logRecordInsert(txID: txContext.transactionID, pageID: currentPage.pageID, recordID: record.id, data: record.data)
-                }
                 pageDirty = true
                 inserted += 1
             }
@@ -475,7 +465,7 @@ public actor StorageEngine: Sendable {
 
         // Flush the last page
         if pageDirty {
-            if let txContext = transactionContext {
+            if transactionContext != nil {
                 try await savePage(currentPage, transactionContext: transactionContext, skipAfterImage: true)
             } else {
                 try await savePage(currentPage, transactionContext: transactionContext)

@@ -18,6 +18,16 @@ public struct Record: Sendable {
         self.overflowPageID = overflowPageID
     }
 
+    /// Pre-computed serialized size: avoids calling serialize() just to measure.
+    /// Non-overflow: 8B id + 4B length + data.count
+    /// Overflow: 8B id + 4B length + 1B flag + 4B totalLen + 4B overflowPageID + data.count
+    public var serializedSize: Int {
+        if overflowPageID != nil {
+            return 12 + 9 + data.count
+        }
+        return 12 + data.count
+    }
+
     /// Serialize the record into binary format: [id: 8 bytes][length: 4 bytes][data]
     /// For overflow records, data is prefixed with overflow header.
     public func serialize() -> Data {
