@@ -204,7 +204,7 @@ public struct DatabasePage: Sendable {
         guard let index = records.firstIndex(where: { $0.id == id }) else {
             return false
         }
-        let oldSize = records[index].serialize().count
+        let oldSize = index < recordSlots.count ? recordSlots[index].length : records[index].serialize().count
         let newSize = newRecord.serialize().count
         let sizeDiff = newSize - oldSize
         // Check if new record fits: freeSpaceOffset shrinks by sizeDiff
@@ -249,8 +249,9 @@ public struct DatabasePage: Sendable {
         guard let index = records.firstIndex(where: { $0.id == id }) else {
             return false
         }
-        let removedSize = records[index].serialize().count
+        let removedSize = index < recordSlots.count ? recordSlots[index].length : records[index].serialize().count
         records.remove(at: index)
+        if index < recordSlots.count { recordSlots.remove(at: index) }
         recordCount -= 1
         freeSpaceOffset += removedSize
         return true

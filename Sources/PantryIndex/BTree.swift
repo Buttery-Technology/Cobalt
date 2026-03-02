@@ -216,6 +216,33 @@ public actor BTree: Sendable {
         return (current, endIdx)
     }
 
+    /// Count entries in a range without materializing Row objects.
+    /// Much faster than searchRange + count for large result sets.
+    public func countRange(from startKey: DBValue?, to endKey: DBValue?) async throws -> Int64 {
+        guard let rootId = rootId,
+              let root = try await nodeStore.loadNode(nodeId: rootId) else {
+            return 0
+        }
+        let (leaf, startIndex) = try await findLeafAndIndex(from: root, key: startKey)
+        var count: Int64 = 0
+        var currentLeaf: BTreeNode? = leaf
+        var i = startIndex
+        while let leaf = currentLeaf {
+            while i < leaf.keys.count {
+                if let end = endKey, leaf.keys[i] > end { return count }
+                count += 1
+                i += 1
+            }
+            if let nextId = leaf.nextLeafId {
+                currentLeaf = try await nodeStore.loadNode(nodeId: nextId)
+                i = 0
+            } else {
+                currentLeaf = nil
+            }
+        }
+        return count
+    }
+
     // MARK: - Delete
 
     public func delete(key: DBValue, row: Row? = nil) async throws {

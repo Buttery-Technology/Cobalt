@@ -5,6 +5,7 @@ public protocol IndexHook: Sendable {
     func lookupRecord(id: UInt64, tableName: String) async throws -> Int?
     func updateIndexes(record: Record, row: Row, tableName: String) async throws
     func removeFromIndexes(id: UInt64, row: Row, tableName: String) async throws
+    func removeFromIndexesBatch(records: [(id: UInt64, row: Row)], tableName: String) async throws
 }
 
 /// Main storage engine coordinating pages, buffer pool, WAL, transactions, and table registry
@@ -46,6 +47,10 @@ public actor StorageEngine: Sendable {
 
     /// Set of system/reserved page IDs that should not be used for data
     private var systemPageIDs: Set<Int> = [0, 1]
+
+    /// Per-table RID-to-page cache for O(1) record lookup by ID.
+    /// Populated during table scans, updated on insert/delete.
+    private var ridPageMap: [String: [UInt64: Int]] = [:]
 
     public init(databasePath: String, bufferPoolCapacity: Int = 1000, encryptionProvider: EncryptionProvider? = nil, bufferPoolStripeCount: Int = 8, bgWriterIntervalMs: Int = 100) async throws {
         let sm = try StorageManager(databasePath: databasePath, encryptionProvider: encryptionProvider)
@@ -224,6 +229,29 @@ public actor StorageEngine: Sendable {
         }
     }
 
+    /// Save a page without flushing to disk — only serializes and marks dirty in buffer pool.
+    /// Call `flushDirtyPages` after a batch of deferred saves to write them all at once.
+    public func savePageDeferred(_ page: DatabasePage) async throws {
+        var serializedPage = page
+        try serializedPage.saveRecords()
+        bufferPoolManager.updatePage(serializedPage)
+        bufferPoolManager.markDirty(pageID: page.pageID)
+        if !systemPageIDs.contains(page.pageID) {
+            freeSpaceBitmap.setCategory(pageID: page.pageID, category: serializedPage.spaceCategory())
+        }
+    }
+
+    /// Flush specific dirty pages to disk.
+    public func flushDirtyPages(_ pageIDs: Set<Int>) async throws {
+        for pageID in pageIDs {
+            if let page = bufferPoolManager.getCachedPage(pageID: pageID) {
+                var writablePage = page
+                try await storageManager.writePage(&writablePage, alreadySerialized: true)
+                bufferPoolManager.clearDirtyFlag(pageID: pageID)
+            }
+        }
+    }
+
     // MARK: - Record Operations
 
     @discardableResult
@@ -290,6 +318,9 @@ public actor StorageEngine: Sendable {
         }
         updatedInfo.recordCount += 1
         tableRegistry.updateTableInfo(updatedInfo)
+
+        // Update RID-to-page cache
+        ridPageMap[tableName, default: [:]][record.id] = page.pageID
 
         if let row = row {
             try await indexHook?.updateIndexes(record: record, row: row, tableName: tableName)
@@ -530,6 +561,9 @@ public actor StorageEngine: Sendable {
             try await indexHook?.removeFromIndexes(id: id, row: row, tableName: tableName)
         }
 
+        // Remove from RID cache
+        ridPageMap[tableName]?.removeValue(forKey: id)
+
         guard var freshInfo = tableRegistry.getTableInfo(name: tableName) else {
             throw PantryError.tableNotFound(name: tableName)
         }
@@ -553,6 +587,7 @@ public actor StorageEngine: Sendable {
 
         let deleteSchema = tableRegistry.getTableInfo(name: tableName)?.schema
         var totalDeleted = 0
+        var indexRemovals: [(id: UInt64, row: Row)] = []
 
         // Process pages in sorted order for sequential I/O
         for pageID in byPage.keys.sorted() {
@@ -580,9 +615,13 @@ public actor StorageEngine: Sendable {
                         try await freeOverflowPages(startingAt: overflowStart)
                     }
 
+                    // Collect for batch index removal
                     if let row = row {
-                        try await indexHook?.removeFromIndexes(id: recordID, row: row, tableName: tableName)
+                        indexRemovals.append((id: recordID, row: row))
                     }
+
+                    // Remove from RID cache
+                    ridPageMap[tableName]?.removeValue(forKey: recordID)
                 }
             }
 
@@ -590,10 +629,20 @@ public actor StorageEngine: Sendable {
                 if transactionContext != nil {
                     try await savePage(page, transactionContext: transactionContext, skipAfterImage: true)
                 } else {
-                    try await savePage(page, transactionContext: transactionContext)
+                    try await savePageDeferred(page)
                 }
                 totalDeleted += deletedFromPage
             }
+        }
+
+        // Batch index removal — one pass per index instead of per record
+        if !indexRemovals.isEmpty {
+            try await indexHook?.removeFromIndexesBatch(records: indexRemovals, tableName: tableName)
+        }
+
+        // Flush all dirty pages at once for non-transactional deletes
+        if transactionContext == nil && totalDeleted > 0 {
+            try await flushDirtyPages(Set(byPage.keys))
         }
 
         // Update registry once
@@ -739,9 +788,8 @@ public actor StorageEngine: Sendable {
         return results
     }
 
-    /// Batch lookup: fetch full (Record, Row) pairs for a set of record IDs in a single table scan.
-    /// Much more efficient than N individual getRecord calls.
-    /// Uses concurrent page reads when no transaction context.
+    /// Batch lookup: fetch full (Record, Row) pairs for a set of record IDs.
+    /// Uses RID-to-page cache for O(1) lookup when available, falls back to page scan.
     /// Pass `neededColumns` to enable lazy overflow loading.
     public func getRecordsByIDs(_ ids: Set<UInt64>, tableName: String, transactionContext: TransactionContext? = nil, neededColumns: Set<String>? = nil) async throws -> [(Record, Row)] {
         guard let tableInfo = tableRegistry.getTableInfo(name: tableName) else {
@@ -752,9 +800,53 @@ public actor StorageEngine: Sendable {
         var remaining = ids
         var results: [(Record, Row)] = []
 
-        // Use cached page list for faster iteration
-        let pageIDs = tableInfo.pageList ?? []
+        // Fast path: use RID-to-page cache for direct page lookups
+        if let cache = ridPageMap[tableName], !cache.isEmpty {
+            // Group IDs by page for efficient batch loading
+            var idsByPage = [Int: [UInt64]]()
+            var uncached = [UInt64]()
+            for id in ids {
+                if let pageID = cache[id] {
+                    idsByPage[pageID, default: []].append(id)
+                } else {
+                    uncached.append(id)
+                }
+            }
 
+            for (pageID, pageIds) in idsByPage {
+                let page = transactionContext == nil
+                    ? try await getPageConcurrent(pageID: pageID)
+                    : try await getPage(pageID: pageID, transactionContext: transactionContext)
+                let idSet = Set(pageIds)
+                for var record in page.records {
+                    guard idSet.contains(record.id) else { continue }
+                    if record.isOverflow {
+                        if let needed = neededColumns,
+                           let partialRow = Row.fromBytesPartial(record.data, neededColumns: needed) {
+                            results.append((record, partialRow))
+                            remaining.remove(record.id)
+                            continue
+                        }
+                        record = try await reassembleOverflowRecord(record)
+                    }
+                    if let row = Row.fromBytesAuto(record.data, schema: idsSchema) {
+                        results.append((record, row))
+                        remaining.remove(record.id)
+                    }
+                }
+            }
+
+            // If all found, return early
+            if remaining.isEmpty || (remaining.isSubset(of: Set(uncached)) && uncached.isEmpty) {
+                return results
+            }
+            // Fall through for any remaining IDs not in cache
+            remaining = remaining.intersection(Set(uncached))
+            if remaining.isEmpty { return results }
+        }
+
+        // Fallback: scan pages to find remaining IDs (also populates the RID cache)
+        let pageIDs = tableInfo.pageList ?? []
         if !pageIDs.isEmpty {
             for currentPageID in pageIDs {
                 guard !remaining.isEmpty else { break }
@@ -762,6 +854,8 @@ public actor StorageEngine: Sendable {
                     ? try await getPageConcurrent(pageID: currentPageID)
                     : try await getPage(pageID: currentPageID, transactionContext: transactionContext)
                 for var record in page.records {
+                    // Populate RID cache for all records we see
+                    ridPageMap[tableName, default: [:]][record.id] = currentPageID
                     guard remaining.contains(record.id) else { continue }
                     if record.isOverflow {
                         if let needed = neededColumns,
@@ -779,7 +873,6 @@ public actor StorageEngine: Sendable {
                 }
             }
         } else {
-            // Fallback: walk linked list
             var currentPageID = tableInfo.firstPageID
             var visited: Set<Int> = []
             while currentPageID != 0 && !remaining.isEmpty {
@@ -788,6 +881,7 @@ public actor StorageEngine: Sendable {
                 }
                 let page = try await getPage(pageID: currentPageID, transactionContext: transactionContext)
                 for var record in page.records {
+                    ridPageMap[tableName, default: [:]][record.id] = currentPageID
                     guard remaining.contains(record.id) else { continue }
                     if record.isOverflow {
                         if let needed = neededColumns,
@@ -820,8 +914,44 @@ public actor StorageEngine: Sendable {
         let idsSchema = tableInfo.schema
         var remaining = ids
         var results: [(Record, Row, Int)] = []
-        let pageIDs = tableInfo.pageList ?? []
 
+        // Fast path: use RID-to-page cache
+        if let cache = ridPageMap[tableName], !cache.isEmpty {
+            var idsByPage = [Int: [UInt64]]()
+            var uncached = [UInt64]()
+            for id in ids {
+                if let pageID = cache[id] { idsByPage[pageID, default: []].append(id) }
+                else { uncached.append(id) }
+            }
+            for (pageID, pageIds) in idsByPage {
+                let page = transactionContext == nil
+                    ? try await getPageConcurrent(pageID: pageID)
+                    : try await getPage(pageID: pageID, transactionContext: transactionContext)
+                let idSet = Set(pageIds)
+                for var record in page.records {
+                    guard idSet.contains(record.id) else { continue }
+                    if record.isOverflow {
+                        if let needed = neededColumns,
+                           let partialRow = Row.fromBytesPartial(record.data, neededColumns: needed) {
+                            results.append((record, partialRow, pageID))
+                            remaining.remove(record.id)
+                            continue
+                        }
+                        record = try await reassembleOverflowRecord(record)
+                    }
+                    if let row = Row.fromBytesAuto(record.data, schema: idsSchema) {
+                        results.append((record, row, pageID))
+                        remaining.remove(record.id)
+                    }
+                }
+            }
+            if remaining.isEmpty { return results }
+            remaining = remaining.intersection(Set(uncached))
+            if remaining.isEmpty { return results }
+        }
+
+        // Fallback: scan pages
+        let pageIDs = tableInfo.pageList ?? []
         if !pageIDs.isEmpty {
             for currentPageID in pageIDs {
                 guard !remaining.isEmpty else { break }
@@ -829,6 +959,7 @@ public actor StorageEngine: Sendable {
                     ? try await getPageConcurrent(pageID: currentPageID)
                     : try await getPage(pageID: currentPageID, transactionContext: transactionContext)
                 for var record in page.records {
+                    ridPageMap[tableName, default: [:]][record.id] = currentPageID
                     guard remaining.contains(record.id) else { continue }
                     if record.isOverflow {
                         if let needed = neededColumns,
@@ -854,6 +985,7 @@ public actor StorageEngine: Sendable {
                 }
                 let page = try await getPage(pageID: currentPageID, transactionContext: transactionContext)
                 for var record in page.records {
+                    ridPageMap[tableName, default: [:]][record.id] = currentPageID
                     guard remaining.contains(record.id) else { continue }
                     if record.isOverflow {
                         if let needed = neededColumns,
@@ -1098,8 +1230,9 @@ public actor StorageEngine: Sendable {
             throw PantryError.tableNotFound(name: name)
         }
 
-        // Remove from registry first
+        // Remove from registry and RID cache
         tableRegistry.removeTable(name: name)
+        ridPageMap.removeValue(forKey: name)
         try await tableRegistry.save()
 
         // Chain freed data pages into the free list
