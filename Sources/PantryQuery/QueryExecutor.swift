@@ -1029,9 +1029,38 @@ public actor QueryExecutor: Sendable {
                 guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
                 return UInt64(bitPattern: ridSigned)
             })
-            let fullRecords = try await storageEngine.getRecordsByIDsWithPages(matchingRIDs, tableName: table, transactionContext: transactionContext)
 
-            // Batch delete: collect matching records, then delete per-page in one pass
+            // Raw data path: skip full Row deserialization, use lazy eval + raw index removal
+            let idxSchema = storageEngine.getTableSchema(table)
+            let idxColMap = idxSchema?.columnOrdinals
+            if idxSchema != nil {
+                let rawRecords = try await storageEngine.getRecordDataByIDs(matchingRIDs, tableName: table, transactionContext: transactionContext)
+                var matchingRaw: [(id: UInt64, pageID: Int, data: Data?)] = []
+                matchingRaw.reserveCapacity(rawRecords.count)
+                for (record, recordPageID) in rawRecords {
+                    // Lazy eval to verify condition without full Row decode
+                    if let colMap = idxColMap,
+                       let lazyResult = evaluateConditionLazy(condition, data: record.data, columnIndexMap: colMap) {
+                        if lazyResult {
+                            matchingRaw.append((id: record.id, pageID: recordPageID, data: record.data))
+                        }
+                        continue
+                    }
+                    // Fallback: full Row decode for complex conditions
+                    guard let row = Row.fromBytesAuto(record.data, schema: idxSchema),
+                          evaluateCondition(condition, row: row) else { continue }
+                    matchingRaw.append((id: record.id, pageID: recordPageID, data: record.data))
+                }
+                if !matchingRaw.isEmpty {
+                    try await storageEngine.deleteRecordsBatchRaw(matchingRaw, tableName: table, transactionContext: transactionContext)
+                    let modifiedPages = Set(matchingRaw.map { $0.pageID })
+                    invalidateResultCache(forTable: table, modifiedPages: modifiedPages)
+                }
+                return matchingRaw.count
+            }
+
+            // Fallback: original Row-based path
+            let fullRecords = try await storageEngine.getRecordsByIDsWithPages(matchingRIDs, tableName: table, transactionContext: transactionContext)
             var matchingForDelete: [(id: UInt64, pageID: Int, row: Row?)] = []
             for (record, row, recordPageID) in fullRecords where evaluateCondition(condition, row: row) {
                 matchingForDelete.append((id: record.id, pageID: recordPageID, row: row))
@@ -1047,44 +1076,68 @@ public actor QueryExecutor: Sendable {
         // Table scan path — walk pages directly, collect matching records, batch-delete per page
         let deleteSchema = storageEngine.getTableSchema(table)
         let deleteColMap = deleteSchema?.columnOrdinals
+        let useRawPath = deleteSchema != nil  // Use raw data path to avoid full Row deserialization
 
-        var matchingRecords: [(id: UInt64, pageID: Int, row: Row?)] = []
+        var matchingRaw: [(id: UInt64, pageID: Int, data: Data?)] = []
+        var matchingRows: [(id: UInt64, pageID: Int, row: Row?)] = []
         for pageID in pageIDs {
             let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
             for var record in page.records {
                 if condition == nil {
-                    // Unconditional delete — decode row for index removal
-                    let row: Row?
-                    if record.isOverflow {
-                        let full = try await storageEngine.reassembleOverflowRecord(record)
-                        row = Row.fromBytesAuto(full.data, schema: deleteSchema)
+                    // Unconditional delete
+                    if useRawPath {
+                        let data = record.isOverflow
+                            ? try await storageEngine.reassembleOverflowRecord(record).data
+                            : record.data
+                        matchingRaw.append((id: record.id, pageID: pageID, data: data))
                     } else {
-                        row = Row.fromBytesAuto(record.data, schema: deleteSchema)
+                        let row: Row? = record.isOverflow
+                            ? Row.fromBytesAuto(try await storageEngine.reassembleOverflowRecord(record).data, schema: deleteSchema)
+                            : Row.fromBytesAuto(record.data, schema: deleteSchema)
+                        matchingRows.append((id: record.id, pageID: pageID, row: row))
                     }
-                    matchingRecords.append((id: record.id, pageID: pageID, row: row))
                 } else {
                     var data = record.data
                     if record.isOverflow {
                         record = try await storageEngine.reassembleOverflowRecord(record)
                         data = record.data
                     }
+                    // Lazy evaluation: extract only the condition column, skip full decode
                     if let colMap = deleteColMap {
                         if let lazyResult = evaluateConditionLazy(condition!, data: data, columnIndexMap: colMap) {
                             if !lazyResult { continue }
+                            // Lazy eval was definitive — skip redundant full-Row condition check
+                            if useRawPath {
+                                matchingRaw.append((id: record.id, pageID: pageID, data: data))
+                            } else {
+                                guard let row = Row.fromBytesAuto(data, schema: deleteSchema) else { continue }
+                                matchingRows.append((id: record.id, pageID: pageID, row: row))
+                            }
+                            continue
                         }
                     }
+                    // Lazy eval couldn't determine result — fall back to full Row decode
                     guard let row = Row.fromBytesAuto(data, schema: deleteSchema), evaluateCondition(condition!, row: row) else { continue }
-                    matchingRecords.append((id: record.id, pageID: pageID, row: row))
+                    if useRawPath {
+                        matchingRaw.append((id: record.id, pageID: pageID, data: data))
+                    } else {
+                        matchingRows.append((id: record.id, pageID: pageID, row: row))
+                    }
                 }
             }
         }
 
-        if !matchingRecords.isEmpty {
-            try await storageEngine.deleteRecordsBatch(matchingRecords, tableName: table, transactionContext: transactionContext)
-            let modifiedPages = Set(matchingRecords.map { $0.pageID })
+        if useRawPath && !matchingRaw.isEmpty {
+            try await storageEngine.deleteRecordsBatchRaw(matchingRaw, tableName: table, transactionContext: transactionContext)
+            let modifiedPages = Set(matchingRaw.map { $0.pageID })
+            invalidateResultCache(forTable: table, modifiedPages: modifiedPages)
+            return matchingRaw.count
+        } else if !matchingRows.isEmpty {
+            try await storageEngine.deleteRecordsBatch(matchingRows, tableName: table, transactionContext: transactionContext)
+            let modifiedPages = Set(matchingRows.map { $0.pageID })
             invalidateResultCache(forTable: table, modifiedPages: modifiedPages)
         }
-        return matchingRecords.count
+        return matchingRows.count
     }
 
     // MARK: - AGGREGATE

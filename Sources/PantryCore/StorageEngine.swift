@@ -6,6 +6,7 @@ public protocol IndexHook: Sendable {
     func updateIndexes(record: Record, row: Row, tableName: String) async throws
     func removeFromIndexes(id: UInt64, row: Row, tableName: String) async throws
     func removeFromIndexesBatch(records: [(id: UInt64, row: Row)], tableName: String) async throws
+    func removeFromIndexesBatchRaw(records: [(id: UInt64, data: Data)], tableName: String, schema: PantryTableSchema) async throws
 }
 
 /// Main storage engine coordinating pages, buffer pool, WAL, transactions, and table registry
@@ -662,6 +663,73 @@ public actor StorageEngine: Sendable {
         }
     }
 
+    /// Batch-delete using raw data — avoids full Row deserialization.
+    /// Extracts only indexed column values via O(1) positional access.
+    public func deleteRecordsBatchRaw(_ records: [(id: UInt64, pageID: Int, data: Data?)], tableName: String, transactionContext: TransactionContext? = nil) async throws {
+        guard !records.isEmpty else { return }
+
+        var byPage = [Int: [(id: UInt64, data: Data?)]]()
+        for r in records {
+            byPage[r.pageID, default: []].append((id: r.id, data: r.data))
+        }
+
+        let schema = tableRegistry.getTableInfo(name: tableName)?.schema
+        var totalDeleted = 0
+        var rawIndexRemovals: [(id: UInt64, data: Data)] = []
+
+        for pageID in byPage.keys.sorted() {
+            let group = byPage[pageID]!
+            var page = try await getPage(pageID: pageID, transactionContext: transactionContext)
+            var deletedFromPage = 0
+
+            for (recordID, rawData) in group {
+                var overflowPageIDToFree: Int? = nil
+                if let record = page.records.first(where: { $0.id == recordID }), record.isOverflow {
+                    overflowPageIDToFree = record.overflowPageID
+                }
+
+                if let txContext = transactionContext,
+                   let record = page.records.first(where: { $0.id == recordID }) {
+                    try await logManager.logRecordDelete(txID: txContext.transactionID, pageID: pageID, recordID: recordID, data: record.data)
+                }
+
+                if page.deleteRecord(id: recordID) {
+                    deletedFromPage += 1
+                    if let overflowStart = overflowPageIDToFree {
+                        try await freeOverflowPages(startingAt: overflowStart)
+                    }
+                    if let data = rawData {
+                        rawIndexRemovals.append((id: recordID, data: data))
+                    }
+                    ridPageMap[tableName]?.removeValue(forKey: recordID)
+                }
+            }
+
+            if deletedFromPage > 0 {
+                if transactionContext != nil {
+                    try await savePage(page, transactionContext: transactionContext, skipAfterImage: true)
+                } else {
+                    try await savePageDeferred(page)
+                }
+                totalDeleted += deletedFromPage
+            }
+        }
+
+        if !rawIndexRemovals.isEmpty, let schema = schema {
+            try await indexHook?.removeFromIndexesBatchRaw(records: rawIndexRemovals, tableName: tableName, schema: schema)
+        }
+
+        if transactionContext == nil && totalDeleted > 0 {
+            try await flushDirtyPages(Set(byPage.keys))
+        }
+
+        if totalDeleted > 0 {
+            guard var freshInfo = tableRegistry.getTableInfo(name: tableName) else { return }
+            freshInfo.recordCount = max(0, freshInfo.recordCount - totalDeleted)
+            tableRegistry.updateTableInfo(freshInfo)
+        }
+    }
+
     /// Try to replace a record in-place on its current page. Returns true if successful.
     /// Falls back to false when: record not found, new data doesn't fit, or record is overflow.
     /// Pass `knownPageID` to skip the sequential scan for the record's page.
@@ -1009,6 +1077,86 @@ public actor StorageEngine: Sendable {
                         results.append((record, row, currentPageID))
                         remaining.remove(record.id)
                     }
+                }
+                currentPageID = page.nextPageID
+            }
+        }
+
+        return results
+    }
+
+    /// Like getRecordsByIDsWithPages but returns raw Data instead of decoded Row.
+    /// Skips full Row deserialization for callers that only need raw bytes.
+    public func getRecordDataByIDs(_ ids: Set<UInt64>, tableName: String, transactionContext: TransactionContext? = nil) async throws -> [(Record, Int)] {
+        guard let tableInfo = tableRegistry.getTableInfo(name: tableName) else {
+            throw PantryError.tableNotFound(name: tableName)
+        }
+
+        var remaining = ids
+        var results: [(Record, Int)] = []
+        results.reserveCapacity(ids.count)
+
+        // Fast path: use RID-to-page cache
+        if let cache = ridPageMap[tableName], !cache.isEmpty {
+            var idsByPage = [Int: [UInt64]]()
+            var uncached = [UInt64]()
+            for id in ids {
+                if let pageID = cache[id] { idsByPage[pageID, default: []].append(id) }
+                else { uncached.append(id) }
+            }
+            for (pageID, pageIds) in idsByPage {
+                let page = transactionContext == nil
+                    ? try await getPageConcurrent(pageID: pageID)
+                    : try await getPage(pageID: pageID, transactionContext: transactionContext)
+                let idSet = Set(pageIds)
+                for var record in page.records {
+                    guard idSet.contains(record.id) else { continue }
+                    if record.isOverflow {
+                        record = try await reassembleOverflowRecord(record)
+                    }
+                    results.append((record, pageID))
+                    remaining.remove(record.id)
+                }
+            }
+            if remaining.isEmpty { return results }
+            remaining = remaining.intersection(Set(uncached))
+            if remaining.isEmpty { return results }
+        }
+
+        // Fallback: scan pages
+        let pageIDs = tableInfo.pageList ?? []
+        if !pageIDs.isEmpty {
+            for currentPageID in pageIDs {
+                guard !remaining.isEmpty else { break }
+                let page = transactionContext == nil
+                    ? try await getPageConcurrent(pageID: currentPageID)
+                    : try await getPage(pageID: currentPageID, transactionContext: transactionContext)
+                for var record in page.records {
+                    ridPageMap[tableName, default: [:]][record.id] = currentPageID
+                    guard remaining.contains(record.id) else { continue }
+                    if record.isOverflow {
+                        record = try await reassembleOverflowRecord(record)
+                    }
+                    results.append((record, currentPageID))
+                    remaining.remove(record.id)
+                }
+            }
+        } else {
+            var currentPageID = tableInfo.firstPageID
+            var visited: Set<Int> = []
+            while currentPageID != 0 && !remaining.isEmpty {
+                guard visited.insert(currentPageID).inserted else {
+                    throw PantryError.corruptPage(pageID: currentPageID)
+                }
+                let page = try await getPage(pageID: currentPageID, transactionContext: transactionContext)
+                for var record in page.records {
+                    ridPageMap[tableName, default: [:]][record.id] = currentPageID
+                    guard remaining.contains(record.id) else { continue }
+                    if record.isOverflow {
+                        record = try await reassembleOverflowRecord(record)
+                    }
+                    results.append((record, currentPageID))
+                    remaining.remove(record.id)
                 }
                 currentPageID = page.nextPageID
             }
