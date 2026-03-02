@@ -100,7 +100,7 @@ public final class PageBackedNodeStore: @unchecked Sendable {
         for (_, node, pageID) in nodesToFlush {
             let data = try node.serialize()
             let record = Record(id: Self.nodeId(node.nodeId), data: data)
-            let recordSize = record.serialize().count
+            let recordSize = record.serializedSize
             let maxRecordSize = PantryConstants.PAGE_SIZE - PantryConstants.PAGE_HEADER_SIZE - PantryConstants.SLOT_SIZE
             guard recordSize <= maxRecordSize else {
                 throw PantryError.pageOverflow

@@ -270,7 +270,7 @@ public actor StorageEngine: Sendable {
             throw PantryError.tableNotFound(name: tableName)
         }
 
-        let serializedSize = record.serialize().count
+        let serializedSize = record.serializedSize
         let maxInlineSize = PantryConstants.MAX_INLINE_RECORD_SIZE
 
         // Check if this record needs overflow pages
@@ -346,7 +346,7 @@ public actor StorageEngine: Sendable {
             throw PantryError.tableNotFound(name: tableName)
         }
 
-        let serializedSize = record.serialize().count
+        let serializedSize = record.serializedSize
         let maxInlineSize = PantryConstants.MAX_INLINE_RECORD_SIZE
 
         if serializedSize > maxInlineSize {
@@ -1715,7 +1715,7 @@ public actor StorageEngine: Sendable {
         guard let currentInfo = tableRegistry.getTableInfo(name: tableName) else {
             throw PantryError.tableNotFound(name: tableName)
         }
-        let serializedSize = inlineRecord.serialize().count
+        let serializedSize = inlineRecord.serializedSize
         let targetPageID = try await findTargetPageForInsert(tableInfo: currentInfo, recordSize: serializedSize)
         var page = try await getPage(pageID: targetPageID, transactionContext: transactionContext)
 
@@ -1909,7 +1909,7 @@ public actor StorageEngine: Sendable {
         var metaPage = try await storageManager.readPage(pageID: PantryConstants.SYSTEM_PAGE_DB_METADATA)
         metaPage.records = [record]
         metaPage.recordCount = 1
-        metaPage.freeSpaceOffset = PantryConstants.PAGE_SIZE - record.serialize().count
+        metaPage.freeSpaceOffset = PantryConstants.PAGE_SIZE - record.serializedSize
         try await storageManager.writePage(&metaPage)
         bufferPoolManager.updatePage(metaPage)
     }
