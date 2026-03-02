@@ -59,6 +59,51 @@ public actor BTree: Sendable {
         return try await searchNode(node: root, key: key)
     }
 
+    /// Range scan from a lower bound, collecting rows while predicate returns true.
+    /// Exploits B-tree sort order: once predicate fails, no further matches exist.
+    public func searchRangeWhile(from startKey: DBValue?, predicate: @Sendable (DBValue) -> Bool) async throws -> [Row] {
+        guard let rootId = rootId,
+              let root = try await nodeStore.loadNode(nodeId: rootId) else {
+            return []
+        }
+        var results: [Row] = []
+        try await collectRangeWhile(node: root, startKey: startKey, predicate: predicate, results: &results)
+        return results
+    }
+
+    /// In-order traversal from lowerBound(startKey), collecting while predicate holds on keys.
+    private func collectRangeWhile(node: BTreeNode, startKey: DBValue?, predicate: @Sendable (DBValue) -> Bool, results: inout [Row]) async throws {
+        var i: Int
+        if let start = startKey {
+            i = lowerBound(node.keys, start)
+        } else {
+            i = 0
+        }
+
+        if node.isLeaf {
+            while i < node.keys.count {
+                guard predicate(node.keys[i]) else { return }
+                results.append(node.values[i])
+                i += 1
+            }
+        } else {
+            while i <= node.keys.count {
+                if let childId = node.children?[i],
+                   let child = try await nodeStore.loadNode(nodeId: childId) {
+                    let before = results.count
+                    try await collectRangeWhile(node: child, startKey: startKey, predicate: predicate, results: &results)
+                    // If child traversal stopped early (predicate failed), propagate stop
+                    if results.count == before && i > 0 { return }
+                }
+                if i < node.keys.count {
+                    guard predicate(node.keys[i]) else { return }
+                    results.append(node.values[i])
+                }
+                i += 1
+            }
+        }
+    }
+
     public func searchRange(from startKey: DBValue?, to endKey: DBValue?) async throws -> [Row] {
         guard let rootId = rootId,
               let root = try await nodeStore.loadNode(nodeId: rootId) else {
@@ -80,11 +125,7 @@ public actor BTree: Sendable {
         if ascending {
             try await collectRangeLimited(node: root, startKey: startKey, endKey: endKey, results: &results, limit: limit)
         } else {
-            // For descending, collect all in range then reverse + take limit
-            // (A proper reverse traversal would be more efficient for large datasets)
-            try await collectRange(node: root, startKey: startKey, endKey: endKey, results: &results)
-            results.reverse()
-            if results.count > limit { results = Array(results.prefix(limit)) }
+            try await collectRangeReverseLimited(node: root, startKey: startKey, endKey: endKey, results: &results, limit: limit)
         }
         return results
     }
@@ -117,6 +158,61 @@ public actor BTree: Sendable {
                     results.append(node.values[i])
                 }
                 i += 1
+            }
+        }
+    }
+
+    /// Collect rows in descending order with early exit once limit is reached.
+    /// Traverses right-to-left: in non-leaf nodes iterates children from rightmost to leftmost,
+    /// in leaf nodes iterates keys from last to first.
+    private func collectRangeReverseLimited(node: BTreeNode, startKey: DBValue?, endKey: DBValue?, results: inout [Row], limit: Int) async throws {
+        guard results.count < limit else { return }
+
+        // Find the rightmost position to start (using endKey as upper bound)
+        let hi: Int
+        if let end = endKey {
+            hi = upperBound(node.keys, end) - 1
+        } else {
+            hi = node.keys.count - 1
+        }
+
+        // Find the leftmost position to stop (using startKey as lower bound)
+        let lo: Int
+        if let start = startKey {
+            lo = lowerBound(node.keys, start)
+        } else {
+            lo = 0
+        }
+
+        if node.isLeaf {
+            var i = hi
+            while i >= lo && results.count < limit {
+                results.append(node.values[i])
+                i -= 1
+            }
+        } else {
+            // Traverse from right to left: child[i+1], then key[i], child[i], key[i-1], ...
+            var i = hi
+            // First, traverse the rightmost child (child at index hi+1)
+            if hi + 1 <= node.keys.count, hi + 1 < (node.children?.count ?? 0) {
+                if let childId = node.children?[hi + 1],
+                   let child = try await nodeStore.loadNode(nodeId: childId) {
+                    try await collectRangeReverseLimited(node: child, startKey: startKey, endKey: endKey, results: &results, limit: limit)
+                }
+            }
+            guard results.count < limit else { return }
+
+            while i >= lo && results.count < limit {
+                // Add current key
+                results.append(node.values[i])
+                guard results.count < limit else { return }
+
+                // Traverse left child
+                if let childId = node.children?[i],
+                   let child = try await nodeStore.loadNode(nodeId: childId) {
+                    try await collectRangeReverseLimited(node: child, startKey: startKey, endKey: endKey, results: &results, limit: limit)
+                }
+                i -= 1
             }
         }
     }

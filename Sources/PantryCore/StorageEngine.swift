@@ -27,6 +27,9 @@ public actor StorageEngine: Sendable {
     /// Page ID storing the free space bitmap (0 = not allocated)
     private var freeSpaceBitmapPageID: Int = 0
 
+    /// LSN of the last completed checkpoint (persisted in page 0 metadata)
+    private var checkpointLSN: UInt64 = 0
+
     /// Persisted free space bitmap for O(1) page selection
     private let freeSpaceBitmap = FreeSpaceBitmap()
 
@@ -98,6 +101,9 @@ public actor StorageEngine: Sendable {
             freeListHead = meta.freeListHead
             indexRegistryPageID = meta.indexRegistryPageID
             freeSpaceBitmapPageID = meta.freeSpaceBitmapPageID
+            checkpointLSN = meta.checkpointLSN
+            // Pass checkpoint LSN to WAL so recovery skips already-checkpointed records
+            await logManager.setCheckpointLSN(checkpointLSN)
         }
 
         // Load or initialize the free space bitmap
@@ -1174,7 +1180,7 @@ public actor StorageEngine: Sendable {
 
     /// Save freeListHead, indexRegistryPageID, and freeSpaceBitmapPageID as a record on page 0
     private func saveDBMetadata() async throws {
-        let meta = DBMetadata(freeListHead: freeListHead, indexRegistryPageID: indexRegistryPageID, freeSpaceBitmapPageID: freeSpaceBitmapPageID)
+        let meta = DBMetadata(freeListHead: freeListHead, indexRegistryPageID: indexRegistryPageID, freeSpaceBitmapPageID: freeSpaceBitmapPageID, checkpointLSN: checkpointLSN)
         let data = try JSONEncoder().encode(meta)
         let record = Record(id: 1, data: data)
 
@@ -1195,6 +1201,12 @@ public actor StorageEngine: Sendable {
     /// Flush all dirty pages and truncate the WAL
     public func checkpoint() async throws {
         try await transactionManager.createCheckpoint()
+        // Persist the checkpoint LSN so recovery skips already-checkpointed records
+        let newLSN = await transactionManager.lastCheckpointLSN
+        if newLSN > checkpointLSN {
+            checkpointLSN = newLSN
+            try await saveDBMetadata()
+        }
     }
 
     // MARK: - Lifecycle

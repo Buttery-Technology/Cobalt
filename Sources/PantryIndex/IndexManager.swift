@@ -78,6 +78,11 @@ public actor ColumnIndex: Sendable {
         try await btree.searchRangeWithLimit(from: startKey, to: endKey, limit: limit, ascending: ascending)
     }
 
+    /// Range scan from a lower bound, collecting while predicate holds on keys
+    public func searchRangeWhile(from startKey: DBValue?, predicate: @Sendable (DBValue) -> Bool) async throws -> [Row] {
+        try await btree.searchRangeWhile(from: startKey, predicate: predicate)
+    }
+
     /// Delete a specific (key, row) entry from this index
     public func delete(key: DBValue, row: Row? = nil) async throws {
         try await btree.delete(key: key, row: row)
@@ -88,6 +93,18 @@ public actor ColumnIndex: Sendable {
         bloomFilter.add(value.indexKey)
         if keyHashSet.count < Self.maxHashSetSize {
             keyHashSet.insert(value.indexKey.hashValue)
+        }
+    }
+
+    /// Get the current bloom filter snapshot for persistence
+    public var bloomFilterSnapshot: BloomFilterSnapshot {
+        bloomFilter.snapshot
+    }
+
+    /// Restore bloom filter from a persisted snapshot
+    public func restoreBloomFilter(_ snap: BloomFilterSnapshot) {
+        if let restored = BloomFilter.fromSnapshot(snap) {
+            bloomFilter = restored
         }
     }
 }
@@ -175,12 +192,14 @@ public actor IndexManager: IndexHook, Sendable {
                 let rootId = await columnIndex.btree.getRootId()
                 let nodePageMap = await columnIndex.nodeStore.getNodePageMap()
                 let compoundCols = await columnIndex.compoundColumns
+                let bloomSnap = await columnIndex.bloomFilterSnapshot
                 entries.append(IndexRegistryEntry(
                     tableName: tableName,
                     columnName: columnName,
                     compoundColumns: compoundCols,
                     rootNodeId: rootId,
-                    nodePageMap: nodePageMap
+                    nodePageMap: nodePageMap,
+                    bloomFilterSnapshot: bloomSnap
                 ))
             }
         }
@@ -204,12 +223,13 @@ public actor IndexManager: IndexHook, Sendable {
                 nodeStore: nodeStore
             )
 
-            // Rebuild bloom filter from B-tree data
-            if entry.rootNodeId != nil {
+            // Restore bloom filter from persisted snapshot, or rebuild from B-tree data
+            if let snap = entry.bloomFilterSnapshot {
+                await columnIndex.restoreBloomFilter(snap)
+            } else if entry.rootNodeId != nil {
                 let allRows = try await btree.searchRange(from: nil, to: nil)
                 for row in allRows {
                     if let compoundCols = entry.compoundColumns {
-                        // Compound index: reconstruct compound key for bloom filter
                         let keyValues = compoundCols.map { row.values[$0] ?? .null }
                         await columnIndex.addToBloomFilter(.compound(keyValues))
                     } else if let value = row.values[entry.columnName] {
@@ -356,19 +376,19 @@ public actor IndexManager: IndexHook, Sendable {
                             return results
                         }
                     }
-                    // Prefix match: first N columns present (range scan on prefix)
+                    // Prefix match: first N columns present (bounded range scan on prefix)
                     let prefixLen = compoundColumns.prefix(while: { equalsMap[$0] != nil }).count
                     if prefixLen > 0 && prefixLen < compoundColumns.count {
                         let prefixValues = compoundColumns.prefix(prefixLen).map { equalsMap[$0]! }
-                        // Scan all entries and filter by prefix columns in memory
-                        let allRows = try await columnIndex.searchRange(from: nil, to: nil)
-                        let filtered = allRows.filter { row in
-                            for (i, col) in compoundColumns.prefix(prefixLen).enumerated() {
-                                guard let val = row.values[col], val == prefixValues[i] else { return false }
+                        let lowerBound = DBValue.compound(prefixValues)
+                        let results = try await columnIndex.searchRangeWhile(from: lowerBound) { key in
+                            guard case .compound(let keyParts) = key, keyParts.count >= prefixLen else { return false }
+                            for i in 0..<prefixLen {
+                                if keyParts[i] != prefixValues[i] { return false }
                             }
                             return true
                         }
-                        return filtered
+                        return results
                     }
                 }
             }

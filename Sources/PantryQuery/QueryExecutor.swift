@@ -852,7 +852,10 @@ public actor QueryExecutor: Sendable {
                 guard start < end else { continue }
                 let chunk = Array(rows[start..<end])
                 group.addTask {
-                    self.computeAggregate(rows: chunk, function: function)
+                    if case .avg(let column) = function {
+                        return self.computePartialAVG(rows: chunk, column: column)
+                    }
+                    return self.computeAggregate(rows: chunk, function: function)
                 }
             }
             var results = [DBValue]()
@@ -885,16 +888,17 @@ public actor QueryExecutor: Sendable {
             return allInts ? .integer(intSum) : .double(doubleSum)
 
         case .avg:
-            // Each partial AVG needs to be re-derived from partial sums
-            // Since we used avg per chunk, we need to re-weight
-            // Simpler: sum all partial avgs weighted by chunk size isn't perfect
-            // For correctness, recalculate from the sum aggregate
-            var sum: Double = 0; var count = 0
+            // Each partial result is .compound([.double(sum), .integer(count)])
+            var totalSum: Double = 0
+            var totalCount: Int64 = 0
             for r in results {
-                if case .double(let v) = r { sum += v; count += 1 }
+                if case .compound(let parts) = r, parts.count == 2,
+                   case .double(let s) = parts[0], case .integer(let c) = parts[1] {
+                    totalSum += s
+                    totalCount += c
+                }
             }
-            // Approximate: since partitions are equal-ish, weight equally
-            return count > 0 ? .double(sum / Double(count)) : .null
+            return totalCount > 0 ? .double(totalSum / Double(totalCount)) : .null
 
         case .min:
             var best: DBValue = .null
@@ -910,6 +914,20 @@ public actor QueryExecutor: Sendable {
             }
             return best
         }
+    }
+
+    /// Compute partial AVG as (sum, count) for correct parallel merging.
+    /// Returns .compound([.double(sum), .integer(count)]) instead of the divided average.
+    private nonisolated func computePartialAVG(rows: [Row], column: String) -> DBValue {
+        var sum: Double = 0
+        var count: Int64 = 0
+        for row in rows {
+            if let value = numericValue(row.values[column]) {
+                sum += value
+                count += 1
+            }
+        }
+        return .compound([.double(sum), .integer(count)])
     }
 
     private nonisolated func numericValue(_ value: DBValue?) -> Double? {
@@ -1157,47 +1175,62 @@ public actor QueryExecutor: Sendable {
 
     /// Evaluate a WHERE condition against raw binary data using partial column extraction.
     /// Returns nil if the condition type is too complex for lazy eval.
-    private nonisolated func evaluateConditionLazy(_ condition: WhereCondition, data: Data) -> Bool? {
-        // Positional encoding (0xFF magic) doesn't embed column names — can't use columnValue
-        if data.count >= 1, data[data.startIndex] == 0xFF { return nil }
+    /// When `columnIndexMap` is provided (schema-based positional data), uses fast positional lookup.
+    private nonisolated func evaluateConditionLazy(_ condition: WhereCondition, data: Data, columnIndexMap: [String: Int]? = nil) -> Bool? {
+        // Build a column lookup closure that dispatches to positional or self-describing extraction
+        let lookupColumn: (String) -> DBValue?
+        if data.count >= 2, data[data.startIndex] == 0xFF {
+            guard let indexMap = columnIndexMap else { return nil }
+            // Read colCount from the positional header
+            var off = 2
+            guard let colCount = data.readUInt16(at: &off) else { return nil }
+            let cc = Int(colCount)
+            lookupColumn = { col in
+                guard let idx = indexMap[col] else { return nil }
+                return Row.columnValuePositional(at: idx, colCount: cc, from: data)
+            }
+        } else {
+            lookupColumn = { col in Row.columnValue(named: col, from: data) }
+        }
+
         switch condition {
         case .equals(let col, let value):
             if value == .null { return false }
-            guard let rowValue = Row.columnValue(named: col, from: data) else { return false }
+            guard let rowValue = lookupColumn(col) else { return false }
             if rowValue == .null { return false }
             return rowValue == value
         case .notEquals(let col, let value):
             if value == .null { return false }
-            guard let rowValue = Row.columnValue(named: col, from: data) else { return false }
+            guard let rowValue = lookupColumn(col) else { return false }
             if rowValue == .null { return false }
             return rowValue != value
         case .lessThan(let col, let value):
-            guard let rowValue = Row.columnValue(named: col, from: data), rowValue != .null, value != .null else { return false }
+            guard let rowValue = lookupColumn(col), rowValue != .null, value != .null else { return false }
             return rowValue < value
         case .greaterThan(let col, let value):
-            guard let rowValue = Row.columnValue(named: col, from: data), rowValue != .null, value != .null else { return false }
+            guard let rowValue = lookupColumn(col), rowValue != .null, value != .null else { return false }
             return rowValue > value
         case .lessThanOrEqual(let col, let value):
-            guard let rowValue = Row.columnValue(named: col, from: data), rowValue != .null, value != .null else { return false }
+            guard let rowValue = lookupColumn(col), rowValue != .null, value != .null else { return false }
             return rowValue <= value
         case .greaterThanOrEqual(let col, let value):
-            guard let rowValue = Row.columnValue(named: col, from: data), rowValue != .null, value != .null else { return false }
+            guard let rowValue = lookupColumn(col), rowValue != .null, value != .null else { return false }
             return rowValue >= value
         case .isNull(let col):
-            let val = Row.columnValue(named: col, from: data)
+            let val = lookupColumn(col)
             return val == nil || val == .null
         case .isNotNull(let col):
-            guard let val = Row.columnValue(named: col, from: data) else { return false }
+            guard let val = lookupColumn(col) else { return false }
             return val != .null
         case .and(let subs):
             for sub in subs {
-                guard let result = evaluateConditionLazy(sub, data: data) else { return nil }
+                guard let result = evaluateConditionLazy(sub, data: data, columnIndexMap: columnIndexMap) else { return nil }
                 if !result { return false }
             }
             return true
         case .or(let subs):
             for sub in subs {
-                guard let result = evaluateConditionLazy(sub, data: data) else { return nil }
+                guard let result = evaluateConditionLazy(sub, data: data, columnIndexMap: columnIndexMap) else { return nil }
                 if result { return true }
             }
             return false
@@ -1373,6 +1406,17 @@ public actor QueryExecutor: Sendable {
             let conditionColumns = columnsReferenced(in: condition)
             let useLazy = conditionColumns.count <= 3
 
+            // Precompute column name → index map for positional lazy evaluation
+            let columnIndexMap: [String: Int]?
+            if let schema = schema {
+                var map = [String: Int]()
+                map.reserveCapacity(schema.columns.count)
+                for (i, col) in schema.columns.enumerated() { map[col.name] = i }
+                columnIndexMap = map
+            } else {
+                columnIndexMap = nil
+            }
+
             // Sequential early-exit path when limit is set (avoids over-scanning)
             if let limit = limit {
                 var rows: [Row] = []
@@ -1392,7 +1436,7 @@ public actor QueryExecutor: Sendable {
                             }
                             record = try await storageEngine.reassembleOverflowRecord(record)
                         }
-                        if useLazy, let result = evaluateConditionLazy(condition, data: record.data) {
+                        if useLazy, let result = evaluateConditionLazy(condition, data: record.data, columnIndexMap: columnIndexMap) {
                             if result, let row = Row.fromBytesAuto(record.data, schema: schema) {
                                 rows.append(row)
                                 if rows.count >= limit { return rows }
@@ -1423,7 +1467,7 @@ public actor QueryExecutor: Sendable {
                                 }
                                 record = try await storageEngine.reassembleOverflowRecord(record)
                             }
-                            if useLazy, let result = self.evaluateConditionLazy(condition, data: record.data) {
+                            if useLazy, let result = self.evaluateConditionLazy(condition, data: record.data, columnIndexMap: columnIndexMap) {
                                 if result, let row = Row.fromBytesAuto(record.data, schema: schema) {
                                     pageRows.append(row)
                                 }

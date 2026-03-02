@@ -149,13 +149,15 @@ public struct IndexRegistryEntry: Codable, Sendable {
     public var compoundColumns: [String]?
     public var rootNodeId: UUID?
     public var nodePageMap: [String: Int] // UUID string → page ID
+    public var bloomFilterSnapshot: BloomFilterSnapshot?
 
-    public init(tableName: String, columnName: String, compoundColumns: [String]? = nil, rootNodeId: UUID?, nodePageMap: [UUID: Int]) {
+    public init(tableName: String, columnName: String, compoundColumns: [String]? = nil, rootNodeId: UUID?, nodePageMap: [UUID: Int], bloomFilterSnapshot: BloomFilterSnapshot? = nil) {
         self.tableName = tableName
         self.columnName = columnName
         self.compoundColumns = compoundColumns
         self.rootNodeId = rootNodeId
         self.nodePageMap = Dictionary(uniqueKeysWithValues: nodePageMap.map { ($0.key.uuidString, $0.value) })
+        self.bloomFilterSnapshot = bloomFilterSnapshot
     }
 
     public var decodedNodePageMap: [UUID: Int] {
