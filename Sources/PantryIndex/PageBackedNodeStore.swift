@@ -3,14 +3,16 @@ import PantryCore
 
 /// Replaces SwiftDB's file-per-node PageManager with page-backed storage via BufferPool.
 /// Each B-tree node is serialized and stored in a PantryCore page.
-public actor PageBackedNodeStore: Sendable {
-    private var nodePageMap: [UUID: Int] = [:]
-    /// Node object cache with LRU eviction — returns references directly without deep copying.
-    /// Safe because BTree and PageBackedNodeStore are both actors (serialized access).
-    private var nodeCache: [UUID: BTreeNode] = [:]
-    private var nodeCacheOrder: [UUID: UInt64] = [:]  // LRU: access counter per node
-    private var nodeCacheCounter: UInt64 = 0
-    private var dirtyNodes: Set<UUID> = []  // nodes modified since last flush
+/// Converted from actor to class with internal locking to eliminate actor hops from BTree.
+public final class PageBackedNodeStore: @unchecked Sendable {
+    private struct State {
+        var nodePageMap: [UUID: Int] = [:]
+        var nodeCache: [UUID: BTreeNode] = [:]
+        var nodeCacheOrder: [UUID: UInt64] = [:]
+        var nodeCacheCounter: UInt64 = 0
+        var dirtyNodes: Set<UUID> = []
+    }
+    private let state: PantryLock<State>
     private static let maxNodeCacheSize = 10_000
     private let bufferPool: BufferPoolManager
     private let storageManager: StorageManager
@@ -18,34 +20,48 @@ public actor PageBackedNodeStore: Sendable {
     public init(bufferPool: BufferPoolManager, storageManager: StorageManager) {
         self.bufferPool = bufferPool
         self.storageManager = storageManager
+        self.state = PantryLock(State())
     }
 
     /// Save a B-tree node — caches in memory and marks dirty.
     /// Serialization is deferred until flushDirtyNodes() for batch I/O.
     public func saveNode(_ node: BTreeNode) async throws {
-        // Allocate a page for new nodes immediately (need page ID for mapping)
-        if nodePageMap[node.nodeId] == nil {
+        let needsPage = state.withLock { s in
+            s.nodePageMap[node.nodeId] == nil
+        }
+        if needsPage {
             var page = try await storageManager.createNewPage()
             page.pageFlags = [.indexNode]
-            nodePageMap[node.nodeId] = page.pageID
+            state.withLock { s in
+                s.nodePageMap[node.nodeId] = page.pageID
+            }
             await bufferPool.cachePage(page)
         }
-        // Cache the node directly — no copy needed (actor serializes access)
-        nodeCache[node.nodeId] = node
-        dirtyNodes.insert(node.nodeId)
-        nodeCacheCounter += 1
-        nodeCacheOrder[node.nodeId] = nodeCacheCounter
-        evictNodeCacheIfNeeded()
+        state.withLock { s in
+            s.nodeCache[node.nodeId] = node
+            s.dirtyNodes.insert(node.nodeId)
+            s.nodeCacheCounter += 1
+            s.nodeCacheOrder[node.nodeId] = s.nodeCacheCounter
+            Self.evictIfNeeded(&s)
+        }
     }
 
     /// Serialize and persist all dirty nodes to their pages.
     /// Called at transaction boundaries or during flush.
     public func flushDirtyNodes() async throws {
-        for nodeId in dirtyNodes {
-            guard let node = nodeCache[nodeId],
-                  let pageID = nodePageMap[nodeId] else { continue }
+        let nodesToFlush: [(UUID, BTreeNode, Int)] = state.withLock { s in
+            var result = [(UUID, BTreeNode, Int)]()
+            for nodeId in s.dirtyNodes {
+                guard let node = s.nodeCache[nodeId],
+                      let pageID = s.nodePageMap[nodeId] else { continue }
+                result.append((nodeId, node, pageID))
+            }
+            s.dirtyNodes.removeAll()
+            return result
+        }
+        for (_, node, pageID) in nodesToFlush {
             let data = try node.serialize()
-            let record = Record(id: self.nodeId(nodeId), data: data)
+            let record = Record(id: Self.nodeId(node.nodeId), data: data)
             let recordSize = record.serialize().count
             let maxRecordSize = PantryConstants.PAGE_SIZE - PantryConstants.PAGE_HEADER_SIZE - PantryConstants.SLOT_SIZE
             guard recordSize <= maxRecordSize else {
@@ -59,50 +75,55 @@ public actor PageBackedNodeStore: Sendable {
             bufferPool.updatePage(page)
             bufferPool.markDirty(pageID: pageID)
         }
-        dirtyNodes.removeAll()
     }
 
-    /// Load a B-tree node from its page.
-    /// Returns cached reference directly (no deep copy) — safe under actor isolation.
+    /// Load a B-tree node — synchronous fast path for cache hits, async for misses.
     public func loadNode(nodeId: UUID) async throws -> BTreeNode? {
-        if let cached = nodeCache[nodeId] {
-            nodeCacheCounter += 1
-            nodeCacheOrder[nodeId] = nodeCacheCounter
-            return cached
-        }
-
-        guard let pageID = nodePageMap[nodeId] else {
+        // Fast path: cache hit (no async, no actor hop)
+        let cached: BTreeNode? = state.withLock { s in
+            if let node = s.nodeCache[nodeId] {
+                s.nodeCacheCounter += 1
+                s.nodeCacheOrder[nodeId] = s.nodeCacheCounter
+                return node
+            }
             return nil
         }
+        if let cached { return cached }
+
+        // Slow path: load from buffer pool
+        let pageID: Int? = state.withLock { s in s.nodePageMap[nodeId] }
+        guard let pageID else { return nil }
 
         let page = try await bufferPool.getPage(pageID: pageID)
-        guard let record = page.records.first else {
-            return nil
-        }
+        guard let record = page.records.first else { return nil }
 
         let node = try BTreeNode.deserialize(from: record.data)
-        nodeCache[nodeId] = node
-        nodeCacheCounter += 1
-        nodeCacheOrder[nodeId] = nodeCacheCounter
-        evictNodeCacheIfNeeded()
+        state.withLock { s in
+            s.nodeCache[nodeId] = node
+            s.nodeCacheCounter += 1
+            s.nodeCacheOrder[nodeId] = s.nodeCacheCounter
+            Self.evictIfNeeded(&s)
+        }
         return node
     }
 
     /// Remove a node from the page map and cache (e.g. after merge absorbs it)
     public func removeNode(nodeId: UUID) {
-        nodePageMap.removeValue(forKey: nodeId)
-        nodeCache.removeValue(forKey: nodeId)
-        nodeCacheOrder.removeValue(forKey: nodeId)
+        state.withLock { s in
+            s.nodePageMap.removeValue(forKey: nodeId)
+            s.nodeCache.removeValue(forKey: nodeId)
+            s.nodeCacheOrder.removeValue(forKey: nodeId)
+        }
     }
 
     /// LRU eviction: remove least recently used quarter when cache exceeds max size
-    private func evictNodeCacheIfNeeded() {
-        guard nodeCache.count > Self.maxNodeCacheSize else { return }
-        let evictCount = Self.maxNodeCacheSize / 4
-        let sorted = nodeCacheOrder.sorted { $0.value < $1.value }
+    private static func evictIfNeeded(_ s: inout State) {
+        guard s.nodeCache.count > maxNodeCacheSize else { return }
+        let evictCount = maxNodeCacheSize / 4
+        let sorted = s.nodeCacheOrder.sorted { $0.value < $1.value }
         for entry in sorted.prefix(evictCount) {
-            nodeCache.removeValue(forKey: entry.key)
-            nodeCacheOrder.removeValue(forKey: entry.key)
+            s.nodeCache.removeValue(forKey: entry.key)
+            s.nodeCacheOrder.removeValue(forKey: entry.key)
         }
     }
 
@@ -114,16 +135,16 @@ public actor PageBackedNodeStore: Sendable {
 
     /// Get the current node→page mapping (for persistence)
     public func getNodePageMap() -> [UUID: Int] {
-        nodePageMap
+        state.withLock { s in s.nodePageMap }
     }
 
     /// Restore the node→page mapping (from persisted index registry)
     public func restoreNodePageMap(_ map: [UUID: Int]) {
-        nodePageMap = map
+        state.withLock { s in s.nodePageMap = map }
     }
 
     // Convert UUID to a stable UInt64 ID using all 16 bytes
-    private func nodeId(_ uuid: UUID) -> UInt64 {
+    private static func nodeId(_ uuid: UUID) -> UInt64 {
         let u = uuid.uuid
         let high = UInt64(u.0) | UInt64(u.1) << 8 | UInt64(u.2) << 16 | UInt64(u.3) << 24 |
                    UInt64(u.4) << 32 | UInt64(u.5) << 40 | UInt64(u.6) << 48 | UInt64(u.7) << 56
