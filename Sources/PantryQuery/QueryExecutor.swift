@@ -342,6 +342,81 @@ public actor QueryExecutor: Sendable {
     // MARK: - JOIN
 
     public func executeJoin(from table: String, joins: [JoinClause], columns: [String]? = nil, where condition: WhereCondition? = nil, modifiers: QueryModifiers? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {
+        // Fast path: single INNER JOIN + LIMIT + index on right join column
+        // Streams through left table and probes right index, stopping at LIMIT.
+        // Avoids scanning the right table entirely and can short-circuit left scan.
+        if joins.count == 1, let join = joins.first, join.type == .inner,
+           let mods = modifiers, let limit = mods.limit, limit > 0,
+           (mods.orderBy == nil || mods.orderBy!.isEmpty), !mods.distinct,
+           condition == nil {
+            let rightIndex = await indexManager.getIndex(tableName: join.table, columnName: join.rightColumn)
+            if let rightIndex = rightIndex {
+                let totalNeeded = limit + (mods.offset ?? 0)
+                let pageIDs = transactionContext == nil
+                    ? try await storageEngine.getPageChainConcurrent(tableName: table)
+                    : try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
+                let leftSchema = storageEngine.getTableSchema(table)
+
+                var result = [Row]()
+                result.reserveCapacity(totalNeeded)
+                let leftJoinColIdx: Int? = leftSchema?.columns.firstIndex { $0.name == join.leftColumn }
+
+                for pageID in pageIDs {
+                    if result.count >= totalNeeded { break }
+                    let page = transactionContext == nil
+                        ? try await storageEngine.getPageConcurrent(pageID: pageID)
+                        : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+                    for record in page.records {
+                        if result.count >= totalNeeded { break }
+                        // Extract left join key without full Row decode
+                        let leftKey: DBValue?
+                        if let colIdx = leftJoinColIdx {
+                            leftKey = Row.extractColumnValue(from: record.data, columnIndex: colIdx)
+                        } else {
+                            let row = Row.fromBytesAuto(record.data, schema: leftSchema)
+                            leftKey = row?.values[join.leftColumn]
+                        }
+                        guard let leftKey = leftKey, leftKey != .null else { continue }
+
+                        // Probe right index
+                        guard let indexRows = try await rightIndex.search(key: leftKey), !indexRows.isEmpty else { continue }
+
+                        // Decode left row fully only on match
+                        guard let leftRow = Row.fromBytesAuto(record.data, schema: leftSchema) else { continue }
+
+                        let rids = Set(indexRows.compactMap { row -> UInt64? in
+                            guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
+                            return UInt64(bitPattern: ridSigned)
+                        })
+                        let fullRightRecords = try await storageEngine.getRecordsByIDs(rids, tableName: join.table, transactionContext: transactionContext)
+
+                        for (_, rightRow) in fullRightRecords {
+                            if result.count >= totalNeeded { break }
+                            var combined = [String: DBValue](minimumCapacity: leftRow.values.count + rightRow.values.count * 2)
+                            for (k, v) in leftRow.values { combined[k] = v; combined["\(table).\(k)"] = v }
+                            for (k, v) in rightRow.values { combined["\(join.table).\(k)"] = v; combined[k] = v }
+                            result.append(Row(values: combined))
+                        }
+                    }
+                }
+
+                // Apply OFFSET
+                if let offset = mods.offset, offset > 0 {
+                    result = Array(result.dropFirst(offset))
+                }
+                result = Array(result.prefix(limit))
+
+                // Project columns
+                if let columns = columns, !columns.isEmpty {
+                    result = result.map { row in
+                        let projected = columns.reduce(into: [String: DBValue]()) { r, c in r[c] = row.values[c] ?? .null }
+                        return Row(values: projected)
+                    }
+                }
+                return result
+            }
+        }
+
         // Optimize join order using cost-based planner before scanning
         let optimizedJoins = planner.optimizeJoinOrder(
             primaryTable: table,
@@ -398,8 +473,20 @@ public actor QueryExecutor: Sendable {
             let rightTableInfo = planner.registry.getTableInfo(name: join.table)
             let rightRowEstimate = rightTableInfo?.recordCount ?? 0
 
-            // Use index nested loop join when: index exists on right column AND left side is small relative to right
-            if let rightIndex = rightIndex, join.type == .inner, result.count < rightRowEstimate / 2 {
+            // Compute join limit: push LIMIT down for inner joins when no ORDER BY/DISTINCT
+            let joinLimit: Int?
+            if let mods = modifiers, let limit = mods.limit, limit > 0,
+               (mods.orderBy == nil || mods.orderBy!.isEmpty), !mods.distinct,
+               join.type == .inner {
+                joinLimit = limit + (mods.offset ?? 0)
+            } else {
+                joinLimit = nil
+            }
+
+            // Use index nested loop join when: index exists on right column AND
+            // either left side is small relative to right, or we have a LIMIT
+            if let rightIndex = rightIndex, join.type == .inner,
+               (result.count < rightRowEstimate / 2 || joinLimit != nil) {
                 var newResult = [Row]()
                 // Collect unique left keys to avoid redundant index lookups
                 var keyToLeftRows = [DBValue: [Row]]()
@@ -409,8 +496,7 @@ public actor QueryExecutor: Sendable {
                         keyToLeftRows[leftKey, default: []].append(leftRow)
                     }
                 }
-                let rightSchema = storageEngine.getTableSchema(join.table)
-                for (key, leftRows) in keyToLeftRows {
+                outerLoop: for (key, leftRows) in keyToLeftRows {
                     guard let indexRows = try await rightIndex.search(key: key), !indexRows.isEmpty else { continue }
                     // Retrieve full right rows from RIDs
                     let rids = Set(indexRows.compactMap { row -> UInt64? in
@@ -423,6 +509,7 @@ public actor QueryExecutor: Sendable {
                             var combined = leftRow.values
                             for (k, v) in rightRow.values { combined["\(join.table).\(k)"] = v; combined[k] = v }
                             newResult.append(Row(values: combined))
+                            if let jl = joinLimit, newResult.count >= jl { break outerLoop }
                         }
                     }
                 }
@@ -444,16 +531,6 @@ public actor QueryExecutor: Sendable {
                 rightRows: rightRows.count,
                 join: join
             )
-
-            // Compute join limit: push LIMIT down for inner joins when no ORDER BY/DISTINCT
-            let joinLimit: Int?
-            if let mods = modifiers, let limit = mods.limit, limit > 0,
-               (mods.orderBy == nil || mods.orderBy!.isEmpty), !mods.distinct,
-               join.type == .inner {
-                joinLimit = limit + (mods.offset ?? 0)
-            } else {
-                joinLimit = nil
-            }
 
             switch join.type {
             case .inner:
@@ -730,8 +807,10 @@ public actor QueryExecutor: Sendable {
             }
         }
 
-        // Phase 1: Insert all records without index updates
+        // Phase 1: Serialize all records, then batch-insert with page-level batching
         let bulkSchema = storageEngine.getTableSchema(table)
+        var serializedRecords = [Record]()
+        serializedRecords.reserveCapacity(rows.count)
         var insertedPairs: [(Record, Row)] = []
         insertedPairs.reserveCapacity(rows.count)
 
@@ -739,9 +818,12 @@ public actor QueryExecutor: Sendable {
             let rowData = bulkSchema != nil ? row.toBytesPositional(schema: bulkSchema!) : row.toBytes()
             let recordID = generateRecordID()
             let record = Record(id: recordID, data: rowData)
-            _ = try await storageEngine.insertRecordSkipIndex(record, tableName: table, transactionContext: transactionContext)
+            serializedRecords.append(record)
             insertedPairs.append((record, row))
         }
+
+        // Batch insert: fills pages to capacity before writing (much fewer I/O ops)
+        _ = try await storageEngine.bulkInsertRecordsBatched(serializedRecords, tableName: table, transactionContext: transactionContext)
 
         // Phase 2: Batch index updates — sorted keys for sequential B-tree traversal
         try await indexManager.updateIndexesBatch(records: insertedPairs, tableName: table)
@@ -798,38 +880,60 @@ public actor QueryExecutor: Sendable {
             return updatedCount
         }
 
-        // Table scan path
-        let rawRecords = try await storageEngine.scanTableRaw(table, transactionContext: transactionContext)
+        // Table scan path: page-by-page update to avoid double page reads
         var updatedCount = 0
         let updateColMap = updateSchema?.columnOrdinals
+        var modifiedPages = Set<Int>()
 
-        for (record, data) in rawRecords {
-            // Lazy filter: skip full row decode for non-matching records
-            if let condition = condition, let colMap = updateColMap {
-                if let lazyResult = evaluateConditionLazy(condition, data: data, columnIndexMap: colMap) {
-                    if !lazyResult { continue }
+        for pageID in pageIDs {
+            var page = transactionContext == nil
+                ? try await storageEngine.getPageConcurrent(pageID: pageID)
+                : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+            var pageModified = false
+            var overflowUpdates: [(Record, Row)]  = [] // records that couldn't be replaced in-place
+
+            for var record in page.records {
+                if record.isOverflow {
+                    record = try await storageEngine.reassembleOverflowRecord(record)
+                }
+                let data = record.data
+
+                // Lazy filter: skip full row decode for non-matching records
+                if let condition = condition, let colMap = updateColMap {
+                    if let lazyResult = evaluateConditionLazy(condition, data: data, columnIndexMap: colMap) {
+                        if !lazyResult { continue }
+                    }
+                }
+                guard let row = Row.fromBytesAuto(data, schema: updateSchema) else { continue }
+                if condition == nil || evaluateCondition(condition!, row: row) {
+                    var updatedValues = row.values
+                    for (key, value) in values { updatedValues[key] = value }
+                    let updatedRow = Row(values: updatedValues)
+                    let rowData = updateSchema != nil ? updatedRow.toBytesPositional(schema: updateSchema!) : updatedRow.toBytes()
+                    let newRecord = Record(id: record.id, data: rowData)
+
+                    if page.replaceRecord(id: record.id, with: newRecord) {
+                        pageModified = true
+                    } else {
+                        overflowUpdates.append((newRecord, updatedRow))
+                    }
+                    updatedCount += 1
                 }
             }
-            guard let row = Row.fromBytesAuto(data, schema: updateSchema) else { continue }
-            if condition == nil || evaluateCondition(condition!, row: row) {
-                var updatedValues = row.values
-                for (key, value) in values {
-                    updatedValues[key] = value
-                }
-                let updatedRow = Row(values: updatedValues)
 
-                let rowData = updateSchema != nil ? updatedRow.toBytesPositional(schema: updateSchema!) : updatedRow.toBytes()
-                let newRecord = Record(id: record.id, data: rowData)
-                let replaced = try await storageEngine.replaceRecordInPlace(id: record.id, newRecord: newRecord, tableName: table, transactionContext: transactionContext)
-                if !replaced {
-                    try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
-                    try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
-                }
-                updatedCount += 1
+            if pageModified {
+                try await storageEngine.savePage(page, transactionContext: transactionContext)
+                modifiedPages.insert(pageID)
+            }
+
+            // Handle records that couldn't be replaced in-place (size changed too much)
+            for (newRecord, updatedRow) in overflowUpdates {
+                try await storageEngine.deleteRecord(id: newRecord.id, tableName: table, transactionContext: transactionContext, knownPageID: pageID)
+                try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
             }
         }
 
-        if updatedCount > 0 { invalidateResultCache(forTable: table) }
+        if updatedCount > 0 { invalidateResultCache(forTable: table, modifiedPages: modifiedPages) }
         return updatedCount
     }
 
@@ -937,12 +1041,21 @@ public actor QueryExecutor: Sendable {
             }
         }
 
-        // Streaming aggregate: scan pages directly without materializing [Row]
+        // Streaming aggregate: scan pages directly, extract only the needed column
         let pageIDs = transactionContext == nil
             ? try await storageEngine.getPageChainConcurrent(tableName: table)
             : try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
         let aggSchema = storageEngine.getTableSchema(table)
         let aggColMap = aggSchema?.columnOrdinals
+
+        // Resolve the column index for direct extraction (O(1) per record)
+        let aggColumnName: String? = {
+            switch function {
+            case .count(let c): return c
+            case .sum(let c), .avg(let c), .min(let c), .max(let c): return c
+            }
+        }()
+        let aggColumnIndex: Int? = aggColumnName.flatMap { aggColMap?[$0] }
 
         var count: Int64 = 0
         var intSum: Int64 = 0; var doubleSum: Double = 0; var allIntegers = true; var hasValue = false
@@ -958,11 +1071,49 @@ public actor QueryExecutor: Sendable {
                     record = try await storageEngine.reassembleOverflowRecord(record)
                 }
                 // Lazy filter: skip full row decode for non-matching records
+                var lazyFilterResult: Bool? = nil
                 if let cond = condition, let colMap = aggColMap {
-                    if let lazyResult = evaluateConditionLazy(cond, data: record.data, columnIndexMap: colMap) {
-                        if !lazyResult { continue }
+                    lazyFilterResult = evaluateConditionLazy(cond, data: record.data, columnIndexMap: colMap)
+                    if lazyFilterResult == false { continue }
+                }
+
+                // Ultra-fast path: COUNT(*) WHERE — lazy filter already confirmed match, no column needed
+                if case .count(nil) = function, lazyFilterResult == true {
+                    count += 1
+                    continue
+                }
+
+                // Fast path: extract only the needed column via O(1) offset table lookup
+                // Avoids constructing a full [String: DBValue] dictionary per record
+                if let colIdx = aggColumnIndex {
+                    if let rawValue = Row.extractColumnValue(from: record.data, columnIndex: colIdx) {
+                        // If there's a condition and lazy eval didn't handle it, must verify with full row
+                        if condition != nil && lazyFilterResult == nil {
+                            guard let row = Row.fromBytesAuto(record.data, schema: aggSchema) else { continue }
+                            if !evaluateCondition(condition!, row: row) { continue }
+                        }
+
+                        switch function {
+                        case .count:
+                            if rawValue != .null { count += 1 }
+                        case .sum:
+                            switch rawValue {
+                            case .integer(let v): hasValue = true; let (r, o) = intSum.addingReportingOverflow(v); if o { allIntegers = false }; intSum = r; doubleSum += Double(v)
+                            case .double(let v): hasValue = true; allIntegers = false; doubleSum += v
+                            default: break
+                            }
+                        case .avg:
+                            if let v = numericValue(rawValue) { avgSum += v; avgCount += 1 }
+                        case .min:
+                            if rawValue != .null { if minVal == .null || rawValue < minVal { minVal = rawValue } }
+                        case .max:
+                            if rawValue != .null { if maxVal == .null || rawValue > maxVal { maxVal = rawValue } }
+                        }
+                        continue
                     }
                 }
+
+                // Slow path: full Row decode (non-v3 format, COUNT(*), or extraction failed)
                 guard let row = Row.fromBytesAuto(record.data, schema: aggSchema) else { continue }
                 if let cond = condition, !evaluateCondition(cond, row: row) { continue }
 

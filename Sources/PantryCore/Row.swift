@@ -248,6 +248,63 @@ extension Row {
         return Row(values: values)
     }
 
+    /// Extract a single column value from positional v3 data by column index.
+    /// O(1) random access via offset table — no Row dictionary allocation.
+    /// Returns nil if data is not v3 format (caller should fall back to full decode).
+    public static func extractColumnValue(from data: Data, columnIndex: Int) -> DBValue? {
+        let base = data.startIndex
+        guard data.count >= 4,
+              data[base] == 0xFF,
+              data[base + 1] == 0x03 else { return nil }
+
+        let colCount = Int(UInt16(littleEndian: data.withUnsafeBytes {
+            $0.loadUnaligned(fromByteOffset: 2, as: UInt16.self)
+        }))
+        guard columnIndex < colCount else { return .null }
+
+        let bitmapBytes = (colCount + 7) / 8
+        let bitmapStart = 4
+        guard bitmapStart + bitmapBytes <= data.count else { return nil }
+
+        // Check NULL bitmap
+        let isNull = (data[base + bitmapStart + columnIndex / 8] & (1 << (columnIndex % 8))) != 0
+        if isNull { return .null }
+
+        // Read offset from offset table
+        let offsetTableStart = bitmapStart + bitmapBytes
+        let offsetPos = offsetTableStart + columnIndex * 2
+        let offsetTableEnd = offsetTableStart + colCount * 2
+        guard offsetPos + 2 <= data.count else { return nil }
+
+        let relOffset = data.withUnsafeBytes {
+            UInt16(littleEndian: $0.loadUnaligned(fromByteOffset: offsetPos, as: UInt16.self))
+        }
+        guard relOffset != 0xFFFF else { return .null }
+
+        var decodeOff = offsetTableEnd + Int(relOffset)
+        return decodeDBValue(from: data, at: &decodeOff)
+    }
+
+    /// Check if a column is NULL in positional v3 data without decoding the value.
+    /// Returns nil if data is not v3 format.
+    public static func isColumnNull(in data: Data, columnIndex: Int) -> Bool? {
+        let base = data.startIndex
+        guard data.count >= 4,
+              data[base] == 0xFF,
+              data[base + 1] == 0x03 else { return nil }
+
+        let colCount = Int(UInt16(littleEndian: data.withUnsafeBytes {
+            $0.loadUnaligned(fromByteOffset: 2, as: UInt16.self)
+        }))
+        guard columnIndex < colCount else { return true }
+
+        let bitmapStart = 4
+        let bitmapBytes = (colCount + 7) / 8
+        guard bitmapStart + bitmapBytes <= data.count else { return nil }
+
+        return (data[base + bitmapStart + columnIndex / 8] & (1 << (columnIndex % 8))) != 0
+    }
+
     /// Decode from positional format v2 (NULL bitmap) using schema for column names.
     public static func fromBytesPositionalV2(_ data: Data, schema: PantryTableSchema) -> Row? {
         guard data.count >= 4,
