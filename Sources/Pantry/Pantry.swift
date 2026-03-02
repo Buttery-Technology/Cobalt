@@ -93,20 +93,24 @@ public actor PantryDatabase: Sendable {
     public func createIndex(table: String, column: String, include: [String]? = nil) async throws {
         let columnIndex = try await indexManager.createIndex(tableName: table, columnName: column, includeColumns: include)
 
-        // Populate the index from existing data with slim rows: __rid + indexed column + INCLUDE columns
+        // Populate the index from existing data — collect all pairs, then batch insert
         let rows = try await storageEngine.scanTable(table)
+        var pairs: [(key: DBValue, row: Row)] = []
+        pairs.reserveCapacity(rows.count)
         for (record, row) in rows {
             if let value = row.values[column] {
                 var slimValues: [String: DBValue] = [
                     "__rid": .integer(Int64(bitPattern: record.id)),
                     column: value
                 ]
-                // Add INCLUDE columns for covering index
                 if let include = include {
                     for incCol in include { slimValues[incCol] = row.values[incCol] ?? .null }
                 }
-                try await columnIndex.insert(key: value, row: Row(values: slimValues))
+                pairs.append((key: value, row: Row(values: slimValues)))
             }
+        }
+        if !pairs.isEmpty {
+            try await columnIndex.insertBatch(pairs: pairs)
         }
 
         // Mark column as indexed in stats and refresh distinct counts
@@ -119,10 +123,10 @@ public actor PantryDatabase: Sendable {
     public func createPartialIndex(table: String, column: String, where condition: WhereCondition, include: [String]? = nil) async throws {
         let columnIndex = try await indexManager.createIndex(tableName: table, columnName: column, includeColumns: include, partialCondition: condition)
 
-        // Populate the index from existing data that matches the condition
+        // Populate the index from existing data that matches the condition — batch insert
         let rows = try await storageEngine.scanTable(table)
+        var pairs: [(key: DBValue, row: Row)] = []
         for (record, row) in rows {
-            // Only index rows that satisfy the partial condition
             if !evaluateConditionForPartialIndex(condition, row: row) { continue }
             if let value = row.values[column] {
                 var slimValues: [String: DBValue] = [
@@ -132,8 +136,11 @@ public actor PantryDatabase: Sendable {
                 if let include = include {
                     for incCol in include { slimValues[incCol] = row.values[incCol] ?? .null }
                 }
-                try await columnIndex.insert(key: value, row: Row(values: slimValues))
+                pairs.append((key: value, row: Row(values: slimValues)))
             }
+        }
+        if !pairs.isEmpty {
+            try await columnIndex.insertBatch(pairs: pairs)
         }
 
         try await storageEngine.analyzeTable(table)
@@ -143,8 +150,10 @@ public actor PantryDatabase: Sendable {
     public func createCompoundIndex(table: String, columns: [String]) async throws {
         let columnIndex = try await indexManager.createCompoundIndex(tableName: table, columns: columns)
 
-        // Populate the index from existing data with slim rows: __rid + indexed columns only
+        // Populate the index from existing data — batch insert
         let rows = try await storageEngine.scanTable(table)
+        var pairs: [(key: DBValue, row: Row)] = []
+        pairs.reserveCapacity(rows.count)
         for (record, row) in rows {
             let rid: DBValue = .integer(Int64(bitPattern: record.id))
             var slimValues: [String: DBValue] = ["__rid": rid]
@@ -154,7 +163,10 @@ public actor PantryDatabase: Sendable {
                 return v
             }
             let compoundKey = DBValue.compound(keyValues)
-            try await columnIndex.insert(key: compoundKey, row: Row(values: slimValues))
+            pairs.append((key: compoundKey, row: Row(values: slimValues)))
+        }
+        if !pairs.isEmpty {
+            try await columnIndex.insertBatch(pairs: pairs)
         }
         queryExecutor.invalidatePlanCache(forTable: table)
     }

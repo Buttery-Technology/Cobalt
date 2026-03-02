@@ -233,7 +233,10 @@ public actor StorageEngine: Sendable {
     /// Call `flushDirtyPages` after a batch of deferred saves to write them all at once.
     public func savePageDeferred(_ page: DatabasePage) async throws {
         var serializedPage = page
-        try serializedPage.saveRecords()
+        // Fast path: if a single record was replaced with same-size data, patch in-place
+        if !serializedPage.saveRecordPatch() {
+            try serializedPage.saveRecords()
+        }
         bufferPoolManager.updatePage(serializedPage)
         bufferPoolManager.markDirty(pageID: page.pageID)
         if !systemPageIDs.contains(page.pageID) {
@@ -433,8 +436,8 @@ public actor StorageEngine: Sendable {
                 continue
             }
 
-            // Try to add to current page
-            if currentPage.addRecord(record) {
+            // Try to add to current page (pass pre-computed size to avoid double serialization)
+            if currentPage.addRecord(record, knownSerializedSize: serializedSize) {
                 if let txContext = transactionContext {
                     try await logManager.logRecordInsert(txID: txContext.transactionID, pageID: currentPage.pageID, recordID: record.id, data: record.data)
                 }
@@ -452,7 +455,7 @@ public actor StorageEngine: Sendable {
                 }
 
                 currentPage = try await createNewPageForTable(tableInfo: &tableInfo)
-                if !currentPage.addRecord(record) {
+                if !currentPage.addRecord(record, knownSerializedSize: serializedSize) {
                     throw PantryError.recordTooLarge(size: serializedSize)
                 }
                 if let txContext = transactionContext {

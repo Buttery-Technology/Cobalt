@@ -82,6 +82,25 @@ public actor ColumnIndex: Sendable {
         return results.map { reconstructRow($0, key: key) }
     }
 
+    /// Batch search for multiple keys in a single actor call. Returns a dictionary of key -> [Row].
+    /// Much faster than individual search() calls for joins since it avoids per-key actor hops.
+    public func searchBatch(keys: [DBValue]) async throws -> [DBValue: [Row]] {
+        var results = [DBValue: [Row]]()
+        for key in keys {
+            if keyHashSet.count < Self.maxHashSetSize && !keyHashSet.contains(key.indexKey.hashValue) {
+                continue
+            }
+            if !bloomFilter.contains(key.indexKey) {
+                continue
+            }
+            let rows = try await btree.search(key: key)
+            if !rows.isEmpty {
+                results[key] = rows.map { reconstructRow($0, key: key) }
+            }
+        }
+        return results
+    }
+
     /// Range query on this index (returns rows with column values reconstructed from keys)
     public func searchRange(from startKey: DBValue?, to endKey: DBValue?) async throws -> [Row] {
         let keyed = try await btree.searchRangeKeyed(from: startKey, to: endKey)

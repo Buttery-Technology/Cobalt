@@ -361,6 +361,10 @@ public actor QueryExecutor: Sendable {
                 result.reserveCapacity(totalNeeded)
                 let leftJoinColIdx: Int? = leftSchema?.columns.firstIndex { $0.name == join.leftColumn }
 
+                // Streaming approach: collect batches of left keys, batch-probe index, batch-fetch right records
+                var pendingKeys = [(key: DBValue, recordData: Data)]()
+                let batchSize = min(totalNeeded, 64)
+
                 for pageID in pageIDs {
                     if result.count >= totalNeeded { break }
                     let page = transactionContext == nil
@@ -368,7 +372,6 @@ public actor QueryExecutor: Sendable {
                         : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
                     for record in page.records {
                         if result.count >= totalNeeded { break }
-                        // Extract left join key without full Row decode
                         let leftKey: DBValue?
                         if let colIdx = leftJoinColIdx {
                             leftKey = Row.extractColumnValue(from: record.data, columnIndex: colIdx)
@@ -377,27 +380,17 @@ public actor QueryExecutor: Sendable {
                             leftKey = row?.values[join.leftColumn]
                         }
                         guard let leftKey = leftKey, leftKey != .null else { continue }
+                        pendingKeys.append((key: leftKey, recordData: record.data))
 
-                        // Probe right index
-                        guard let indexRows = try await rightIndex.search(key: leftKey), !indexRows.isEmpty else { continue }
-
-                        // Decode left row fully only on match
-                        guard let leftRow = Row.fromBytesAuto(record.data, schema: leftSchema) else { continue }
-
-                        let rids = Set(indexRows.compactMap { row -> UInt64? in
-                            guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
-                            return UInt64(bitPattern: ridSigned)
-                        })
-                        let fullRightRecords = try await storageEngine.getRecordsByIDs(rids, tableName: join.table, transactionContext: transactionContext)
-
-                        for (_, rightRow) in fullRightRecords {
-                            if result.count >= totalNeeded { break }
-                            var combined = [String: DBValue](minimumCapacity: leftRow.values.count + rightRow.values.count * 2)
-                            for (k, v) in leftRow.values { combined[k] = v; combined["\(table).\(k)"] = v }
-                            for (k, v) in rightRow.values { combined["\(join.table).\(k)"] = v; combined[k] = v }
-                            result.append(Row(values: combined))
+                        // Flush batch when full
+                        if pendingKeys.count >= batchSize {
+                            try await _flushJoinBatch(pendingKeys: &pendingKeys, rightIndex: rightIndex, join: join, table: table, leftSchema: leftSchema, result: &result, totalNeeded: totalNeeded, transactionContext: transactionContext)
                         }
                     }
+                }
+                // Flush remaining
+                if !pendingKeys.isEmpty && result.count < totalNeeded {
+                    try await _flushJoinBatch(pendingKeys: &pendingKeys, rightIndex: rightIndex, join: join, table: table, leftSchema: leftSchema, result: &result, totalNeeded: totalNeeded, transactionContext: transactionContext)
                 }
 
                 // Apply OFFSET
@@ -990,15 +983,17 @@ public actor QueryExecutor: Sendable {
             })
             let fullRecords = try await storageEngine.getRecordsByIDsWithPages(matchingRIDs, tableName: table, transactionContext: transactionContext)
 
-            var deletedCount = 0
-            var modifiedPages = Set<Int>()
+            // Batch delete: collect matching records, then delete per-page in one pass
+            var matchingForDelete: [(id: UInt64, pageID: Int, row: Row?)] = []
             for (record, row, recordPageID) in fullRecords where evaluateCondition(condition, row: row) {
-                try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext, knownPageID: recordPageID)
-                modifiedPages.insert(recordPageID)
-                deletedCount += 1
+                matchingForDelete.append((id: record.id, pageID: recordPageID, row: row))
             }
-            if deletedCount > 0 { invalidateResultCache(forTable: table, modifiedPages: modifiedPages) }
-            return deletedCount
+            if !matchingForDelete.isEmpty {
+                try await storageEngine.deleteRecordsBatch(matchingForDelete, tableName: table, transactionContext: transactionContext)
+                let modifiedPages = Set(matchingForDelete.map { $0.pageID })
+                invalidateResultCache(forTable: table, modifiedPages: modifiedPages)
+            }
+            return matchingForDelete.count
         }
 
         // Table scan path — walk pages directly, collect matching records, batch-delete per page
@@ -1757,6 +1752,58 @@ public actor QueryExecutor: Sendable {
     }
 
     // MARK: - JOIN Helpers
+
+    /// Flush a batch of left join keys: batch-probe right index, batch-fetch right records, combine.
+    private func _flushJoinBatch(
+        pendingKeys: inout [(key: DBValue, recordData: Data)],
+        rightIndex: ColumnIndex,
+        join: JoinClause,
+        table: String,
+        leftSchema: PantryTableSchema?,
+        result: inout [Row],
+        totalNeeded: Int,
+        transactionContext: TransactionContext?
+    ) async throws {
+        let batch = pendingKeys
+        pendingKeys.removeAll(keepingCapacity: true)
+
+        // Single actor call: batch-probe right index for all keys
+        let uniqueKeys = Array(Set(batch.map { $0.key }))
+        let indexResults = try await rightIndex.searchBatch(keys: uniqueKeys)
+
+        // Collect all right RIDs and batch-fetch
+        var allRIDs = Set<UInt64>()
+        var ridsByKey = [DBValue: [UInt64]]()
+        for (key, rows) in indexResults {
+            let rids = rows.compactMap { row -> UInt64? in
+                guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
+                return UInt64(bitPattern: ridSigned)
+            }
+            ridsByKey[key] = rids
+            allRIDs.formUnion(rids)
+        }
+        guard !allRIDs.isEmpty else { return }
+        let rightRecords = try await storageEngine.getRecordsByIDs(allRIDs, tableName: join.table, transactionContext: transactionContext)
+        var rightRowsByRID = [UInt64: Row]()
+        for (record, row) in rightRecords {
+            rightRowsByRID[record.id] = row
+        }
+
+        // Build combined rows
+        for (key, recordData) in batch {
+            if result.count >= totalNeeded { break }
+            guard let rids = ridsByKey[key], !rids.isEmpty else { continue }
+            guard let leftRow = Row.fromBytesAuto(recordData, schema: leftSchema) else { continue }
+            for rid in rids {
+                if result.count >= totalNeeded { break }
+                guard let rightRow = rightRowsByRID[rid] else { continue }
+                var combined = [String: DBValue](minimumCapacity: leftRow.values.count + rightRow.values.count * 2)
+                for (k, v) in leftRow.values { combined[k] = v; combined["\(table).\(k)"] = v }
+                for (k, v) in rightRow.values { combined["\(join.table).\(k)"] = v; combined[k] = v }
+                result.append(Row(values: combined))
+            }
+        }
+    }
 
     private func scanAllRows(table: String, filter: WhereCondition? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {
         let pageIDs = transactionContext == nil
