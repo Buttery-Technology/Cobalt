@@ -157,6 +157,11 @@ public actor ColumnIndex: Sendable {
         try await btree.delete(key: key, rid: rid)
     }
 
+    /// Batch delete: sorts keys for cache locality and avoids per-delete root save overhead
+    public func deleteBatch(pairs: [(key: DBValue, rid: DBValue)]) async throws {
+        try await btree.deleteBatch(pairs: pairs)
+    }
+
     /// Add a value to the bloom filter and hash set (used during index rebuild on load)
     public func addToBloomFilter(_ value: DBValue) {
         bloomFilter.add(value.indexKey)
@@ -428,19 +433,72 @@ public actor IndexManager: IndexHook, Sendable {
             let compoundCols = columnIndex.compoundColumns
             let colName = columnIndex.columnName
 
+            // Collect key-rid pairs for batch delete
+            var pairs: [(key: DBValue, rid: DBValue)] = []
+            pairs.reserveCapacity(records.count)
             for (id, row) in records {
                 if let condition = condition {
                     if !evaluateConditionForIndex(condition, row: row) { continue }
                 }
                 let rid: DBValue = .integer(Int64(bitPattern: id))
-
                 if let columns = compoundCols {
                     let keyValues = columns.map { col -> DBValue in row.values[col] ?? .null }
-                    try await columnIndex.delete(key: .compound(keyValues), rid: rid)
+                    pairs.append((key: .compound(keyValues), rid: rid))
                 } else if let value = row.values[colName] {
-                    try await columnIndex.delete(key: value, rid: rid)
+                    pairs.append((key: value, rid: rid))
                 }
             }
+            try await columnIndex.deleteBatch(pairs: pairs)
+        }
+    }
+
+    /// Batch remove from indexes using raw positional data — avoids full Row deserialization.
+    /// Extracts only the indexed column value via O(1) positional access, then sorts by key for cache locality.
+    public func removeFromIndexesBatchRaw(records: [(id: UInt64, data: Data)], tableName: String, schema: PantryTableSchema) async throws {
+        guard let tableIndexes = indexes[tableName] else { return }
+
+        for (_, columnIndex) in tableIndexes {
+            let condition = await columnIndex.partialCondition
+            let compoundCols = columnIndex.compoundColumns
+            let colName = columnIndex.columnName
+
+            // Extract keys from raw data using O(1) positional access
+            var pairs: [(key: DBValue, rid: DBValue)] = []
+            pairs.reserveCapacity(records.count)
+
+            if let columns = compoundCols {
+                // Compound index: extract multiple columns
+                let colIndices = columns.compactMap { schema.columnOrdinals[$0] }
+                guard colIndices.count == columns.count else { continue }
+                for (id, data) in records {
+                    if condition != nil {
+                        // Need full row for partial index condition check
+                        guard let row = Row.fromBytesAuto(data, schema: schema),
+                              evaluateConditionForIndex(condition!, row: row) else { continue }
+                    }
+                    let keyValues = colIndices.map { idx -> DBValue in
+                        Row.extractColumnValue(from: data, columnIndex: idx) ?? .null
+                    }
+                    let compoundKey = DBValue.compound(keyValues)
+                    let rid: DBValue = .integer(Int64(bitPattern: id))
+                    pairs.append((key: compoundKey, rid: rid))
+                }
+            } else if let colIdx = schema.columnOrdinals[colName] {
+                // Single column index: extract one column
+                for (id, data) in records {
+                    if condition != nil {
+                        guard let row = Row.fromBytesAuto(data, schema: schema),
+                              evaluateConditionForIndex(condition!, row: row) else { continue }
+                    }
+                    guard let value = Row.extractColumnValue(from: data, columnIndex: colIdx),
+                          value != .null else { continue }
+                    let rid: DBValue = .integer(Int64(bitPattern: id))
+                    pairs.append((key: value, rid: rid))
+                }
+            }
+
+            // Batch delete: sorts internally for cache locality, avoids per-delete root save
+            try await columnIndex.deleteBatch(pairs: pairs)
         }
     }
 

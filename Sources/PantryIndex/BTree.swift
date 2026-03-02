@@ -268,6 +268,33 @@ public final class BTree: @unchecked Sendable {
         }
     }
 
+    /// Batch delete: sorts keys for cache-friendly B-tree traversal.
+    public func deleteBatch(pairs: [(key: DBValue, rid: DBValue)]) async throws {
+        guard !pairs.isEmpty else { return }
+        let sorted = pairs.sorted { $0.key < $1.key }
+
+        for (key, rid) in sorted {
+            guard let currentRootId = rootId,
+                  let root = try await nodeStore.loadNode(nodeId: currentRootId) else { return }
+            try await deleteFromNode(node: root, key: key, rid: rid)
+            if root.keys.isEmpty {
+                if root.isLeaf {
+                    self.rootId = nil
+                    nodeStore.removeNode(nodeId: currentRootId)
+                    return
+                } else if let newRootId = root.children?.first {
+                    self.rootId = newRootId
+                    nodeStore.removeNode(nodeId: currentRootId)
+                }
+            }
+        }
+        // Save root once at end
+        if let currentRootId = rootId,
+           let root = try await nodeStore.loadNode(nodeId: currentRootId) {
+            try await nodeStore.saveNode(root)
+        }
+    }
+
     // MARK: - Binary Search Helpers
 
     /// Binary search for the first index where keys[index] >= key (lower bound)
