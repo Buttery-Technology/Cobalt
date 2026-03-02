@@ -907,8 +907,14 @@ public final class QueryExecutor: @unchecked Sendable {
             : try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
         let plan = planner.chooseAccessPlan(table: table, condition: condition, pageCount: pageIDs.count)
 
-        if case .indexScan = plan, let condition = condition,
-           let indexedRows = try await indexManager.attemptIndexLookup(tableName: table, condition: condition) {
+        if case .indexScan = plan, let condition = condition {
+            let indexedRows: [Row]?
+            if let cached = indexManager.attemptIndexLookupCached(tableName: table, condition: condition) {
+                indexedRows = cached
+            } else {
+                indexedRows = try await indexManager.attemptIndexLookup(tableName: table, condition: condition)
+            }
+            if let indexedRows {
             let matchingRIDs = Set(indexedRows.compactMap { row -> UInt64? in
                 guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
                 return UInt64(bitPattern: ridSigned)
@@ -1016,6 +1022,7 @@ public final class QueryExecutor: @unchecked Sendable {
             if updatedCount > 0 { invalidateResultCache(forTable: table, modifiedPages: modifiedPages) }
             return updatedCount
         }
+        }
 
         // Table scan path: page-by-page update to avoid double page reads
         var updatedCount = 0
@@ -1107,8 +1114,14 @@ public final class QueryExecutor: @unchecked Sendable {
             : try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
         let plan = planner.chooseAccessPlan(table: table, condition: condition, pageCount: pageIDs.count)
 
-        if case .indexScan = plan, let condition = condition,
-           let indexedRows = try await indexManager.attemptIndexLookup(tableName: table, condition: condition) {
+        if case .indexScan = plan, let condition = condition {
+            let indexedRows: [Row]?
+            if let cached = indexManager.attemptIndexLookupCached(tableName: table, condition: condition) {
+                indexedRows = cached
+            } else {
+                indexedRows = try await indexManager.attemptIndexLookup(tableName: table, condition: condition)
+            }
+            if let indexedRows {
             let matchingRIDs = Set(indexedRows.compactMap { row -> UInt64? in
                 guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
                 return UInt64(bitPattern: ridSigned)
@@ -1139,6 +1152,7 @@ public final class QueryExecutor: @unchecked Sendable {
                 invalidateResultCache(forTable: table, modifiedPages: modifiedPages)
             }
             return matchingForDelete.count
+        }
         }
 
         // Table scan path — walk pages directly, collect matching records, batch-delete per page
@@ -1936,9 +1950,14 @@ public final class QueryExecutor: @unchecked Sendable {
         let batch = pendingKeys
         pendingKeys.removeAll(keepingCapacity: true)
 
-        // Single actor call: batch-probe right index for all keys
+        // Try synchronous cache-only path first, fall back to async
         let uniqueKeys = Array(Set(batch.map { $0.key }))
-        let indexResults = try await rightIndex.searchBatch(keys: uniqueKeys)
+        let indexResults: [DBValue: [Row]]
+        if let cached = rightIndex.searchBatchCached(keys: uniqueKeys) {
+            indexResults = cached
+        } else {
+            indexResults = try await rightIndex.searchBatch(keys: uniqueKeys)
+        }
 
         // Collect all right RIDs and batch-fetch
         var allRIDs = Set<UInt64>()
