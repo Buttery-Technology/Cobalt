@@ -118,15 +118,7 @@ public final class PageBackedNodeStore: @unchecked Sendable {
     /// Load a B-tree node — synchronous fast path for cache hits, async for misses.
     public func loadNode(nodeId: UUID) async throws -> BTreeNode? {
         // Fast path: cache hit (no async, no actor hop)
-        let cached: BTreeNode? = state.withLock { s in
-            if let node = s.nodeCache[nodeId] {
-                s.nodeCacheCounter += 1
-                s.nodeCacheOrder[nodeId] = s.nodeCacheCounter
-                return node
-            }
-            return nil
-        }
-        if let cached { return cached }
+        if let cached = loadNodeCached(nodeId: nodeId) { return cached }
 
         // Slow path: load from buffer pool
         let pageID: Int? = state.withLock { s in s.nodePageMap[nodeId] }
@@ -143,6 +135,18 @@ public final class PageBackedNodeStore: @unchecked Sendable {
             Self.evictIfNeeded(&s)
         }
         return node
+    }
+
+    /// Synchronous cache-only node load. Returns nil on cache miss.
+    public func loadNodeCached(nodeId: UUID) -> BTreeNode? {
+        state.withLock { s in
+            if let node = s.nodeCache[nodeId] {
+                s.nodeCacheCounter += 1
+                s.nodeCacheOrder[nodeId] = s.nodeCacheCounter
+                return node
+            }
+            return nil
+        }
     }
 
     /// Remove a node from the page map and cache (e.g. after merge absorbs it)
