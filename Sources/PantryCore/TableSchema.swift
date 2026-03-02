@@ -3,13 +3,44 @@ public struct PantryTableSchema: Codable, Sendable {
     public let name: String
     public let columns: [PantryColumn]
 
+    /// Pre-computed column name → ordinal index map for O(1) lookup.
+    /// Not encoded — rebuilt from `columns` on decode or init.
+    public let columnOrdinals: [String: Int]
+
     public init(name: String, columns: [PantryColumn]) {
         self.name = name
         self.columns = columns
+        var ordinals = [String: Int](minimumCapacity: columns.count)
+        for (i, col) in columns.enumerated() {
+            ordinals[col.name] = i
+        }
+        self.columnOrdinals = ordinals
     }
 
     public var primaryKeyColumn: PantryColumn? {
         columns.first { $0.isPrimaryKey }
+    }
+
+    // Custom Codable: columnOrdinals is derived, not serialized
+    enum CodingKeys: String, CodingKey {
+        case name, columns
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.name = try container.decode(String.self, forKey: .name)
+        self.columns = try container.decode([PantryColumn].self, forKey: .columns)
+        var ordinals = [String: Int](minimumCapacity: columns.count)
+        for (i, col) in columns.enumerated() {
+            ordinals[col.name] = i
+        }
+        self.columnOrdinals = ordinals
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(name, forKey: .name)
+        try container.encode(columns, forKey: .columns)
     }
 }
 
