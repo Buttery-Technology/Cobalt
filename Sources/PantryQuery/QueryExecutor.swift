@@ -30,17 +30,18 @@ private struct CachedQueryResult {
 
 /// Executes SELECT, INSERT, UPDATE, DELETE queries against the storage engine.
 /// Uses cost-based QueryPlanner for index vs scan decisions and join ordering.
-public actor QueryExecutor: Sendable {
+/// Converted from actor to class with internal locking to eliminate actor hops.
+public final class QueryExecutor: @unchecked Sendable {
     private let storageEngine: StorageEngine
     private let indexManager: IndexManager
     private let planner: QueryPlanner
 
-    /// Query result cache: stores SELECT results keyed by query signature
-    private var resultCache: [QueryResultCacheKey: CachedQueryResult] = [:]
-    /// Per-table generation counter: incremented on INSERT/UPDATE/DELETE
-    private var tableGenerations: [String: UInt64] = [:]
-    /// Monotonic access counter for LRU eviction
-    private var resultCacheCounter: UInt64 = 0
+    private struct CacheState {
+        var resultCache: [QueryResultCacheKey: CachedQueryResult] = [:]
+        var tableGenerations: [String: UInt64] = [:]
+        var resultCacheCounter: UInt64 = 0
+    }
+    private let _cache: PantryLock<CacheState>
     /// Maximum cached query results
     private let maxResultCacheSize = 128
 
@@ -48,6 +49,7 @@ public actor QueryExecutor: Sendable {
         self.storageEngine = storageEngine
         self.indexManager = indexManager
         self.planner = QueryPlanner(storageEngine: storageEngine, indexManager: indexManager, registry: tableRegistry, costWeights: costWeights)
+        self._cache = PantryLock(CacheState())
     }
 
     /// Convenience init — resolves tableRegistry from storageEngine (requires await)
@@ -56,43 +58,47 @@ public actor QueryExecutor: Sendable {
         self.indexManager = indexManager
         let reg = await storageEngine.tableRegistry
         self.planner = QueryPlanner(storageEngine: storageEngine, indexManager: indexManager, registry: reg, costWeights: costWeights)
+        self._cache = PantryLock(CacheState())
     }
 
     /// Invalidate the query plan cache (call after index create/drop or schema changes)
-    public nonisolated func invalidatePlanCache() {
+    public func invalidatePlanCache() {
         planner.invalidateCache()
     }
 
     /// Invalidate cached plans for a specific table only
-    public nonisolated func invalidatePlanCache(forTable table: String) {
+    public func invalidatePlanCache(forTable table: String) {
         planner.invalidateCache(forTable: table)
     }
 
     /// Invalidate result cache for a specific table (called after mutations).
     /// If modifiedPages is provided, only entries whose accessed pages overlap are invalidated.
     private func invalidateResultCache(forTable table: String, modifiedPages: Set<Int>? = nil) {
-        tableGenerations[table, default: 0] += 1
-        if let modified = modifiedPages {
-            resultCache = resultCache.filter { entry in
-                guard entry.key.table == table else { return true }
-                // If entry has no page tracking (nil), conservatively invalidate
-                guard let accessed = entry.value.accessedPages else { return false }
-                return accessed.isDisjoint(with: modified)
+        _cache.withLock { cs in
+            cs.tableGenerations[table, default: 0] += 1
+            if let modified = modifiedPages {
+                cs.resultCache = cs.resultCache.filter { entry in
+                    guard entry.key.table == table else { return true }
+                    guard let accessed = entry.value.accessedPages else { return false }
+                    return accessed.isDisjoint(with: modified)
+                }
+            } else {
+                cs.resultCache = cs.resultCache.filter { $0.key.table != table }
             }
-        } else {
-            resultCache = resultCache.filter { $0.key.table != table }
         }
     }
 
     /// Look up a cached query result, returns nil on miss or stale generation
     private func lookupResultCache(key: QueryResultCacheKey) -> [Row]? {
-        guard let cached = resultCache[key],
-              cached.generation == tableGenerations[key.table, default: 0] else {
-            return nil
+        _cache.withLock { cs in
+            guard let cached = cs.resultCache[key],
+                  cached.generation == cs.tableGenerations[key.table, default: 0] else {
+                return nil
+            }
+            cs.resultCacheCounter += 1
+            cs.resultCache[key]?.lastAccess = cs.resultCacheCounter
+            return cached.rows
         }
-        resultCacheCounter += 1
-        resultCache[key]?.lastAccess = resultCacheCounter
-        return cached.rows
     }
 
     /// Store a query result in the cache with LRU eviction
@@ -100,42 +106,41 @@ public actor QueryExecutor: Sendable {
         // Don't cache very large result sets (>10K rows)
         guard rows.count <= 10_000 else { return }
 
-        if resultCache.count >= maxResultCacheSize {
-            // O(n) eviction via single-pass min-k selection (no sort needed).
-            // Maintain array of k smallest-access entries, with tracked max for O(1) skip.
-            let evictCount = maxResultCacheSize / 4
-            var evictKeys = [QueryResultCacheKey]()
-            evictKeys.reserveCapacity(evictCount)
-            var evictAccesses = [UInt64]()
-            evictAccesses.reserveCapacity(evictCount)
-            var maxInSet: UInt64 = 0
+        _cache.withLock { cs in
+            if cs.resultCache.count >= maxResultCacheSize {
+                let evictCount = maxResultCacheSize / 4
+                var evictKeys = [QueryResultCacheKey]()
+                evictKeys.reserveCapacity(evictCount)
+                var evictAccesses = [UInt64]()
+                evictAccesses.reserveCapacity(evictCount)
+                var maxInSet: UInt64 = 0
 
-            for (key, value) in resultCache {
-                if evictKeys.count < evictCount {
-                    evictKeys.append(key)
-                    evictAccesses.append(value.lastAccess)
-                    if value.lastAccess > maxInSet { maxInSet = value.lastAccess }
-                } else if value.lastAccess < maxInSet {
-                    // Replace the max element in our set
-                    if let maxIdx = evictAccesses.firstIndex(of: maxInSet) {
-                        evictKeys[maxIdx] = key
-                        evictAccesses[maxIdx] = value.lastAccess
-                        maxInSet = evictAccesses.max() ?? 0
+                for (key, value) in cs.resultCache {
+                    if evictKeys.count < evictCount {
+                        evictKeys.append(key)
+                        evictAccesses.append(value.lastAccess)
+                        if value.lastAccess > maxInSet { maxInSet = value.lastAccess }
+                    } else if value.lastAccess < maxInSet {
+                        if let maxIdx = evictAccesses.firstIndex(of: maxInSet) {
+                            evictKeys[maxIdx] = key
+                            evictAccesses[maxIdx] = value.lastAccess
+                            maxInSet = evictAccesses.max() ?? 0
+                        }
                     }
                 }
+                for key in evictKeys {
+                    cs.resultCache.removeValue(forKey: key)
+                }
             }
-            for key in evictKeys {
-                resultCache.removeValue(forKey: key)
-            }
-        }
 
-        resultCacheCounter += 1
-        resultCache[key] = CachedQueryResult(
-            rows: rows,
-            generation: tableGenerations[key.table, default: 0],
-            lastAccess: resultCacheCounter,
-            accessedPages: accessedPages
-        )
+            cs.resultCacheCounter += 1
+            cs.resultCache[key] = CachedQueryResult(
+                rows: rows,
+                generation: cs.tableGenerations[key.table, default: 0],
+                lastAccess: cs.resultCacheCounter,
+                accessedPages: accessedPages
+            )
+        }
     }
 
     // MARK: - SELECT
@@ -168,7 +173,7 @@ public actor QueryExecutor: Sendable {
            !mods.distinct {
             let orderCol = orderBy[0].column
             let ascending = orderBy[0].direction == .ascending
-            if let index = await indexManager.getIndex(tableName: table, columnName: orderCol) {
+            if let index = indexManager.getIndex(tableName: table, columnName: orderCol) {
                 let totalNeeded = limit + (mods.offset ?? 0)
 
                 // Check if this is a covering index (has all needed columns)
@@ -368,7 +373,7 @@ public actor QueryExecutor: Sendable {
            let mods = modifiers, let limit = mods.limit, limit > 0,
            (mods.orderBy == nil || mods.orderBy!.isEmpty), !mods.distinct,
            condition == nil {
-            let rightIndex = await indexManager.getIndex(tableName: join.table, columnName: join.rightColumn)
+            let rightIndex = indexManager.getIndex(tableName: join.table, columnName: join.rightColumn)
             if let rightIndex = rightIndex {
                 let totalNeeded = limit + (mods.offset ?? 0)
                 let pageIDs = transactionContext == nil
@@ -481,7 +486,7 @@ public actor QueryExecutor: Sendable {
         // Process each join in optimized order, using planner's join strategy
         for (i, join) in optimizedJoins.enumerated() {
             // Check if right table join column has an index for index nested loop join
-            let rightIndex = await indexManager.getIndex(tableName: join.table, columnName: join.rightColumn)
+            let rightIndex = indexManager.getIndex(tableName: join.table, columnName: join.rightColumn)
             let rightTableInfo = planner.registry.getTableInfo(name: join.table)
             let rightRowEstimate = rightTableInfo?.recordCount ?? 0
 
@@ -766,7 +771,7 @@ public actor QueryExecutor: Sendable {
                     condition: .equals(column: pkColumn.name, value: pkValue)
                 ), !indexed.isEmpty {
                     throw PantryError.primaryKeyViolation
-                } else if !(await indexManager.hasIndex(tableName: table, columnName: pkColumn.name)) {
+                } else if !(indexManager.hasIndex(tableName: table, columnName: pkColumn.name)) {
                     // No index — fall back to scan
                     let existing = try await executeSelect(from: table, columns: [pkColumn.name], where: .equals(column: pkColumn.name, value: pkValue), transactionContext: transactionContext)
                     if !existing.isEmpty {
@@ -809,7 +814,7 @@ public actor QueryExecutor: Sendable {
                             condition: .equals(column: pkColumn.name, value: pkValue)
                         ), !indexed.isEmpty {
                             throw PantryError.primaryKeyViolation
-                        } else if !(await indexManager.hasIndex(tableName: table, columnName: pkColumn.name)) {
+                        } else if !(indexManager.hasIndex(tableName: table, columnName: pkColumn.name)) {
                             let existing = try await executeSelect(from: table, columns: [pkColumn.name], where: .equals(column: pkColumn.name, value: pkValue), transactionContext: transactionContext)
                             if !existing.isEmpty {
                                 throw PantryError.primaryKeyViolation
@@ -1198,14 +1203,14 @@ public actor QueryExecutor: Sendable {
         if condition == nil {
             switch function {
             case .min(let column):
-                if let index = await indexManager.getIndex(tableName: table, columnName: column) {
+                if let index = indexManager.getIndex(tableName: table, columnName: column) {
                     let firstRows = try await index.searchRangeWithLimit(from: nil, to: nil, limit: 1, ascending: true)
                     if let first = firstRows.first, let value = first.values[column], value != .null {
                         return value
                     }
                 }
             case .max(let column):
-                if let index = await indexManager.getIndex(tableName: table, columnName: column) {
+                if let index = indexManager.getIndex(tableName: table, columnName: column) {
                     let lastRows = try await index.searchRangeWithLimit(from: nil, to: nil, limit: 1, ascending: false)
                     if let last = lastRows.first, let value = last.values[column], value != .null {
                         return value
@@ -1337,7 +1342,7 @@ public actor QueryExecutor: Sendable {
     }
 
     /// Serial aggregate computation
-    private nonisolated func computeAggregate(rows: [Row], function: AggregateFunction) -> DBValue {
+    private func computeAggregate(rows: [Row], function: AggregateFunction) -> DBValue {
         switch function {
         case .count(let column):
             if let column = column {
@@ -1431,7 +1436,7 @@ public actor QueryExecutor: Sendable {
     }
 
     /// Merge partial aggregate results from parallel partitions
-    private nonisolated func mergeAggregateResults(_ results: [DBValue], function: AggregateFunction, totalRowCount: Int) -> DBValue {
+    private func mergeAggregateResults(_ results: [DBValue], function: AggregateFunction, totalRowCount: Int) -> DBValue {
         switch function {
         case .count:
             var total: Int64 = 0
@@ -1481,7 +1486,7 @@ public actor QueryExecutor: Sendable {
 
     /// Compute partial AVG as (sum, count) for correct parallel merging.
     /// Returns .compound([.double(sum), .integer(count)]) instead of the divided average.
-    private nonisolated func computePartialAVG(rows: [Row], column: String) -> DBValue {
+    private func computePartialAVG(rows: [Row], column: String) -> DBValue {
         var sum: Double = 0
         var count: Int64 = 0
         for row in rows {
@@ -1498,36 +1503,36 @@ public actor QueryExecutor: Sendable {
     private func indexAcceleratedCount(table: String, condition: WhereCondition) async throws -> DBValue? {
         switch condition {
         case .greaterThan(let col, let value):
-            if let index = await indexManager.getIndex(tableName: table, columnName: col) {
+            if let index = indexManager.getIndex(tableName: table, columnName: col) {
                 // age > 30 → count from 30 (exclusive). Use the next representable value as lower bound.
                 let startKey = incrementKey(value)
                 let count = try await index.countRange(from: startKey, to: nil)
                 return .integer(count)
             }
         case .greaterThanOrEqual(let col, let value):
-            if let index = await indexManager.getIndex(tableName: table, columnName: col) {
+            if let index = indexManager.getIndex(tableName: table, columnName: col) {
                 let count = try await index.countRange(from: value, to: nil)
                 return .integer(count)
             }
         case .lessThan(let col, let value):
-            if let index = await indexManager.getIndex(tableName: table, columnName: col) {
+            if let index = indexManager.getIndex(tableName: table, columnName: col) {
                 // Use decrementKey for exclusive upper bound
                 let endKey = decrementKey(value)
                 let count = try await index.countRange(from: nil, to: endKey)
                 return .integer(count)
             }
         case .lessThanOrEqual(let col, let value):
-            if let index = await indexManager.getIndex(tableName: table, columnName: col) {
+            if let index = indexManager.getIndex(tableName: table, columnName: col) {
                 let count = try await index.countRange(from: nil, to: value)
                 return .integer(count)
             }
         case .between(let col, let minVal, let maxVal):
-            if let index = await indexManager.getIndex(tableName: table, columnName: col) {
+            if let index = indexManager.getIndex(tableName: table, columnName: col) {
                 let count = try await index.countRange(from: minVal, to: maxVal)
                 return .integer(count)
             }
         case .equals(let col, let value):
-            if let index = await indexManager.getIndex(tableName: table, columnName: col) {
+            if let index = indexManager.getIndex(tableName: table, columnName: col) {
                 if let rows = try await index.search(key: value) {
                     return .integer(Int64(rows.count))
                 }
@@ -1539,7 +1544,7 @@ public actor QueryExecutor: Sendable {
     }
 
     /// Return the next representable value (for exclusive lower bound in range count).
-    private nonisolated func incrementKey(_ value: DBValue) -> DBValue {
+    private func incrementKey(_ value: DBValue) -> DBValue {
         switch value {
         case .integer(let v): return .integer(v + 1)
         case .double(let v): return .double(v.nextUp)
@@ -1549,7 +1554,7 @@ public actor QueryExecutor: Sendable {
     }
 
     /// Return the previous representable value (for exclusive upper bound in range count).
-    private nonisolated func decrementKey(_ value: DBValue) -> DBValue {
+    private func decrementKey(_ value: DBValue) -> DBValue {
         switch value {
         case .integer(let v): return .integer(v - 1)
         case .double(let v): return .double(v.nextDown)
@@ -1557,7 +1562,7 @@ public actor QueryExecutor: Sendable {
         }
     }
 
-    private nonisolated func numericValue(_ value: DBValue?) -> Double? {
+    private func numericValue(_ value: DBValue?) -> Double? {
         guard let value = value else { return nil }
         switch value {
         case .integer(let v): return Double(v)
@@ -1568,7 +1573,7 @@ public actor QueryExecutor: Sendable {
 
     // MARK: - Condition Evaluation
 
-    private nonisolated func evaluateCondition(_ condition: WhereCondition, row: Row) -> Bool {
+    private func evaluateCondition(_ condition: WhereCondition, row: Row) -> Bool {
         switch condition {
         case let .equals(column, value):
             // SQL: NULL = anything is false; use isNull for NULL checks
@@ -1618,7 +1623,7 @@ public actor QueryExecutor: Sendable {
 
     /// Static cost heuristic for condition types. Lower = cheaper/more selective.
     /// Used to reorder AND/OR children for faster short-circuit evaluation.
-    private nonisolated func conditionCost(_ condition: WhereCondition) -> Int {
+    private func conditionCost(_ condition: WhereCondition) -> Int {
         switch condition {
         case .isNull, .isNotNull: return 1      // single nil check
         case .equals: return 2                   // single comparison, high selectivity
@@ -1635,7 +1640,7 @@ public actor QueryExecutor: Sendable {
     // MARK: - Lazy Evaluation Helpers
 
     /// Extract all column names referenced in a WHERE condition.
-    private nonisolated func columnsReferenced(in condition: WhereCondition) -> Set<String> {
+    private func columnsReferenced(in condition: WhereCondition) -> Set<String> {
         switch condition {
         case .equals(let col, _), .notEquals(let col, _),
              .lessThan(let col, _), .greaterThan(let col, _),
@@ -1658,7 +1663,7 @@ public actor QueryExecutor: Sendable {
     /// Columns can be qualified ("table.col") or unqualified ("col").
     /// An unqualified column is assigned to a table if it exists in that table's schema and no other.
     /// Only top-level AND conjuncts are pushed down; OR conditions are kept as residual.
-    private nonisolated func decomposePredicates(
+    private func decomposePredicates(
         _ condition: WhereCondition,
         tables: [String],
         tableColumns: [String: Set<String>]
@@ -1728,7 +1733,7 @@ public actor QueryExecutor: Sendable {
 
     /// Resolve a column name to its table. Handles "table.col" qualified names
     /// and unqualified names (matched if unique across tables).
-    private nonisolated func resolveColumnTable(
+    private func resolveColumnTable(
         _ column: String,
         tables: [String],
         tableColumns: [String: Set<String>]
@@ -1752,7 +1757,7 @@ public actor QueryExecutor: Sendable {
 
     /// Strip "table." prefix from column references in a predicate so it can be evaluated
     /// against raw (unprefixed) rows during a table scan.
-    private nonisolated func stripTablePrefix(_ condition: WhereCondition, table: String) -> WhereCondition {
+    private func stripTablePrefix(_ condition: WhereCondition, table: String) -> WhereCondition {
         let prefix = "\(table)."
         func strip(_ col: String) -> String {
             col.hasPrefix(prefix) ? String(col.dropFirst(prefix.count)) : col
@@ -1778,7 +1783,7 @@ public actor QueryExecutor: Sendable {
 
     /// Generate a structural signature of a WhereCondition for cache keying.
     /// Same shape but different literal values produce the same signature.
-    private nonisolated func queryConditionSignature(_ condition: WhereCondition) -> String {
+    private func queryConditionSignature(_ condition: WhereCondition) -> String {
         switch condition {
         case .equals(let col, let val): return "eq(\(col),\(dbValueSignature(val)))"
         case .notEquals(let col, let val): return "ne(\(col),\(dbValueSignature(val)))"
@@ -1797,7 +1802,7 @@ public actor QueryExecutor: Sendable {
     }
 
     /// Include actual values in the signature since we cache exact results
-    private nonisolated func dbValueSignature(_ val: DBValue) -> String {
+    private func dbValueSignature(_ val: DBValue) -> String {
         switch val {
         case .null: return "N"
         case .integer(let v): return "i\(v)"
@@ -1809,7 +1814,7 @@ public actor QueryExecutor: Sendable {
         }
     }
 
-    private nonisolated func queryModifiersSignature(_ mods: QueryModifiers) -> String {
+    private func queryModifiersSignature(_ mods: QueryModifiers) -> String {
         var parts: [String] = []
         if let orderBy = mods.orderBy {
             parts.append("o:\(orderBy.map { "\($0.column)\($0.direction == .ascending ? "a" : "d")" }.joined(separator: ","))")
@@ -1823,7 +1828,7 @@ public actor QueryExecutor: Sendable {
     /// Evaluate a WHERE condition against raw binary data using partial column extraction.
     /// Returns nil if the condition type is too complex for lazy eval.
     /// When `columnIndexMap` is provided (schema-based positional data), uses fast positional lookup.
-    private nonisolated func evaluateConditionLazy(_ condition: WhereCondition, data: Data, columnIndexMap: [String: Int]? = nil) -> Bool? {
+    private func evaluateConditionLazy(_ condition: WhereCondition, data: Data, columnIndexMap: [String: Int]? = nil) -> Bool? {
         // Build a column lookup closure that dispatches to positional or self-describing extraction
         let lookupColumn: (String) -> DBValue?
         if data.count >= 2, data[data.startIndex] == 0xFF {
@@ -1973,7 +1978,7 @@ public actor QueryExecutor: Sendable {
         }
     }
 
-    private nonisolated func prefixRow(_ row: Row, table: String) -> [String: DBValue] {
+    private func prefixRow(_ row: Row, table: String) -> [String: DBValue] {
         var values = [String: DBValue]()
         for (k, v) in row.values {
             values["\(table).\(k)"] = v
@@ -1983,7 +1988,7 @@ public actor QueryExecutor: Sendable {
     }
 
     /// Hash inner join: builds hash table on the smaller side (per planner strategy)
-    private nonisolated func hashInnerJoin(left: [Row], right: [Row], join: JoinClause, strategy: JoinStrategy, limit: Int? = nil) -> [Row] {
+    private func hashInnerJoin(left: [Row], right: [Row], join: JoinClause, strategy: JoinStrategy, limit: Int? = nil) -> [Row] {
         let buildOnRight: Bool
         if case .hashJoin(let side) = strategy { buildOnRight = (side == .right) } else { buildOnRight = true }
 
@@ -2027,7 +2032,7 @@ public actor QueryExecutor: Sendable {
     }
 
     /// Hash left join: always probes with left, builds on right
-    private nonisolated func hashLeftJoin(left: [Row], right: [Row], join: JoinClause, strategy: JoinStrategy) -> [Row] {
+    private func hashLeftJoin(left: [Row], right: [Row], join: JoinClause, strategy: JoinStrategy) -> [Row] {
         var hashTable = [DBValue: [Row]]()
         var rightColumns = Set<String>()
         for row in right {
@@ -2055,7 +2060,7 @@ public actor QueryExecutor: Sendable {
     }
 
     /// Hash right join: builds on left, probes with right
-    private nonisolated func hashRightJoin(left: [Row], right: [Row], join: JoinClause, strategy: JoinStrategy) -> [Row] {
+    private func hashRightJoin(left: [Row], right: [Row], join: JoinClause, strategy: JoinStrategy) -> [Row] {
         var hashTable = [DBValue: [Row]]()
         var leftColumns = Set<String>()
         for leftRow in left {
@@ -2085,7 +2090,7 @@ public actor QueryExecutor: Sendable {
         return result
     }
 
-    private nonisolated func crossJoin(left: [Row], right: [Row], join: JoinClause) -> [Row] {
+    private func crossJoin(left: [Row], right: [Row], join: JoinClause) -> [Row] {
         var result = [Row]()
         result.reserveCapacity(left.count * right.count)
         for leftRow in left {
@@ -2102,7 +2107,7 @@ public actor QueryExecutor: Sendable {
 
     /// Build a map of column name → set of columns covered by that index
     private func buildIndexCoverage(table: String) async -> [String: Set<String>] {
-        let indexes = await indexManager.getIndexes(tableName: table)
+        let indexes = indexManager.getIndexes(tableName: table)
         var coverage = [String: Set<String>]()
         for (colName, idx) in indexes {
             let covered = await idx.coveredColumns
@@ -2114,7 +2119,7 @@ public actor QueryExecutor: Sendable {
     // MARK: - Parallel Table Scan
 
     /// Decode a row, using projected decode when possible for fewer allocations.
-    private nonisolated func decodeRow(_ data: Data, schema: PantryTableSchema?, neededColumns: Set<String>?) -> Row? {
+    private func decodeRow(_ data: Data, schema: PantryTableSchema?, neededColumns: Set<String>?) -> Row? {
         if let schema = schema, let needed = neededColumns {
             return Row.fromBytesProjectedV3(data, schema: schema, neededColumns: needed)
         }
@@ -2282,7 +2287,7 @@ public actor QueryExecutor: Sendable {
 
     /// Select the top N elements from an array using a bounded max-heap.
     /// O(n log k) where k = n, much faster than O(n log n) full sort when k << n.
-    private nonisolated func topN(_ elements: [Row], n: Int, by areInIncreasingOrder: (Row, Row) -> Bool) -> [Row] {
+    private func topN(_ elements: [Row], n: Int, by areInIncreasingOrder: (Row, Row) -> Bool) -> [Row] {
         guard n > 0 else { return [] }
         if n >= elements.count {
             return elements.sorted(by: areInIncreasingOrder)
@@ -2308,7 +2313,7 @@ public actor QueryExecutor: Sendable {
     }
 
     /// Sift down in a max-heap (largest-first, where "largest" = !areInIncreasingOrder)
-    private nonisolated func siftDown(_ heap: inout [Row], _ index: Int, _ areInIncreasingOrder: (Row, Row) -> Bool) {
+    private func siftDown(_ heap: inout [Row], _ index: Int, _ areInIncreasingOrder: (Row, Row) -> Bool) {
         var parent = index
         let count = heap.count
         while true {
@@ -2330,7 +2335,7 @@ public actor QueryExecutor: Sendable {
 
     // MARK: - DISTINCT Helper
 
-    private nonisolated func deduplicateRows(_ rows: [Row], columns: [String]?) -> [Row] {
+    private func deduplicateRows(_ rows: [Row], columns: [String]?) -> [Row] {
         var seen = Set<Row>()
         var unique = [Row]()
         for row in rows {
@@ -2351,7 +2356,7 @@ public actor QueryExecutor: Sendable {
     // MARK: - Helpers
 
     /// Strip the internal __rid field from index-returned rows before returning to users
-    private nonisolated func stripRID(_ row: Row) -> Row {
+    private func stripRID(_ row: Row) -> Row {
         guard row.values["__rid"] != nil else { return row }
         var values = row.values
         values.removeValue(forKey: "__rid")
@@ -2367,7 +2372,7 @@ public actor QueryExecutor: Sendable {
     }
 
     /// SQL LIKE pattern matching: % matches any sequence, _ matches any single character
-    private nonisolated func matchLikePattern(_ string: String, pattern: String) -> Bool {
+    private func matchLikePattern(_ string: String, pattern: String) -> Bool {
         let s = Array(string)
         let p = Array(pattern)
         var si = 0, pi = 0
