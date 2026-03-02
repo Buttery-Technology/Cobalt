@@ -311,10 +311,17 @@ extension Row {
         switch tag {
         case 0: // null
             return true
-        case 1: // integer
+        case 1: // integer (legacy 8-byte)
             guard offset + 8 <= data.count else { return false }
             offset += 8
             return true
+        case 7: // integer (varint zigzag)
+            while offset < data.count {
+                let b = data[offset]
+                offset += 1
+                if b & 0x80 == 0 { return true }
+            }
+            return false
         case 2: // double
             guard offset + 8 <= data.count else { return false }
             offset += 8
@@ -353,8 +360,15 @@ extension Row {
         case .null:
             buf.append(0) // tag 0
         case .integer(let v):
-            buf.append(1) // tag 1
-            buf.appendInt64(v)
+            // Varint encoding with zigzag: tag 7
+            buf.append(7)
+            let zigzag = UInt64(bitPattern: (v << 1) ^ (v >> 63))
+            var z = zigzag
+            while z >= 0x80 {
+                buf.append(UInt8(z & 0x7F) | 0x80)
+                z >>= 7
+            }
+            buf.append(UInt8(z))
         case .double(let v):
             buf.append(2) // tag 2
             buf.appendFloat64(v)
@@ -386,8 +400,21 @@ extension Row {
         switch tag {
         case 0: // null
             return .null
-        case 1: // integer
+        case 1: // integer (legacy 8-byte)
             guard let v = data.readInt64(at: &offset) else { return nil }
+            return .integer(v)
+        case 7: // integer (varint zigzag)
+            var zigzag: UInt64 = 0
+            var shift: UInt64 = 0
+            while offset < data.count {
+                let b = UInt64(data[offset])
+                offset += 1
+                zigzag |= (b & 0x7F) << shift
+                if b & 0x80 == 0 { break }
+                shift += 7
+                if shift >= 70 { return nil } // overflow protection
+            }
+            let v = Int64(bitPattern: (zigzag >> 1) ^ (0 &- (zigzag & 1)))
             return .integer(v)
         case 2: // double
             guard let v = data.readFloat64(at: &offset) else { return nil }

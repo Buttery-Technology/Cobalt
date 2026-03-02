@@ -9,6 +9,7 @@ public enum PantryError: Error, Sendable {
     case invalidDatabasePath(description: String? = nil)
     case databaseFileCorrupt
     case databaseClosed
+    case fileOpenError(description: String? = nil)
 
     // Record errors
     case recordNotFound(id: UInt64)

@@ -11,6 +11,8 @@ public final class BTreeNode: Codable, @unchecked Sendable {
     public var children: [UUID]?
     public let nodeId: UUID
     public var isLeaf: Bool
+    public var nextLeafId: UUID?
+    public var prevLeafId: UUID?
 
     public init(isLeaf: Bool = true) {
         self.keys = []
@@ -18,15 +20,19 @@ public final class BTreeNode: Codable, @unchecked Sendable {
         self.children = isLeaf ? nil : []
         self.nodeId = UUID()
         self.isLeaf = isLeaf
+        self.nextLeafId = nil
+        self.prevLeafId = nil
     }
 
-    // Private init that preserves nodeId (for copy via Codable round-trip is expensive)
-    private init(nodeId: UUID, isLeaf: Bool, keys: [DBValue], values: [Row], children: [UUID]?) {
+    // Private init that preserves nodeId
+    private init(nodeId: UUID, isLeaf: Bool, keys: [DBValue], values: [Row], children: [UUID]?, nextLeafId: UUID? = nil, prevLeafId: UUID? = nil) {
         self.nodeId = nodeId
         self.isLeaf = isLeaf
         self.keys = keys
         self.values = values
         self.children = children
+        self.nextLeafId = nextLeafId
+        self.prevLeafId = prevLeafId
     }
 
     /// Serialize to binary data for page storage
@@ -82,6 +88,24 @@ public final class BTreeNode: Codable, @unchecked Sendable {
             for child in children {
                 let cuuid = child.uuid
                 withUnsafeBytes(of: cuuid) { buf.append(contentsOf: $0) }
+            }
+        }
+
+        // Leaf sibling pointers
+        if isLeaf {
+            if let nextId = nextLeafId {
+                buf.append(0x01)
+                let nuuid = nextId.uuid
+                withUnsafeBytes(of: nuuid) { buf.append(contentsOf: $0) }
+            } else {
+                buf.append(0x00)
+            }
+            if let prevId = prevLeafId {
+                buf.append(0x01)
+                let puuid = prevId.uuid
+                withUnsafeBytes(of: puuid) { buf.append(contentsOf: $0) }
+            } else {
+                buf.append(0x00)
             }
         }
 
@@ -165,7 +189,33 @@ public final class BTreeNode: Codable, @unchecked Sendable {
             children = childList
         }
 
-        return BTreeNode(nodeId: nodeId, isLeaf: isLeaf, keys: keys, values: values, children: children)
+        // Leaf sibling pointers (backward compat: old nodes may not have these bytes)
+        var nextLeafId: UUID? = nil
+        var prevLeafId: UUID? = nil
+        if isLeaf, offset < data.count {
+            let hasNext = data[offset] != 0
+            offset += 1
+            if hasNext, offset + 16 <= data.count {
+                let nuuid = data.withUnsafeBytes { buf -> uuid_t in
+                    buf.loadUnaligned(fromByteOffset: offset, as: uuid_t.self)
+                }
+                nextLeafId = UUID(uuid: nuuid)
+                offset += 16
+            }
+            if offset < data.count {
+                let hasPrev = data[offset] != 0
+                offset += 1
+                if hasPrev, offset + 16 <= data.count {
+                    let puuid = data.withUnsafeBytes { buf -> uuid_t in
+                        buf.loadUnaligned(fromByteOffset: offset, as: uuid_t.self)
+                    }
+                    prevLeafId = UUID(uuid: puuid)
+                    offset += 16
+                }
+            }
+        }
+
+        return BTreeNode(nodeId: nodeId, isLeaf: isLeaf, keys: keys, values: values, children: children, nextLeafId: nextLeafId, prevLeafId: prevLeafId)
     }
 }
 

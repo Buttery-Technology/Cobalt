@@ -170,8 +170,10 @@ public actor QueryExecutor: Sendable {
         }
 
         // Get page chain for cost estimation and schema for positional row decoding
-        let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
-        let selectSchema = await storageEngine.getTableSchema(table)
+        let pageIDs = transactionContext == nil
+            ? try await storageEngine.getPageChainConcurrent(tableName: table)
+            : try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
+        let selectSchema = storageEngine.getTableSchema(table)
 
         // Build index coverage map for cost-based planner
         let indexCoverage = await buildIndexCoverage(table: table)
@@ -305,7 +307,7 @@ public actor QueryExecutor: Sendable {
             // Build table column map from schemas
             var tableColumns: [String: Set<String>] = [:]
             for t in allTables {
-                if let schema = await storageEngine.getTableSchema(t) {
+                if let schema = storageEngine.getTableSchema(t) {
                     tableColumns[t] = Set(schema.columns.map { $0.name })
                 }
             }
@@ -406,8 +408,10 @@ public actor QueryExecutor: Sendable {
 
     public func executeGroupBy(from table: String, select expressions: [SelectExpression], where condition: WhereCondition? = nil, groupBy: GroupByClause, modifiers: QueryModifiers? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {
         // Streaming hash aggregate: scan pages directly, accumulate per-group state
-        let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
-        let gbSchema = await storageEngine.getTableSchema(table)
+        let pageIDs = transactionContext == nil
+            ? try await storageEngine.getPageChainConcurrent(tableName: table)
+            : try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
+        let gbSchema = storageEngine.getTableSchema(table)
 
         // Per-group accumulators: key → (count, per-expression state)
         struct GroupAccum {
@@ -566,7 +570,7 @@ public actor QueryExecutor: Sendable {
 
     public func executeInsert(into table: String, row: Row, transactionContext: TransactionContext? = nil) async throws {
         // Enforce primary key uniqueness if schema defines one
-        if let schema = await storageEngine.getTableSchema(table),
+        if let schema = storageEngine.getTableSchema(table),
            let pkColumn = schema.primaryKeyColumn {
             if let pkValue = row.values[pkColumn.name], pkValue != .null {
                 // Check index first if available, otherwise scan
@@ -587,7 +591,7 @@ public actor QueryExecutor: Sendable {
             }
         }
 
-        let schema = await storageEngine.getTableSchema(table)
+        let schema = storageEngine.getTableSchema(table)
         let rowData = schema != nil ? row.toBytesPositional(schema: schema!) : row.toBytes()
         let recordID = generateRecordID()
         let record = Record(id: recordID, data: rowData)
@@ -601,7 +605,7 @@ public actor QueryExecutor: Sendable {
         guard !rows.isEmpty else { return }
 
         // Validate primary key uniqueness in batch
-        let schema = await storageEngine.getTableSchema(table)
+        let schema = storageEngine.getTableSchema(table)
         if let pkColumn = schema?.primaryKeyColumn {
             var seenPKs = Set<String>()
             for row in rows {
@@ -629,7 +633,7 @@ public actor QueryExecutor: Sendable {
         }
 
         // Phase 1: Insert all records without index updates
-        let bulkSchema = await storageEngine.getTableSchema(table)
+        let bulkSchema = storageEngine.getTableSchema(table)
         var insertedPairs: [(Record, Row)] = []
         insertedPairs.reserveCapacity(rows.count)
 
@@ -652,7 +656,7 @@ public actor QueryExecutor: Sendable {
 
     public func executeUpdate(table: String, set values: [String: DBValue], where condition: WhereCondition?, transactionContext: TransactionContext? = nil) async throws -> Int {
         // If updating PK column, validate uniqueness of new PK value
-        if let schema = await storageEngine.getTableSchema(table),
+        if let schema = storageEngine.getTableSchema(table),
            let pkColumn = schema.primaryKeyColumn,
            let newPKValue = values[pkColumn.name], newPKValue != .null {
             let existing = try await executeSelect(from: table, columns: [pkColumn.name], where: .equals(column: pkColumn.name, value: newPKValue), transactionContext: transactionContext)
@@ -663,8 +667,10 @@ public actor QueryExecutor: Sendable {
         }
 
         // Use cost-based planner to decide index vs scan
-        let updateSchema = await storageEngine.getTableSchema(table)
-        let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
+        let updateSchema = storageEngine.getTableSchema(table)
+        let pageIDs = transactionContext == nil
+            ? try await storageEngine.getPageChainConcurrent(tableName: table)
+            : try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
         let plan = planner.chooseAccessPlan(table: table, condition: condition, pageCount: pageIDs.count)
 
         if case .indexScan = plan, let condition = condition,
@@ -726,7 +732,9 @@ public actor QueryExecutor: Sendable {
 
     public func executeDelete(from table: String, where condition: WhereCondition?, transactionContext: TransactionContext? = nil) async throws -> Int {
         // Use cost-based planner to decide index vs scan
-        let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
+        let pageIDs = transactionContext == nil
+            ? try await storageEngine.getPageChainConcurrent(tableName: table)
+            : try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
         let plan = planner.chooseAccessPlan(table: table, condition: condition, pageCount: pageIDs.count)
 
         if case .indexScan = plan, let condition = condition,
@@ -747,7 +755,7 @@ public actor QueryExecutor: Sendable {
         }
 
         // Table scan path
-        let deleteSchema = await storageEngine.getTableSchema(table)
+        let deleteSchema = storageEngine.getTableSchema(table)
         let rawRecords = try await storageEngine.scanTableRaw(table, transactionContext: transactionContext)
         var deletedCount = 0
 
@@ -798,14 +806,64 @@ public actor QueryExecutor: Sendable {
             }
         }
 
-        let rows = try await executeSelect(from: table, where: condition, transactionContext: transactionContext)
+        // Streaming aggregate: scan pages directly without materializing [Row]
+        let pageIDs = transactionContext == nil
+            ? try await storageEngine.getPageChainConcurrent(tableName: table)
+            : try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
+        let aggSchema = storageEngine.getTableSchema(table)
 
-        // For large datasets, partition and compute in parallel
-        if rows.count > 1000 {
-            return try await parallelAggregate(rows: rows, function: function)
+        var count: Int64 = 0
+        var intSum: Int64 = 0; var doubleSum: Double = 0; var allIntegers = true; var hasValue = false
+        var avgSum: Double = 0; var avgCount: Int64 = 0
+        var minVal: DBValue = .null; var maxVal: DBValue = .null
+
+        for pageID in pageIDs {
+            let page = transactionContext == nil
+                ? try await storageEngine.getPageConcurrent(pageID: pageID)
+                : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+            for var record in page.records {
+                if record.isOverflow {
+                    record = try await storageEngine.reassembleOverflowRecord(record)
+                }
+                guard let row = Row.fromBytesAuto(record.data, schema: aggSchema) else { continue }
+                if let cond = condition, !evaluateCondition(cond, row: row) { continue }
+
+                switch function {
+                case .count(let col):
+                    if let col = col {
+                        if let v = row.values[col], v != .null { count += 1 }
+                    } else {
+                        count += 1
+                    }
+                case .sum(let col):
+                    if let dbVal = row.values[col] {
+                        switch dbVal {
+                        case .integer(let v): hasValue = true; let (r, o) = intSum.addingReportingOverflow(v); if o { allIntegers = false }; intSum = r; doubleSum += Double(v)
+                        case .double(let v): hasValue = true; allIntegers = false; doubleSum += v
+                        default: break
+                        }
+                    }
+                case .avg(let col):
+                    if let v = numericValue(row.values[col]) { avgSum += v; avgCount += 1 }
+                case .min(let col):
+                    if let v = row.values[col], v != .null {
+                        if minVal == .null || v < minVal { minVal = v }
+                    }
+                case .max(let col):
+                    if let v = row.values[col], v != .null {
+                        if maxVal == .null || v > maxVal { maxVal = v }
+                    }
+                }
+            }
         }
 
-        return computeAggregate(rows: rows, function: function)
+        switch function {
+        case .count: return .integer(count)
+        case .sum: return hasValue ? (allIntegers ? .integer(intSum) : .double(doubleSum)) : .null
+        case .avg: return avgCount > 0 ? .double(avgSum / Double(avgCount)) : .null
+        case .min: return minVal
+        case .max: return maxVal
+        }
     }
 
     /// Serial aggregate computation
@@ -1251,6 +1309,15 @@ public actor QueryExecutor: Sendable {
         case .greaterThanOrEqual(let col, let value):
             guard let rowValue = lookupColumn(col), rowValue != .null, value != .null else { return false }
             return rowValue >= value
+        case .in(let col, let values):
+            guard let rowValue = lookupColumn(col), rowValue != .null else { return false }
+            return values.contains(rowValue)
+        case .between(let col, let min, let max):
+            guard let rowValue = lookupColumn(col), rowValue != .null, min != .null, max != .null else { return false }
+            return rowValue >= min && rowValue <= max
+        case .like(let col, let pattern):
+            guard let rowValue = lookupColumn(col), case .string(let str) = rowValue else { return false }
+            return matchLikePattern(str, pattern: pattern)
         case .isNull(let col):
             let val = lookupColumn(col)
             return val == nil || val == .null
@@ -1269,20 +1336,22 @@ public actor QueryExecutor: Sendable {
                 if result { return true }
             }
             return false
-        default:
-            return nil // Fall back to full decode
         }
     }
 
     // MARK: - JOIN Helpers
 
     private func scanAllRows(table: String, filter: WhereCondition? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {
-        let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
-        let scanSchema = await storageEngine.getTableSchema(table)
+        let pageIDs = transactionContext == nil
+            ? try await storageEngine.getPageChainConcurrent(tableName: table)
+            : try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
+        let scanSchema = storageEngine.getTableSchema(table)
         return try await withThrowingTaskGroup(of: (Int, [Row]).self) { group in
             for (index, pageID) in pageIDs.enumerated() {
                 group.addTask { [storageEngine, filter, scanSchema] in
-                    let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+                    let page = transactionContext == nil
+                        ? try await storageEngine.getPageConcurrent(pageID: pageID)
+                        : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
                     let rows = page.records.compactMap { Row.fromBytesAuto($0.data, schema: scanSchema) }
                     if let filter = filter {
                         return (index, rows.filter { self.evaluateCondition(filter, row: $0) })

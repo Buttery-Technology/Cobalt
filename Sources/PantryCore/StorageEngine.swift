@@ -33,6 +33,10 @@ public actor StorageEngine: Sendable {
     /// Persisted free space bitmap for O(1) page selection
     private let freeSpaceBitmap = FreeSpaceBitmap()
 
+    /// Per-table extent reserve: pre-allocated contiguous pages for reduced fragmentation
+    private var extentReserve: [String: [DatabasePage]] = [:]
+    private let extentSize = 8
+
     /// Auto-checkpoint: WAL size threshold in bytes (0 = disabled)
     private var autoCheckpointThreshold: Int = 0
 
@@ -142,14 +146,17 @@ public actor StorageEngine: Sendable {
         return loadedPage
     }
 
-    /// Non-actor read path: checks buffer pool cache first (no actor hop needed for hits).
-    /// Falls back to actor-isolated getPage on cache miss.
+    /// Non-actor read path: reads from buffer pool or storage manager directly.
+    /// No actor hop needed — both bufferPoolManager and storageManager are Sendable with internal locking.
     /// Use for read-only parallel scans where transaction tracking is not needed.
     public nonisolated func getPageConcurrent(pageID: Int) async throws -> DatabasePage {
         if let cachedPage = bufferPoolManager.getCachedPage(pageID: pageID) {
             return cachedPage
         }
-        return try await getPage(pageID: pageID)
+        // Read directly from storage manager (pread is thread-safe, no actor hop needed)
+        let page = try storageManager.readPage(pageID: pageID)
+        await bufferPoolManager.cachePage(page)
+        return page
     }
 
     public func savePage(_ page: DatabasePage, transactionContext: TransactionContext? = nil, skipAfterImage: Bool = false) async throws {
@@ -722,6 +729,37 @@ public actor StorageEngine: Sendable {
         return pageIDs
     }
 
+    /// Non-actor page chain read: reads from registry cache or walks pages via getPageConcurrent.
+    /// No actor hop needed — all accessed components are Sendable with internal locking.
+    public nonisolated func getPageChainConcurrent(tableName: String) async throws -> [Int] {
+        guard var tableInfo = tableRegistry.getTableInfo(name: tableName) else {
+            throw PantryError.tableNotFound(name: tableName)
+        }
+
+        // Fast path: return cached page list if available
+        if let cached = tableInfo.pageList, !cached.isEmpty {
+            return cached
+        }
+
+        // Slow path: walk linked list using concurrent page reads
+        var pageIDs: [Int] = []
+        var currentPageID = tableInfo.firstPageID
+        var visited: Set<Int> = []
+
+        while currentPageID != 0 {
+            guard visited.insert(currentPageID).inserted else {
+                throw PantryError.corruptPage(pageID: currentPageID)
+            }
+            pageIDs.append(currentPageID)
+            let page = try await getPageConcurrent(pageID: currentPageID)
+            currentPageID = page.nextPageID
+        }
+
+        tableInfo.pageList = pageIDs
+        tableRegistry.updateTableInfo(tableInfo)
+        return pageIDs
+    }
+
     /// Stream records from a table page-at-a-time, yielding (Record, Row) pairs.
     public func scanTableStream(_ tableName: String) async throws -> AsyncStream<(Record, Row)> {
         guard let tableInfo = tableRegistry.getTableInfo(name: tableName) else {
@@ -842,18 +880,18 @@ public actor StorageEngine: Sendable {
         tableRegistry.getTableInfo(name: tableName)?.columnStats[column]
     }
 
-    /// Check if a table exists
-    public func tableExists(_ name: String) async -> Bool {
+    /// Check if a table exists (nonisolated — reads from Mutex-protected registry)
+    public nonisolated func tableExists(_ name: String) -> Bool {
         tableRegistry.getTableInfo(name: name) != nil
     }
 
-    /// List all table names
-    public func listTables() async -> [String] {
+    /// List all table names (nonisolated — reads from Mutex-protected registry)
+    public nonisolated func listTables() -> [String] {
         tableRegistry.allTables().map { $0.name }
     }
 
-    /// Get a table's schema
-    public func getTableSchema(_ name: String) async -> PantryTableSchema? {
+    /// Get a table's schema (nonisolated — reads from Mutex-protected registry)
+    public nonisolated func getTableSchema(_ name: String) -> PantryTableSchema? {
         tableRegistry.getTableInfo(name: name)?.schema
     }
 
@@ -1004,7 +1042,7 @@ public actor StorageEngine: Sendable {
     }
 
     private func createNewPageForTable(tableInfo: inout TableInfo) async throws -> DatabasePage {
-        // Pop from free list if available, otherwise extend file
+        // Pop from free list if available, check extent reserve, or extend file with extent allocation
         let newPage: DatabasePage
         if freeListHead != 0 {
             let freePage = try await storageManager.readPage(pageID: freeListHead)
@@ -1014,8 +1052,26 @@ public actor StorageEngine: Sendable {
             bufferPoolManager.updatePage(reusedPage)
             try await saveFreeListHead()
             newPage = reusedPage
+        } else if var reserve = extentReserve[tableInfo.name], !reserve.isEmpty {
+            // Use pre-allocated page from extent reserve
+            newPage = reserve.removeFirst()
+            if reserve.isEmpty {
+                extentReserve.removeValue(forKey: tableInfo.name)
+            } else {
+                extentReserve[tableInfo.name] = reserve
+            }
         } else {
+            // Allocate a contiguous extent of pages, use the first, reserve the rest
             newPage = try await storageManager.createNewPage()
+            var reserved: [DatabasePage] = []
+            for _ in 1..<extentSize {
+                let extraPage = try await storageManager.createNewPage()
+                await bufferPoolManager.cachePage(extraPage)
+                reserved.append(extraPage)
+            }
+            if !reserved.isEmpty {
+                extentReserve[tableInfo.name] = reserved
+            }
         }
         await bufferPoolManager.cachePage(newPage)
 
