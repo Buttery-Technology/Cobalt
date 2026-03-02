@@ -101,10 +101,32 @@ public actor QueryExecutor: Sendable {
         guard rows.count <= 10_000 else { return }
 
         if resultCache.count >= maxResultCacheSize {
+            // O(n) eviction: find the median-ish access threshold and remove entries below it
             let evictCount = maxResultCacheSize / 4
-            let sorted = resultCache.sorted { $0.value.lastAccess < $1.value.lastAccess }
-            for entry in sorted.prefix(evictCount) {
-                resultCache.removeValue(forKey: entry.key)
+            // Find the Nth smallest lastAccess via single pass collecting candidates
+            var candidates: [(key: QueryResultCacheKey, access: UInt64)] = []
+            candidates.reserveCapacity(resultCache.count)
+            for (key, value) in resultCache {
+                candidates.append((key: key, access: value.lastAccess))
+            }
+            // Partial sort: only need the evictCount smallest values
+            // Use nth_element-style: partition around approximate threshold
+            let threshold: UInt64
+            if candidates.count <= evictCount {
+                threshold = UInt64.max
+            } else {
+                // Find the evictCount-th smallest access value via partial selection
+                var accesses = candidates.map { $0.access }
+                accesses.sort() // O(n log n) but on UInt64 array, not full cache entries
+                threshold = accesses[evictCount - 1]
+            }
+            var removed = 0
+            for (key, access) in candidates {
+                if access <= threshold {
+                    resultCache.removeValue(forKey: key)
+                    removed += 1
+                    if removed >= evictCount { break }
+                }
             }
         }
 
@@ -140,16 +162,18 @@ public actor QueryExecutor: Sendable {
         var rows: [Row]
 
         // Fast path: ORDER BY + LIMIT on a single indexed column → index-ordered scan with early exit
+        // Works with or without WHERE condition. For WHERE, overfetches and filters.
         if let mods = modifiers,
            let orderBy = mods.orderBy, orderBy.count == 1,
            let limit = mods.limit, limit > 0,
-           !mods.distinct,
-           condition == nil {
+           !mods.distinct {
             let orderCol = orderBy[0].column
             let ascending = orderBy[0].direction == .ascending
             if let index = await indexManager.getIndex(tableName: table, columnName: orderCol) {
                 let totalNeeded = limit + (mods.offset ?? 0)
-                let indexRows = try await index.searchRangeWithLimit(from: nil, to: nil, limit: totalNeeded, ascending: ascending)
+                // With WHERE, overfetch to account for filtered-out rows
+                let fetchLimit = condition != nil ? totalNeeded * 4 : totalNeeded
+                let indexRows = try await index.searchRangeWithLimit(from: nil, to: nil, limit: fetchLimit, ascending: ascending)
 
                 // Fetch full rows by RID
                 let rids = Set(indexRows.compactMap { row -> UInt64? in
@@ -160,25 +184,34 @@ public actor QueryExecutor: Sendable {
 
                 // Re-sort by the index order (getRecordsByIDs doesn't preserve order)
                 let ridToRow = Dictionary(fullRecords.map { (record, row) in (record.id, row) }, uniquingKeysWith: { a, _ in a })
-                rows = indexRows.compactMap { indexRow -> Row? in
+                var orderedRows = indexRows.compactMap { indexRow -> Row? in
                     guard case .integer(let ridSigned) = indexRow.values["__rid"] else { return nil }
                     return ridToRow[UInt64(bitPattern: ridSigned)]
                 }
 
-                // Apply OFFSET then LIMIT (already sorted by index)
-                if let offset = mods.offset, offset > 0 {
-                    rows = Array(rows.dropFirst(offset))
+                // Apply WHERE filter if present
+                if let condition = condition {
+                    orderedRows = orderedRows.filter { evaluateCondition(condition, row: $0) }
                 }
-                rows = Array(rows.prefix(limit))
 
-                // Project columns
-                if let columns = columns, !columns.isEmpty {
-                    return rows.map { row in
-                        let projected = columns.reduce(into: [String: DBValue]()) { r, c in r[c] = row.values[c] ?? .null }
-                        return Row(values: projected)
+                // If we got enough rows, return early (skip full table scan)
+                if orderedRows.count >= totalNeeded || condition == nil {
+                    // Apply OFFSET then LIMIT (already sorted by index)
+                    if let offset = mods.offset, offset > 0 {
+                        orderedRows = Array(orderedRows.dropFirst(offset))
                     }
+                    rows = Array(orderedRows.prefix(limit))
+
+                    // Project columns
+                    if let columns = columns, !columns.isEmpty {
+                        return rows.map { row in
+                            let projected = columns.reduce(into: [String: DBValue]()) { r, c in r[c] = row.values[c] ?? .null }
+                            return Row(values: projected)
+                        }
+                    }
+                    return rows
                 }
-                return rows
+                // Not enough rows from overfetch — fall through to full scan
             }
         }
 
@@ -1168,9 +1201,29 @@ public actor QueryExecutor: Sendable {
         case let .isNotNull(column):
             return row.values[column] != nil && row.values[column] != .null
         case let .and(conditions):
-            return conditions.allSatisfy { evaluateCondition($0, row: row) }
+            // Reorder: cheapest/most-selective predicates first for faster short-circuit
+            let ordered = conditions.count <= 1 ? conditions : conditions.sorted { conditionCost($0) < conditionCost($1) }
+            return ordered.allSatisfy { evaluateCondition($0, row: row) }
         case let .or(conditions):
-            return conditions.contains { evaluateCondition($0, row: row) }
+            // Reorder: cheapest predicates first for faster short-circuit
+            let ordered = conditions.count <= 1 ? conditions : conditions.sorted { conditionCost($0) < conditionCost($1) }
+            return ordered.contains { evaluateCondition($0, row: row) }
+        }
+    }
+
+    /// Static cost heuristic for condition types. Lower = cheaper/more selective.
+    /// Used to reorder AND/OR children for faster short-circuit evaluation.
+    private nonisolated func conditionCost(_ condition: WhereCondition) -> Int {
+        switch condition {
+        case .isNull, .isNotNull: return 1      // single nil check
+        case .equals: return 2                   // single comparison, high selectivity
+        case .notEquals: return 3                // single comparison, low selectivity
+        case .in: return 4                       // set membership
+        case .lessThan, .greaterThan, .lessThanOrEqual, .greaterThanOrEqual: return 5
+        case .between: return 6                  // two comparisons
+        case .like: return 10                    // string pattern matching
+        case .and(let subs): return 20 + subs.count
+        case .or(let subs): return 20 + subs.count
         }
     }
 

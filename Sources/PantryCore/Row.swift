@@ -207,10 +207,22 @@ extension Row {
         guard off + offsetTableSize <= data.count else { return nil }
         let valuesStart = offsetTableStart + offsetTableSize
 
+        // If needing >50% of columns, full decode is cheaper than random offset lookups
+        if neededColumns.count * 2 > encodedCount {
+            guard let full = fromBytesAuto(data, schema: schema) else { return nil }
+            var projected = [String: DBValue]()
+            projected.reserveCapacity(neededColumns.count)
+            for col in neededColumns { projected[col] = full.values[col] ?? .null }
+            return Row(values: projected)
+        }
+
         var values = [String: DBValue]()
         values.reserveCapacity(neededColumns.count)
 
-        for colName in neededColumns {
+        // Sort needed columns by ordinal for sequential data section access (cache-friendly)
+        let sortedCols = neededColumns.sorted { (schema.columnOrdinals[$0] ?? Int.max) < (schema.columnOrdinals[$1] ?? Int.max) }
+
+        for colName in sortedCols {
             guard let idx = schema.columnOrdinals[colName], idx < encodedCount else {
                 values[colName] = .null
                 continue
