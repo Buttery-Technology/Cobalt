@@ -246,13 +246,13 @@ public final class BTree: @unchecked Sendable {
 
     // MARK: - Delete
 
-    public func delete(key: DBValue, row: Row? = nil) async throws {
+    public func delete(key: DBValue, rid: DBValue? = nil) async throws {
         guard let rootId = rootId,
               let root = try await nodeStore.loadNode(nodeId: rootId) else {
             return
         }
 
-        try await deleteFromNode(node: root, key: key, row: row)
+        try await deleteFromNode(node: root, key: key, rid: rid)
 
         if root.keys.isEmpty {
             if root.isLeaf {
@@ -466,14 +466,93 @@ public final class BTree: @unchecked Sendable {
         try await nodeStore.saveNode(parent)
     }
 
+    // MARK: - Bulk Load
+
+    /// Build the B-tree bottom-up from pre-sorted pairs. O(n) vs O(n log n) for individual inserts.
+    /// The tree must be empty (rootId == nil) before calling this method.
+    public func bulkLoad(sortedPairs: [(key: DBValue, row: Row)]) async throws {
+        guard !sortedPairs.isEmpty else { return }
+        precondition(rootId == nil, "bulkLoad requires an empty B-tree")
+
+        // Fill to `order` keys per node (not 2*order-1) to stay within page size limits
+        // and leave room for future inserts without immediate splits.
+        let keysPerNode = order
+
+        // Step 1: Create leaf nodes from sorted data
+        var leafNodes = [BTreeNode]()
+        leafNodes.reserveCapacity((sortedPairs.count + keysPerNode - 1) / keysPerNode)
+        var i = 0
+        while i < sortedPairs.count {
+            let node = BTreeNode(isLeaf: true)
+            let end = min(i + keysPerNode, sortedPairs.count)
+            node.keys.reserveCapacity(end - i)
+            node.values.reserveCapacity(end - i)
+            for j in i..<end {
+                node.keys.append(sortedPairs[j].key)
+                node.values.append(sortedPairs[j].row)
+            }
+            leafNodes.append(node)
+            i = end
+        }
+
+        // Step 2: Link leaf siblings
+        for j in 0..<leafNodes.count {
+            if j > 0 { leafNodes[j].prevLeafId = leafNodes[j - 1].nodeId }
+            if j < leafNodes.count - 1 { leafNodes[j].nextLeafId = leafNodes[j + 1].nodeId }
+        }
+
+        // Step 3: Save all leaf nodes in batch (single file extend)
+        try await nodeStore.saveNodesBatch(leafNodes)
+
+        // Step 4: Build internal levels bottom-up
+        var currentLevel: [BTreeNode] = leafNodes
+        while currentLevel.count > 1 {
+            var nextLevel = [BTreeNode]()
+            var idx = 0
+            while idx < currentLevel.count {
+                let parent = BTreeNode(isLeaf: false)
+                // First child — no separator key needed
+                parent.children!.append(currentLevel[idx].nodeId)
+                idx += 1
+                // Add subsequent children with separator keys
+                while idx < currentLevel.count && parent.keys.count < keysPerNode {
+                    let child = currentLevel[idx]
+                    parent.keys.append(child.keys[0])
+                    parent.values.append(child.values[0])
+                    parent.children!.append(child.nodeId)
+                    idx += 1
+                }
+                // If this parent has only 1 child, merge into previous parent
+                if parent.keys.isEmpty && !nextLevel.isEmpty {
+                    let prev = nextLevel[nextLevel.count - 1]
+                    let orphanChild = currentLevel[idx - 1]
+                    prev.keys.append(orphanChild.keys[0])
+                    prev.values.append(orphanChild.values[0])
+                    prev.children!.append(orphanChild.nodeId)
+                } else {
+                    nextLevel.append(parent)
+                }
+            }
+            // Save internal level in batch
+            try await nodeStore.saveNodesBatch(nextLevel)
+            currentLevel = nextLevel
+        }
+
+        // Step 5: Set root
+        rootId = currentLevel.first?.nodeId
+
+        // Step 6: Flush all dirty nodes
+        try await nodeStore.flushDirtyNodes()
+    }
+
     // MARK: - Delete Helpers
 
-    private func deleteFromNode(node: BTreeNode, key: DBValue, row: Row? = nil) async throws {
+    private func deleteFromNode(node: BTreeNode, key: DBValue, rid: DBValue? = nil) async throws {
         if node.isLeaf {
             // B+ tree: all data lives in leaves. Find and remove the matching entry.
             var keyIndex = lowerBound(node.keys, key)
-            if let row = row {
-                while keyIndex < node.keys.count && node.keys[keyIndex] == key && node.values[keyIndex] != row {
+            if let rid = rid {
+                while keyIndex < node.keys.count && node.keys[keyIndex] == key && node.values[keyIndex].values["__rid"] != rid {
                     keyIndex += 1
                 }
             }
@@ -498,9 +577,9 @@ public final class BTree: @unchecked Sendable {
         if child.keys.count == order - 1 {
             try await fillChild(parent: node, childIndex: childIdx)
             // After fill/merge, structure may have changed — re-search from this node
-            try await deleteFromNode(node: node, key: key, row: row)
+            try await deleteFromNode(node: node, key: key, rid: rid)
         } else {
-            try await deleteFromNode(node: child, key: key, row: row)
+            try await deleteFromNode(node: child, key: key, rid: rid)
         }
     }
 

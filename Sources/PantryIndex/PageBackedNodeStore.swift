@@ -46,6 +46,44 @@ public final class PageBackedNodeStore: @unchecked Sendable {
         }
     }
 
+    /// Pre-allocate pages for new nodes in batch (single file extend), then cache and mark dirty.
+    /// Much faster than individual saveNode calls for bulk load.
+    public func saveNodesBatch(_ nodes: [BTreeNode]) async throws {
+        // Separate new nodes (need pages) from existing nodes (already have pages)
+        let newNodes: [BTreeNode] = state.withLock { s in
+            nodes.filter { s.nodePageMap[$0.nodeId] == nil }
+        }
+
+        // Batch-allocate pages for all new nodes in one file extend
+        if !newNodes.isEmpty {
+            let pages = try storageManager.createNewPages(count: newNodes.count)
+            state.withLock { s in
+                for (i, node) in newNodes.enumerated() {
+                    var page = pages[i]
+                    page.pageFlags = [.indexNode]
+                    s.nodePageMap[node.nodeId] = page.pageID
+                }
+            }
+            // Cache all pages (no eviction triggered since we're within capacity)
+            for (i, _) in newNodes.enumerated() {
+                var page = pages[i]
+                page.pageFlags = [.indexNode]
+                bufferPool.updatePage(page)
+            }
+        }
+
+        // Mark all nodes as dirty and cached
+        state.withLock { s in
+            for node in nodes {
+                s.nodeCache[node.nodeId] = node
+                s.dirtyNodes.insert(node.nodeId)
+                s.nodeCacheCounter += 1
+                s.nodeCacheOrder[node.nodeId] = s.nodeCacheCounter
+            }
+            Self.evictIfNeeded(&s)
+        }
+    }
+
     /// Serialize and persist all dirty nodes to their pages.
     /// Called at transaction boundaries or during flush.
     public func flushDirtyNodes() async throws {

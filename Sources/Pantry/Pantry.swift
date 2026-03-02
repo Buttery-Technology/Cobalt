@@ -54,6 +54,13 @@ public actor PantryDatabase: Sendable {
         if let indexData = try await engine.loadIndexRegistry() {
             let entries = try JSONDecoder().decode([IndexRegistryEntry].self, from: indexData)
             try await im.loadIndexRegistry(entries: entries)
+            // Mark restored columns as indexed for the query planner
+            for entry in entries {
+                await engine.markColumnIndexed(entry.tableName, column: entry.columnName)
+                if let cols = entry.compoundColumns {
+                    for col in cols { await engine.markColumnIndexed(entry.tableName, column: col) }
+                }
+            }
         }
     }
 
@@ -93,12 +100,28 @@ public actor PantryDatabase: Sendable {
     public func createIndex(table: String, column: String, include: [String]? = nil) async throws {
         let columnIndex = try await indexManager.createIndex(tableName: table, columnName: column, includeColumns: include)
 
-        // Populate the index from existing data — collect all pairs, then batch insert
-        let rows = try await storageEngine.scanTable(table)
+        // Populate the index from existing data — extract only needed columns from raw data
+        let schema = storageEngine.getTableSchema(table)
+        let colIdx = schema?.columnOrdinals[column]
+        let includeIdxs: [(String, Int)]? = include.flatMap { cols in
+            guard let schema = schema else { return nil }
+            return cols.compactMap { col in schema.columnOrdinals[col].map { (col, $0) } }
+        }
+
+        let rawRecords = try await storageEngine.scanTableRaw(table)
         var pairs: [(key: DBValue, row: Row)] = []
-        pairs.reserveCapacity(rows.count)
-        for (record, row) in rows {
-            if let value = row.values[column] {
+        pairs.reserveCapacity(rawRecords.count)
+        for (record, data) in rawRecords {
+            // Fast path: extract column directly from positional data (no full Row allocation)
+            let value: DBValue?
+            if let idx = colIdx {
+                value = Row.extractColumnValue(from: data, columnIndex: idx)
+                if value == nil || value == .null { continue }
+            } else {
+                // Fallback for non-positional data
+                guard let row = Row.fromBytesAuto(data, schema: schema) else { continue }
+                value = row.values[column]
+                guard let value else { continue }
                 var slimValues: [String: DBValue] = [
                     "__rid": .integer(Int64(bitPattern: record.id)),
                     column: value
@@ -107,14 +130,25 @@ public actor PantryDatabase: Sendable {
                     for incCol in include { slimValues[incCol] = row.values[incCol] ?? .null }
                 }
                 pairs.append((key: value, row: Row(values: slimValues)))
+                continue
             }
+            var slimValues: [String: DBValue] = [
+                "__rid": .integer(Int64(bitPattern: record.id)),
+                column: value!
+            ]
+            if let includeIdxs = includeIdxs {
+                for (colName, idx) in includeIdxs {
+                    slimValues[colName] = Row.extractColumnValue(from: data, columnIndex: idx) ?? .null
+                }
+            }
+            pairs.append((key: value!, row: Row(values: slimValues)))
         }
         if !pairs.isEmpty {
-            try await columnIndex.insertBatch(pairs: pairs)
+            try await columnIndex.bulkLoad(pairs: pairs)
         }
 
-        // Mark column as indexed in stats and refresh distinct counts
-        try await storageEngine.analyzeTable(table)
+        // Mark column as indexed for the query planner (lightweight, no full table scan)
+        await storageEngine.markColumnIndexed(table, column: column)
         queryExecutor.invalidatePlanCache(forTable: table)
     }
 
@@ -123,7 +157,7 @@ public actor PantryDatabase: Sendable {
     public func createPartialIndex(table: String, column: String, where condition: WhereCondition, include: [String]? = nil) async throws {
         let columnIndex = try await indexManager.createIndex(tableName: table, columnName: column, includeColumns: include, partialCondition: condition)
 
-        // Populate the index from existing data that matches the condition — batch insert
+        // Populate the index from existing data that matches the condition — bulk load
         let rows = try await storageEngine.scanTable(table)
         var pairs: [(key: DBValue, row: Row)] = []
         for (record, row) in rows {
@@ -140,33 +174,52 @@ public actor PantryDatabase: Sendable {
             }
         }
         if !pairs.isEmpty {
-            try await columnIndex.insertBatch(pairs: pairs)
+            try await columnIndex.bulkLoad(pairs: pairs)
         }
 
-        try await storageEngine.analyzeTable(table)
+        await storageEngine.markColumnIndexed(table, column: column)
         queryExecutor.invalidatePlanCache(forTable: table)
     }
 
     public func createCompoundIndex(table: String, columns: [String]) async throws {
         let columnIndex = try await indexManager.createCompoundIndex(tableName: table, columns: columns)
 
-        // Populate the index from existing data — batch insert
-        let rows = try await storageEngine.scanTable(table)
+        // Populate the index from existing data — extract only needed columns from raw data
+        let schema = storageEngine.getTableSchema(table)
+        let colIdxs: [(String, Int)]? = schema.flatMap { s in
+            columns.compactMap { col in s.columnOrdinals[col].map { (col, $0) } }
+        }
+
+        let rawRecords = try await storageEngine.scanTableRaw(table)
         var pairs: [(key: DBValue, row: Row)] = []
-        pairs.reserveCapacity(rows.count)
-        for (record, row) in rows {
+        pairs.reserveCapacity(rawRecords.count)
+        for (record, data) in rawRecords {
             let rid: DBValue = .integer(Int64(bitPattern: record.id))
             var slimValues: [String: DBValue] = ["__rid": rid]
-            let keyValues = columns.map { col -> DBValue in
-                let v = row.values[col] ?? .null
-                slimValues[col] = v
-                return v
+            var keyValues = [DBValue]()
+            if let colIdxs = colIdxs {
+                for (colName, idx) in colIdxs {
+                    let v = Row.extractColumnValue(from: data, columnIndex: idx) ?? .null
+                    slimValues[colName] = v
+                    keyValues.append(v)
+                }
+            } else {
+                // Fallback for non-positional data
+                guard let row = Row.fromBytesAuto(data, schema: schema) else { continue }
+                for col in columns {
+                    let v = row.values[col] ?? .null
+                    slimValues[col] = v
+                    keyValues.append(v)
+                }
             }
             let compoundKey = DBValue.compound(keyValues)
             pairs.append((key: compoundKey, row: Row(values: slimValues)))
         }
         if !pairs.isEmpty {
-            try await columnIndex.insertBatch(pairs: pairs)
+            try await columnIndex.bulkLoad(pairs: pairs)
+        }
+        for col in columns {
+            await storageEngine.markColumnIndexed(table, column: col)
         }
         queryExecutor.invalidatePlanCache(forTable: table)
     }
@@ -177,6 +230,7 @@ public actor PantryDatabase: Sendable {
 
     public func dropIndex(table: String, column: String) async {
         await indexManager.dropIndex(tableName: table, columnName: column)
+        await storageEngine.markColumnNotIndexed(table, column: column)
         queryExecutor.invalidatePlanCache(forTable: table)
     }
 

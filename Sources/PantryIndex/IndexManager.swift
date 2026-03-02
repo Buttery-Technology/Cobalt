@@ -34,7 +34,7 @@ public actor ColumnIndex: Sendable {
     public var isCompound: Bool { compoundColumns != nil }
 
     /// All columns available from this index (key columns + include columns)
-    public var coveredColumns: Set<String> {
+    public nonisolated var coveredColumns: Set<String> {
         var cols = Set<String>()
         if let compound = compoundColumns {
             cols.formUnion(compound)
@@ -67,6 +67,19 @@ public actor ColumnIndex: Sendable {
             try await btree.insert(key: key, row: row)
         }
         try await nodeStore.flushDirtyNodes()
+    }
+
+    /// Bulk load: builds B-tree bottom-up from sorted pairs. O(n) vs O(n log n) for insertBatch.
+    /// Only valid for initial population of an empty index.
+    public func bulkLoad(pairs: [(key: DBValue, row: Row)]) async throws {
+        let sorted = pairs.sorted { $0.key < $1.key }
+        for (key, _) in sorted {
+            bloomFilter.add(key.indexKey)
+            if keyHashSet.count < Self.maxHashSetSize {
+                keyHashSet.insert(key.indexKey.hashValue)
+            }
+        }
+        try await btree.bulkLoad(sortedPairs: sorted)
     }
 
     /// Search for rows matching a key, using hash set + bloom filter for fast negatives
@@ -139,9 +152,9 @@ public actor ColumnIndex: Sendable {
         return Row(values: vals)
     }
 
-    /// Delete a specific (key, row) entry from this index
-    public func delete(key: DBValue, row: Row? = nil) async throws {
-        try await btree.delete(key: key, row: row)
+    /// Delete a specific (key, rid) entry from this index
+    public func delete(key: DBValue, rid: DBValue? = nil) async throws {
+        try await btree.delete(key: key, rid: rid)
     }
 
     /// Add a value to the bloom filter and hash set (used during index rebuild on load)
@@ -326,16 +339,20 @@ public actor IndexManager: IndexHook, Sendable {
                 if !evaluateConditionForIndex(condition, row: row) { continue }
             }
 
-            let tidRow = Row(values: ["__rid": rid])
-            if let columns = await columnIndex.compoundColumns {
+            if let columns = columnIndex.compoundColumns {
                 // Compound index: key contains all indexed column values
                 let keyValues = columns.map { col -> DBValue in row.values[col] ?? .null }
                 let compoundKey = DBValue.compound(keyValues)
+                let tidRow = Row(values: ["__rid": rid])
                 try await columnIndex.insert(key: compoundKey, row: tidRow)
             } else {
-                let columnName = await columnIndex.columnName
+                let columnName = columnIndex.columnName
                 if let value = row.values[columnName] {
-                    try await columnIndex.insert(key: value, row: tidRow)
+                    var vals: [String: DBValue] = ["__rid": rid, columnName: value]
+                    if let include = columnIndex.includeColumns {
+                        for incCol in include { vals[incCol] = row.values[incCol] ?? .null }
+                    }
+                    try await columnIndex.insert(key: value, row: Row(values: vals))
                 }
             }
         }
@@ -348,8 +365,9 @@ public actor IndexManager: IndexHook, Sendable {
 
         for (_, columnIndex) in tableIndexes {
             let condition = await columnIndex.partialCondition
-            let compoundCols = await columnIndex.compoundColumns
-            let colName = await columnIndex.columnName
+            let compoundCols = columnIndex.compoundColumns
+            let colName = columnIndex.columnName
+            let includeCols = columnIndex.includeColumns
 
             var pairs: [(key: DBValue, row: Row)] = []
             pairs.reserveCapacity(records.count)
@@ -359,13 +377,16 @@ public actor IndexManager: IndexHook, Sendable {
                     if !evaluateConditionForIndex(condition, row: row) { continue }
                 }
                 let rid: DBValue = .integer(Int64(bitPattern: record.id))
-                let tidRow = Row(values: ["__rid": rid])
 
                 if let columns = compoundCols {
                     let keyValues = columns.map { col -> DBValue in row.values[col] ?? .null }
-                    pairs.append((key: .compound(keyValues), row: tidRow))
+                    pairs.append((key: .compound(keyValues), row: Row(values: ["__rid": rid])))
                 } else if let value = row.values[colName] {
-                    pairs.append((key: value, row: tidRow))
+                    var vals: [String: DBValue] = ["__rid": rid, colName: value]
+                    if let include = includeCols {
+                        for incCol in include { vals[incCol] = row.values[incCol] ?? .null }
+                    }
+                    pairs.append((key: value, row: Row(values: vals)))
                 }
             }
 
@@ -385,15 +406,14 @@ public actor IndexManager: IndexHook, Sendable {
                 if !evaluateConditionForIndex(condition, row: row) { continue }
             }
 
-            let tidRow = Row(values: ["__rid": rid])
-            if let columns = await columnIndex.compoundColumns {
+            if let columns = columnIndex.compoundColumns {
                 let keyValues = columns.map { col -> DBValue in row.values[col] ?? .null }
                 let compoundKey = DBValue.compound(keyValues)
-                try await columnIndex.delete(key: compoundKey, row: tidRow)
+                try await columnIndex.delete(key: compoundKey, rid: rid)
             } else {
-                let columnName = await columnIndex.columnName
+                let columnName = columnIndex.columnName
                 if let value = row.values[columnName] {
-                    try await columnIndex.delete(key: value, row: tidRow)
+                    try await columnIndex.delete(key: value, rid: rid)
                 }
             }
         }
@@ -405,21 +425,20 @@ public actor IndexManager: IndexHook, Sendable {
 
         for (_, columnIndex) in tableIndexes {
             let condition = await columnIndex.partialCondition
-            let compoundCols = await columnIndex.compoundColumns
-            let colName = await columnIndex.columnName
+            let compoundCols = columnIndex.compoundColumns
+            let colName = columnIndex.columnName
 
             for (id, row) in records {
                 if let condition = condition {
                     if !evaluateConditionForIndex(condition, row: row) { continue }
                 }
                 let rid: DBValue = .integer(Int64(bitPattern: id))
-                let tidRow = Row(values: ["__rid": rid])
 
                 if let columns = compoundCols {
                     let keyValues = columns.map { col -> DBValue in row.values[col] ?? .null }
-                    try await columnIndex.delete(key: .compound(keyValues), row: tidRow)
+                    try await columnIndex.delete(key: .compound(keyValues), rid: rid)
                 } else if let value = row.values[colName] {
-                    try await columnIndex.delete(key: value, row: tidRow)
+                    try await columnIndex.delete(key: value, rid: rid)
                 }
             }
         }

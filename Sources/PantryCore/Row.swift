@@ -129,6 +129,55 @@ extension Row {
         return buf
     }
 
+    /// Patch specific columns in positional v3 data without full deserialization.
+    /// Returns patched data if all updates are same-size, nil otherwise (fall through to full path).
+    public static func patchPositionalData(_ data: Data, schema: PantryTableSchema, updates: [String: DBValue]) -> Data? {
+        let base = data.startIndex
+        guard data.count >= 4,
+              data[base] == 0xFF,
+              data[base + 1] == 0x03 else { return nil }
+
+        let colCount = Int(UInt16(data[base + 2]) | (UInt16(data[base + 3]) << 8))
+        let bitmapBytes = (colCount + 7) / 8
+        let bitmapStart = base + 4
+        let offsetTableStart = bitmapStart + bitmapBytes
+        let valuesStart = offsetTableStart + colCount * 2
+
+        guard valuesStart <= data.endIndex else { return nil }
+
+        var patched = data
+        for (colName, newValue) in updates {
+            guard let colIdx = schema.columnOrdinals[colName] else { return nil }
+
+            // Check NULL bitmap
+            let isCurrentlyNull = (data[bitmapStart + colIdx / 8] & (1 << UInt8(colIdx % 8))) != 0
+            let newIsNull = (newValue == .null)
+
+            // If NULL status changes, bail to full path
+            if isCurrentlyNull != newIsNull { return nil }
+            if isCurrentlyNull { continue } // Both NULL, nothing to patch
+
+            // Read offset from offset table (little-endian UInt16, safe byte access)
+            let offsetPos = offsetTableStart + colIdx * 2
+            let relOffset = Int(UInt16(data[offsetPos]) | (UInt16(data[offsetPos + 1]) << 8))
+            let valueStart = valuesStart + relOffset
+
+            // Find end of current value by skipping it
+            var endOffset = valueStart
+            guard skipDBValue(in: data, at: &endOffset) else { return nil }
+            let oldSize = endOffset - valueStart
+
+            // Encode new value
+            var newBuf = Data()
+            encodeDBValue(newValue, into: &newBuf)
+
+            // Must be same size for in-place patch
+            guard newBuf.count == oldSize else { return nil }
+            patched.replaceSubrange(valueStart..<endOffset, with: newBuf)
+        }
+        return patched
+    }
+
     /// Decode from positional format v3 (NULL bitmap + offset table) using schema for column names.
     public static func fromBytesPositionalV3(_ data: Data, schema: PantryTableSchema) -> Row? {
         guard data.count >= 4,
