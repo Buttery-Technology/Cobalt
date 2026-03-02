@@ -124,6 +124,26 @@ public final class ColumnIndex: @unchecked Sendable {
         return results.map { reconstructRow($0, key: key) }
     }
 
+    /// Synchronous batch search using only cached B-tree nodes. Returns nil on any cache miss.
+    public func searchBatchCached(keys: [DBValue]) -> [DBValue: [Row]]? {
+        let filteredKeys: [DBValue] = _mutable.withLock { s in
+            keys.filter { key in
+                if s.keyHashSet.count < Self.maxHashSetSize && !s.keyHashSet.contains(key.indexKey.hashValue) {
+                    return false
+                }
+                return s.bloomFilter.contains(key.indexKey)
+            }
+        }
+        var results = [DBValue: [Row]]()
+        for key in filteredKeys {
+            guard let rows = btree.searchCached(key: key) else { return nil }
+            if !rows.isEmpty {
+                results[key] = rows.map { reconstructRow($0, key: key) }
+            }
+        }
+        return results
+    }
+
     /// Batch search for multiple keys. Returns a dictionary of key -> [Row].
     /// Much faster than individual search() calls for joins since it avoids per-key overhead.
     public func searchBatch(keys: [DBValue]) async throws -> [DBValue: [Row]] {
