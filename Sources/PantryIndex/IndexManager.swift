@@ -177,6 +177,11 @@ public final class ColumnIndex: @unchecked Sendable {
         try await btree.searchRangeWithLimit(from: startKey, to: endKey, limit: limit, ascending: ascending)
     }
 
+    /// Synchronous cache-only range query with limit. Returns nil on cache miss.
+    public func searchRangeWithLimitCached(from startKey: DBValue?, to endKey: DBValue?, limit: Int, ascending: Bool = true) -> [Row]? {
+        btree.searchRangeWithLimitCached(from: startKey, to: endKey, limit: limit, ascending: ascending)
+    }
+
     /// Range scan from a lower bound, collecting while predicate holds on keys
     public func searchRangeWhile(from startKey: DBValue?, predicate: @Sendable (DBValue) -> Bool) async throws -> [Row] {
         try await btree.searchRangeWhile(from: startKey, predicate: predicate)
