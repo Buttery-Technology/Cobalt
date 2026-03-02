@@ -106,7 +106,7 @@ public final class BufferPoolManager: Sendable {
 
             for (pageID, var page) in pagesToFlush {
                 do {
-                    try await storageManager.writePage(&page)
+                    try await storageManager.writePage(&page, alreadySerialized: true)
                     s.withLock { st in
                         st.dirtyPages.remove(pageID)
                         st.flushCount += 1
@@ -221,7 +221,7 @@ public final class BufferPoolManager: Sendable {
         guard let (pageID, dirtyPage) = victim else { return }
 
         if var page = dirtyPage {
-            try await storageManager.writePage(&page)
+            try await storageManager.writePage(&page, alreadySerialized: true)
         }
         stripes[idx].withLock { st in
             st.dirtyPages.remove(pageID)
@@ -275,7 +275,7 @@ public final class BufferPoolManager: Sendable {
             }
 
             for (pageID, var page) in pagesToFlush {
-                try await storageManager.writePage(&page)
+                try await storageManager.writePage(&page, alreadySerialized: true)
                 s.withLock { st in
                     st.flushCount += 1
                     st.dirtyPages.remove(pageID)
@@ -294,7 +294,7 @@ public final class BufferPoolManager: Sendable {
             return nil
         }
         if var page = pageToFlush {
-            try await storageManager.writePage(&page)
+            try await storageManager.writePage(&page, alreadySerialized: true)
             s.withLock { st in
                 st.dirtyPages.remove(pageID)
                 st.flushCount += 1

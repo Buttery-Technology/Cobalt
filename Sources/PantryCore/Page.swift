@@ -197,6 +197,25 @@ public struct DatabasePage: Sendable {
         return true
     }
 
+    /// Replace a record in-place if the new record fits. Returns true on success.
+    public mutating func replaceRecord(id: UInt64, with newRecord: Record) -> Bool {
+        guard let index = records.firstIndex(where: { $0.id == id }) else {
+            return false
+        }
+        let oldSize = records[index].serialize().count
+        let newSize = newRecord.serialize().count
+        let sizeDiff = newSize - oldSize
+        // Check if new record fits: freeSpaceOffset shrinks by sizeDiff
+        let headerEnd = PantryConstants.PAGE_HEADER_SIZE + (recordCount * PantryConstants.SLOT_SIZE)
+        let newFreeOffset = freeSpaceOffset - sizeDiff
+        if headerEnd >= newFreeOffset {
+            return false
+        }
+        records[index] = newRecord
+        freeSpaceOffset = newFreeOffset
+        return true
+    }
+
     /// Delete a record by ID. Returns false if not found.
     public mutating func deleteRecord(id: UInt64) -> Bool {
         guard let index = records.firstIndex(where: { $0.id == id }) else {

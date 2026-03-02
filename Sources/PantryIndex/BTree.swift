@@ -114,6 +114,40 @@ public actor BTree: Sendable {
         return results
     }
 
+    /// Range scan returning (key, value) pairs for TID-only index reconstruction
+    public func searchRangeKeyed(from startKey: DBValue?, to endKey: DBValue?) async throws -> [(DBValue, Row)] {
+        guard let rootId = rootId,
+              let root = try await nodeStore.loadNode(nodeId: rootId) else {
+            return []
+        }
+        var results: [(DBValue, Row)] = []
+        try await collectRangeKeyed(node: root, startKey: startKey, endKey: endKey, results: &results)
+        return results
+    }
+
+    private func collectRangeKeyed(node: BTreeNode, startKey: DBValue?, endKey: DBValue?, results: inout [(DBValue, Row)]) async throws {
+        var i = startKey != nil ? lowerBound(node.keys, startKey!) : 0
+        if node.isLeaf {
+            while i < node.keys.count {
+                if let end = endKey, node.keys[i] > end { break }
+                results.append((node.keys[i], node.values[i]))
+                i += 1
+            }
+        } else {
+            while i <= node.keys.count {
+                if let childId = node.children?[i],
+                   let child = try await nodeStore.loadNode(nodeId: childId) {
+                    try await collectRangeKeyed(node: child, startKey: startKey, endKey: endKey, results: &results)
+                }
+                if i < node.keys.count {
+                    if let end = endKey, node.keys[i] > end { break }
+                    results.append((node.keys[i], node.values[i]))
+                }
+                i += 1
+            }
+        }
+    }
+
     /// Range scan with early termination after collecting `limit` rows.
     /// When `ascending` is false, results are collected in descending order.
     public func searchRangeWithLimit(from startKey: DBValue?, to endKey: DBValue?, limit: Int, ascending: Bool = true) async throws -> [Row] {

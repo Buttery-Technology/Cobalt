@@ -56,7 +56,7 @@ public actor StorageEngine: Sendable {
             for pageID in modifiedPages {
                 if let page = bufferPoolManager.getCachedPage(pageID: pageID) {
                     var pageToWrite = page
-                    try await storageManager.writePage(&pageToWrite)
+                    try await storageManager.writePage(&pageToWrite, alreadySerialized: true)
                     bufferPoolManager.clearDirtyFlag(pageID: pageID)
                 }
             }
@@ -152,12 +152,17 @@ public actor StorageEngine: Sendable {
             // Capture before-image for WAL rollback (only once per page per transaction)
             let alreadyLogged = await txContext.beforeImagePages.contains(page.pageID)
             if !alreadyLogged {
-                // Read the current on-disk version of this page
-                let totalPages = try await storageManager.totalPageCount()
-                if page.pageID < totalPages {
-                    let beforePage = try await storageManager.readPage(pageID: page.pageID)
-                    beforePageData = beforePage.data
-                    try await logManager.logPageBeforeImage(txID: txContext.transactionID, page: beforePage)
+                // Try buffer pool first (avoids disk I/O on hot path), fall back to disk
+                if let cachedBefore = bufferPoolManager.getCachedPage(pageID: page.pageID) {
+                    beforePageData = cachedBefore.data
+                    try await logManager.logPageBeforeImage(txID: txContext.transactionID, page: cachedBefore)
+                } else {
+                    let totalPages = try await storageManager.totalPageCount()
+                    if page.pageID < totalPages {
+                        let beforePage = try await storageManager.readPage(pageID: page.pageID)
+                        beforePageData = beforePage.data
+                        try await logManager.logPageBeforeImage(txID: txContext.transactionID, page: beforePage)
+                    }
                 }
                 await txContext.recordBeforeImage(pageID: page.pageID)
             }
@@ -186,7 +191,7 @@ public actor StorageEngine: Sendable {
         }
 
         if transactionContext == nil {
-            try await storageManager.writePage(&serializedPage)
+            try await storageManager.writePage(&serializedPage, alreadySerialized: true)
             bufferPoolManager.clearDirtyFlag(pageID: page.pageID)
         }
 
@@ -411,6 +416,32 @@ public actor StorageEngine: Sendable {
         tableRegistry.updateTableInfo(freshInfo)
     }
 
+    /// Try to replace a record in-place on its current page. Returns true if successful.
+    /// Falls back to false when: record not found, new data doesn't fit, or record is overflow.
+    public func replaceRecordInPlace(id: UInt64, newRecord: Record, tableName: String, transactionContext: TransactionContext? = nil) async throws -> Bool {
+        let pageID = try await findPageContainingRecord(id: id, tableName: tableName)
+        var page = try await getPage(pageID: pageID, transactionContext: transactionContext)
+
+        // Don't attempt in-place for overflow records
+        if let existing = page.records.first(where: { $0.id == id }), existing.isOverflow {
+            return false
+        }
+
+        guard page.replaceRecord(id: id, with: newRecord) else {
+            return false
+        }
+
+        if let txContext = transactionContext {
+            try await logManager.logRecordDelete(txID: txContext.transactionID, pageID: pageID, recordID: id, data: newRecord.data)
+            try await logManager.logRecordInsert(txID: txContext.transactionID, pageID: pageID, recordID: id, data: newRecord.data)
+            try await savePage(page, transactionContext: transactionContext, skipAfterImage: true)
+        } else {
+            try await savePage(page, transactionContext: transactionContext)
+        }
+
+        return true
+    }
+
     /// Scan all records in a table with sequential readahead.
     /// Pass `neededColumns` to enable lazy overflow loading: if an overflow record's inline data
     /// contains all needed columns, the overflow pages are skipped entirely.
@@ -541,10 +572,16 @@ public actor StorageEngine: Sendable {
 
     /// Walk the page chain for a table and return just the page IDs (lightweight).
     public func getPageChain(tableName: String, transactionContext: TransactionContext? = nil) async throws -> [Int] {
-        guard let tableInfo = tableRegistry.getTableInfo(name: tableName) else {
+        guard var tableInfo = tableRegistry.getTableInfo(name: tableName) else {
             throw PantryError.tableNotFound(name: tableName)
         }
 
+        // Fast path: return cached page list if available
+        if let cached = tableInfo.pageList, !cached.isEmpty {
+            return cached
+        }
+
+        // Slow path: walk linked list and cache the result
         var pageIDs: [Int] = []
         var currentPageID = tableInfo.firstPageID
         var visited: Set<Int> = []
@@ -558,6 +595,8 @@ public actor StorageEngine: Sendable {
             currentPageID = page.nextPageID
         }
 
+        tableInfo.pageList = pageIDs
+        tableRegistry.updateTableInfo(tableInfo)
         return pageIDs
     }
 
@@ -727,21 +766,27 @@ public actor StorageEngine: Sendable {
         try await tableRegistry.save()
 
         // Chain freed data pages into the free list
-        var currentPageID = tableInfo.firstPageID
-        var visited: Set<Int> = []
-        while currentPageID != 0 {
-            guard visited.insert(currentPageID).inserted else { break }
-            let page = try await getPage(pageID: currentPageID)
-            let nextDataPageID = page.nextPageID
-
-            // Push this page onto the free list
-            var freedPage = DatabasePage(pageID: currentPageID)
+        let pagesToFree: [Int]
+        if let cached = tableInfo.pageList, !cached.isEmpty {
+            pagesToFree = cached
+        } else {
+            var list: [Int] = []
+            var currentPageID = tableInfo.firstPageID
+            var visited: Set<Int> = []
+            while currentPageID != 0 {
+                guard visited.insert(currentPageID).inserted else { break }
+                let page = try await getPage(pageID: currentPageID)
+                list.append(currentPageID)
+                currentPageID = page.nextPageID
+            }
+            pagesToFree = list
+        }
+        for pageID in pagesToFree {
+            var freedPage = DatabasePage(pageID: pageID)
             freedPage.nextPageID = freeListHead
             try await savePage(freedPage)
-            freeListHead = currentPageID
-            freeSpaceBitmap.setCategory(pageID: currentPageID, category: .empty)
-
-            currentPageID = nextDataPageID
+            freeListHead = pageID
+            freeSpaceBitmap.setCategory(pageID: pageID, category: .empty)
         }
 
         // Persist the updated free list head to page 0
@@ -788,31 +833,44 @@ public actor StorageEngine: Sendable {
             minCategory = .low
         }
 
-        // Walk the table's page chain, using bitmap to skip known-full pages
-        var currentPageID = tableInfo.firstPageID
-        var visited: Set<Int> = []
-
-        while currentPageID != 0 {
-            guard visited.insert(currentPageID).inserted else {
-                throw PantryError.corruptPage(pageID: currentPageID)
+        // Iterate page list (or walk chain), using bitmap to skip known-full pages
+        let pageIDs = tableInfo.pageList ?? []
+        if !pageIDs.isEmpty {
+            for pageID in pageIDs {
+                let category = freeSpaceBitmap.getCategory(pageID: pageID)
+                if category.rawValue >= minCategory.rawValue {
+                    let page = try await getPage(pageID: pageID)
+                    let actualCategory = page.spaceCategory()
+                    if actualCategory != category {
+                        freeSpaceBitmap.setCategory(pageID: pageID, category: actualCategory)
+                    }
+                    if page.getFreeSpace() > requiredSpace {
+                        return pageID
+                    }
+                }
             }
-
-            // Check bitmap first to skip known-full pages without loading them
-            let category = freeSpaceBitmap.getCategory(pageID: currentPageID)
-            if category.rawValue >= minCategory.rawValue {
+        } else {
+            // Legacy fallback: walk linked page chain
+            var currentPageID = tableInfo.firstPageID
+            var visited: Set<Int> = []
+            while currentPageID != 0 {
+                guard visited.insert(currentPageID).inserted else {
+                    throw PantryError.corruptPage(pageID: currentPageID)
+                }
+                let category = freeSpaceBitmap.getCategory(pageID: currentPageID)
+                if category.rawValue >= minCategory.rawValue {
+                    let page = try await getPage(pageID: currentPageID)
+                    let actualCategory = page.spaceCategory()
+                    if actualCategory != category {
+                        freeSpaceBitmap.setCategory(pageID: currentPageID, category: actualCategory)
+                    }
+                    if page.getFreeSpace() > requiredSpace {
+                        return currentPageID
+                    }
+                }
                 let page = try await getPage(pageID: currentPageID)
-                let actualCategory = page.spaceCategory()
-                if actualCategory != category {
-                    freeSpaceBitmap.setCategory(pageID: currentPageID, category: actualCategory)
-                }
-                if page.getFreeSpace() > requiredSpace {
-                    return currentPageID
-                }
+                currentPageID = page.nextPageID
             }
-
-            // Need to load page to follow chain
-            let page = try await getPage(pageID: currentPageID)
-            currentPageID = page.nextPageID
         }
 
         // Need a new page
@@ -842,24 +900,34 @@ public actor StorageEngine: Sendable {
         if tableInfo.firstPageID == 0 {
             tableInfo.firstPageID = newPage.pageID
             tableInfo.lastPageID = newPage.pageID
+            tableInfo.pageList = [newPage.pageID]
         } else {
-            // Walk the chain to find the true last page — the cached lastPageID may be
-            // stale after a crash (registry not persisted on every page allocation)
-            var currentPageID = tableInfo.lastPageID
-            var visited: Set<Int> = []
-            while true {
-                guard visited.insert(currentPageID).inserted else { break }
-                let page = try await getPage(pageID: currentPageID)
-                if page.nextPageID == 0 {
-                    // Found the real tail
-                    var tailPage = page
-                    tailPage.nextPageID = newPage.pageID
-                    try await savePage(tailPage)
-                    break
+            // Link to the current tail page
+            let tailPageID = tableInfo.pageList?.last ?? tableInfo.lastPageID
+            var tailPage = try await getPage(pageID: tailPageID)
+            if tailPage.nextPageID == 0 {
+                tailPage.nextPageID = newPage.pageID
+                try await savePage(tailPage)
+            } else {
+                // Fallback: walk chain to find true tail (recovery after crash)
+                var currentPageID = tailPage.nextPageID
+                var visited: Set<Int> = [tailPageID]
+                while true {
+                    guard visited.insert(currentPageID).inserted else { break }
+                    let page = try await getPage(pageID: currentPageID)
+                    if page.nextPageID == 0 {
+                        var lastPage = page
+                        lastPage.nextPageID = newPage.pageID
+                        try await savePage(lastPage)
+                        break
+                    }
+                    currentPageID = page.nextPageID
                 }
-                currentPageID = page.nextPageID
             }
             tableInfo.lastPageID = newPage.pageID
+            if tableInfo.pageList != nil {
+                tableInfo.pageList!.append(newPage.pageID)
+            }
         }
 
         return newPage
