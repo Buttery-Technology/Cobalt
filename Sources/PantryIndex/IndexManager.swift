@@ -59,7 +59,7 @@ public final class ColumnIndex: @unchecked Sendable {
         _mutable.withLock { s in
             s.bloomFilter.add(key.indexKey)
             if s.keyHashSet.count < Self.maxHashSetSize {
-                s.keyHashSet.insert(key.indexKey.hashValue)
+                s.keyHashSet.insert(key.hashValue)
             }
         }
         try await btree.insert(key: key, row: row)
@@ -72,7 +72,7 @@ public final class ColumnIndex: @unchecked Sendable {
             for (key, _) in sorted {
                 s.bloomFilter.add(key.indexKey)
                 if s.keyHashSet.count < Self.maxHashSetSize {
-                    s.keyHashSet.insert(key.indexKey.hashValue)
+                    s.keyHashSet.insert(key.hashValue)
                 }
             }
         }
@@ -90,7 +90,7 @@ public final class ColumnIndex: @unchecked Sendable {
             for (key, _) in sorted {
                 s.bloomFilter.add(key.indexKey)
                 if s.keyHashSet.count < Self.maxHashSetSize {
-                    s.keyHashSet.insert(key.indexKey.hashValue)
+                    s.keyHashSet.insert(key.hashValue)
                 }
             }
         }
@@ -100,26 +100,41 @@ public final class ColumnIndex: @unchecked Sendable {
     /// Synchronous search using only cached B-tree nodes. Returns nil on cache miss.
     /// Returns .some([]) for definitive bloom/hash misses, .some(rows) for hits, nil for cache miss.
     public func searchCached(key: DBValue) -> [Row]? {
-        let shouldSearch = _mutable.withLock { s -> Bool in
-            if s.keyHashSet.count < Self.maxHashSetSize && !s.keyHashSet.contains(key.indexKey.hashValue) {
-                return false
-            }
-            return s.bloomFilter.contains(key.indexKey)
-        }
-        if !shouldSearch { return [] }
+        if !bloomCheckCached(key: key) { return [] }
         guard let results = btree.searchCached(key: key) else { return nil }
         return results.map { reconstructRow($0, key: key) }
     }
 
-    /// Search for rows matching a key, using hash set + bloom filter for fast negatives
-    public func search(key: DBValue) async throws -> [Row]? {
-        let shouldSearch = _mutable.withLock { s -> Bool in
-            if s.keyHashSet.count < Self.maxHashSetSize && !s.keyHashSet.contains(key.indexKey.hashValue) {
-                return false
+    /// Fused synchronous lookup returning just the first RID. Avoids Row allocation entirely.
+    /// Returns .some(rid) on hit, .some(nil) on definitive miss, nil on cache miss.
+    public func searchCachedFirstRID(key: DBValue) -> UInt64?? {
+        if !bloomCheckCached(key: key) { return .some(nil) }
+        guard let results = btree.searchCached(key: key) else { return nil } // cache miss
+        guard !results.isEmpty else { return .some(nil) } // no match
+        // Extract __rid directly without Row reconstruction
+        if case .integer(let ridSigned) = results[0].values["__rid"] {
+            return .some(UInt64(bitPattern: ridSigned))
+        }
+        return .some(nil)
+    }
+
+    /// Check bloom filter + hash set under a single lock. Returns true if key might be present.
+    /// Uses DBValue.hashValue for the hash set (no String allocation) and only falls through
+    /// to the bloom filter (String-based) when the hash set is full.
+    private func bloomCheckCached(key: DBValue) -> Bool {
+        _mutable.withLock { s -> Bool in
+            if s.keyHashSet.count < Self.maxHashSetSize {
+                // Hash set is populated — use DBValue.hashValue directly (no String alloc)
+                return s.keyHashSet.contains(key.hashValue)
             }
+            // Hash set is full — fall through to bloom filter
             return s.bloomFilter.contains(key.indexKey)
         }
-        if !shouldSearch { return [] }
+    }
+
+    /// Search for rows matching a key, using hash set + bloom filter for fast negatives
+    public func search(key: DBValue) async throws -> [Row]? {
+        if !bloomCheckCached(key: key) { return [] }
         let results = try await btree.search(key: key)
         return results.map { reconstructRow($0, key: key) }
     }
@@ -128,8 +143,8 @@ public final class ColumnIndex: @unchecked Sendable {
     public func searchBatchCached(keys: [DBValue]) -> [DBValue: [Row]]? {
         let filteredKeys: [DBValue] = _mutable.withLock { s in
             keys.filter { key in
-                if s.keyHashSet.count < Self.maxHashSetSize && !s.keyHashSet.contains(key.indexKey.hashValue) {
-                    return false
+                if s.keyHashSet.count < Self.maxHashSetSize {
+                    return s.keyHashSet.contains(key.hashValue)
                 }
                 return s.bloomFilter.contains(key.indexKey)
             }
@@ -153,8 +168,8 @@ public final class ColumnIndex: @unchecked Sendable {
         // Pre-filter keys through bloom filter + hash set under a single lock acquisition
         let filteredKeys: [DBValue] = _mutable.withLock { s in
             keys.filter { key in
-                if s.keyHashSet.count < Self.maxHashSetSize && !s.keyHashSet.contains(key.indexKey.hashValue) {
-                    return false
+                if s.keyHashSet.count < Self.maxHashSetSize {
+                    return s.keyHashSet.contains(key.hashValue)
                 }
                 return s.bloomFilter.contains(key.indexKey)
             }
@@ -240,7 +255,7 @@ public final class ColumnIndex: @unchecked Sendable {
         _mutable.withLock { s in
             s.bloomFilter.add(value.indexKey)
             if s.keyHashSet.count < Self.maxHashSetSize {
-                s.keyHashSet.insert(value.indexKey.hashValue)
+                s.keyHashSet.insert(value.hashValue)
             }
         }
     }

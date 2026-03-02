@@ -197,20 +197,33 @@ public final class QueryExecutor: @unchecked Sendable {
            (mods.orderBy == nil || mods.orderBy!.isEmpty) {
             if case .equals(let column, let value) = cond, value != .null {
                 if let index = indexManager.getIndex(tableName: table, columnName: column) {
-                    if let indexRows = index.searchCached(key: value), !indexRows.isEmpty {
-                        if case .integer(let ridSigned) = indexRows[0].values["__rid"] {
-                            let rid = UInt64(bitPattern: ridSigned)
-                            if let row = try await storageEngine.getRecordByID(rid, tableName: table, transactionContext: transactionContext) {
-                                var resultRows: [Row]
-                                if let columns = columns, !columns.isEmpty {
-                                    let projected = columns.reduce(into: [String: DBValue]()) { r, c in r[c] = row.values[c] ?? .null }
-                                    resultRows = [Row(values: projected)]
-                                } else {
-                                    resultRows = [row]
-                                }
-                                if let key = cacheKey { storeResultCache(key: key, rows: resultRows) }
-                                return resultRows
+                    // Fused path: bloom check + B-tree → RID → sync mmap record read
+                    // searchCachedFirstRID returns UInt64??: .some(rid) = hit, .some(nil) = miss, nil = cache miss
+                    if let ridResult = index.searchCachedFirstRID(key: value) {
+                        guard let rid = ridResult else {
+                            // Definitive bloom/B-tree miss — no such key
+                            let empty: [Row] = []
+                            if let key = cacheKey { storeResultCache(key: key, rows: empty) }
+                            return empty
+                        }
+                        // Try fully synchronous mmap path first (no async overhead)
+                        var finalRow: Row? = nil
+                        if transactionContext == nil {
+                            finalRow = storageEngine.getRecordByIDSync(rid, tableName: table)
+                        }
+                        if finalRow == nil {
+                            finalRow = try await storageEngine.getRecordByID(rid, tableName: table, transactionContext: transactionContext)
+                        }
+                        if let finalRow {
+                            var resultRows: [Row]
+                            if let columns = columns, !columns.isEmpty {
+                                let projected = columns.reduce(into: [String: DBValue]()) { r, c in r[c] = finalRow.values[c] ?? .null }
+                                resultRows = [Row(values: projected)]
+                            } else {
+                                resultRows = [finalRow]
                             }
+                            if let key = cacheKey { storeResultCache(key: key, rows: resultRows) }
+                            return resultRows
                         }
                     }
                     // Fall through on cache miss — normal path will handle it
@@ -1675,7 +1688,88 @@ public final class QueryExecutor: @unchecked Sendable {
         var avgSum: Double = 0; var avgCount: Int64 = 0
         var minVal: DBValue = .null; var maxVal: DBValue = .null
 
+        // Inline closure for processing a single record's data in the aggregate
+        func processRecordData(_ recordData: Data) {
+            var lazyFilterResult: Bool? = nil
+            if let cond = condition, let colMap = aggColMap {
+                lazyFilterResult = evaluateConditionLazy(cond, data: recordData, columnIndexMap: colMap)
+                if lazyFilterResult == false { return }
+            }
+
+            if case .count(nil) = function, lazyFilterResult == true {
+                count += 1
+                return
+            }
+
+            if let colIdx = aggColumnIndex {
+                if let rawValue = Row.extractColumnValue(from: recordData, columnIndex: colIdx) {
+                    if condition != nil && lazyFilterResult == nil {
+                        guard let row = Row.fromBytesAuto(recordData, schema: aggSchema) else { return }
+                        if !evaluateCondition(condition!, row: row) { return }
+                    }
+
+                    switch function {
+                    case .count:
+                        if rawValue != .null { count += 1 }
+                    case .sum:
+                        switch rawValue {
+                        case .integer(let v): hasValue = true; let (r, o) = intSum.addingReportingOverflow(v); if o { allIntegers = false }; intSum = r; doubleSum += Double(v)
+                        case .double(let v): hasValue = true; allIntegers = false; doubleSum += v
+                        default: break
+                        }
+                    case .avg:
+                        if let v = numericValue(rawValue) { avgSum += v; avgCount += 1 }
+                    case .min:
+                        if rawValue != .null { if minVal == .null || rawValue < minVal { minVal = rawValue } }
+                    case .max:
+                        if rawValue != .null { if maxVal == .null || rawValue > maxVal { maxVal = rawValue } }
+                    }
+                    return
+                }
+            }
+
+            guard let row = Row.fromBytesAuto(recordData, schema: aggSchema) else { return }
+            if let cond = condition, !evaluateCondition(cond, row: row) { return }
+
+            switch function {
+            case .count(let col):
+                if let col = col {
+                    if let v = row.values[col], v != .null { count += 1 }
+                } else {
+                    count += 1
+                }
+            case .sum(let col):
+                if let dbVal = row.values[col] {
+                    switch dbVal {
+                    case .integer(let v): hasValue = true; let (r, o) = intSum.addingReportingOverflow(v); if o { allIntegers = false }; intSum = r; doubleSum += Double(v)
+                    case .double(let v): hasValue = true; allIntegers = false; doubleSum += v
+                    default: break
+                    }
+                }
+            case .avg(let col):
+                if let v = numericValue(row.values[col]) { avgSum += v; avgCount += 1 }
+            case .min(let col):
+                if let v = row.values[col], v != .null {
+                    if minVal == .null || v < minVal { minVal = v }
+                }
+            case .max(let col):
+                if let v = row.values[col], v != .null {
+                    if maxVal == .null || v > maxVal { maxVal = v }
+                }
+            }
+        }
+
         for pageID in pageIDs {
+            // mmap fast path: iterate records without building DatabasePage/[Record]
+            if transactionContext == nil {
+                let handled = storageEngine.forEachRecordOnPageMmap(pageID: pageID) { _, recordData in
+                    processRecordData(recordData)
+                    return true // continue
+                }
+                if handled { continue }
+            }
+
+            // Fallback: full page load
             let page = transactionContext == nil
                 ? try await storageEngine.getPageConcurrent(pageID: pageID)
                 : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
@@ -1683,79 +1777,7 @@ public final class QueryExecutor: @unchecked Sendable {
                 if record.isOverflow {
                     record = try await storageEngine.reassembleOverflowRecord(record)
                 }
-                // Lazy filter: skip full row decode for non-matching records
-                var lazyFilterResult: Bool? = nil
-                if let cond = condition, let colMap = aggColMap {
-                    lazyFilterResult = evaluateConditionLazy(cond, data: record.data, columnIndexMap: colMap)
-                    if lazyFilterResult == false { continue }
-                }
-
-                // Ultra-fast path: COUNT(*) WHERE — lazy filter already confirmed match, no column needed
-                if case .count(nil) = function, lazyFilterResult == true {
-                    count += 1
-                    continue
-                }
-
-                // Fast path: extract only the needed column via O(1) offset table lookup
-                // Avoids constructing a full [String: DBValue] dictionary per record
-                if let colIdx = aggColumnIndex {
-                    if let rawValue = Row.extractColumnValue(from: record.data, columnIndex: colIdx) {
-                        // If there's a condition and lazy eval didn't handle it, must verify with full row
-                        if condition != nil && lazyFilterResult == nil {
-                            guard let row = Row.fromBytesAuto(record.data, schema: aggSchema) else { continue }
-                            if !evaluateCondition(condition!, row: row) { continue }
-                        }
-
-                        switch function {
-                        case .count:
-                            if rawValue != .null { count += 1 }
-                        case .sum:
-                            switch rawValue {
-                            case .integer(let v): hasValue = true; let (r, o) = intSum.addingReportingOverflow(v); if o { allIntegers = false }; intSum = r; doubleSum += Double(v)
-                            case .double(let v): hasValue = true; allIntegers = false; doubleSum += v
-                            default: break
-                            }
-                        case .avg:
-                            if let v = numericValue(rawValue) { avgSum += v; avgCount += 1 }
-                        case .min:
-                            if rawValue != .null { if minVal == .null || rawValue < minVal { minVal = rawValue } }
-                        case .max:
-                            if rawValue != .null { if maxVal == .null || rawValue > maxVal { maxVal = rawValue } }
-                        }
-                        continue
-                    }
-                }
-
-                // Slow path: full Row decode (non-v3 format, COUNT(*), or extraction failed)
-                guard let row = Row.fromBytesAuto(record.data, schema: aggSchema) else { continue }
-                if let cond = condition, !evaluateCondition(cond, row: row) { continue }
-
-                switch function {
-                case .count(let col):
-                    if let col = col {
-                        if let v = row.values[col], v != .null { count += 1 }
-                    } else {
-                        count += 1
-                    }
-                case .sum(let col):
-                    if let dbVal = row.values[col] {
-                        switch dbVal {
-                        case .integer(let v): hasValue = true; let (r, o) = intSum.addingReportingOverflow(v); if o { allIntegers = false }; intSum = r; doubleSum += Double(v)
-                        case .double(let v): hasValue = true; allIntegers = false; doubleSum += v
-                        default: break
-                        }
-                    }
-                case .avg(let col):
-                    if let v = numericValue(row.values[col]) { avgSum += v; avgCount += 1 }
-                case .min(let col):
-                    if let v = row.values[col], v != .null {
-                        if minVal == .null || v < minVal { minVal = v }
-                    }
-                case .max(let col):
-                    if let v = row.values[col], v != .null {
-                        if maxVal == .null || v > maxVal { maxVal = v }
-                    }
-                }
+                processRecordData(record.data)
             }
         }
 

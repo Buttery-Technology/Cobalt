@@ -129,6 +129,22 @@ public final class StorageEngine: @unchecked Sendable {
     // MARK: - Page Operations
 
     public func getPage(pageID: Int, transactionContext: TransactionContext? = nil) async throws -> DatabasePage {
+        // mmap fast path for non-transactional reads
+        if transactionContext == nil && storageManager.mmapAvailable {
+            if bufferPoolManager.isDirty(pageID: pageID),
+               let cachedPage = bufferPoolManager.getCachedPage(pageID: pageID) {
+                return cachedPage
+            }
+            if let page = storageManager.readPageMmap(pageID: pageID) {
+                return page
+            }
+            storageManager.remapMmap()
+            if let page = storageManager.readPageMmap(pageID: pageID) {
+                return page
+            }
+        }
+
+        // Original path (transactional or fallback)
         if let cachedPage = bufferPoolManager.getCachedPage(pageID: pageID) {
             if let txContext = transactionContext {
                 txContext.recordAccess(pageID: pageID, isWrite: false)
@@ -145,23 +161,83 @@ public final class StorageEngine: @unchecked Sendable {
         return loadedPage
     }
 
-    /// Non-actor read path: reads from buffer pool or storage manager directly.
+    /// Non-actor read path: reads from mmap, buffer pool, or storage manager directly.
     /// No actor hop needed — both bufferPoolManager and storageManager are Sendable with internal locking.
     /// Use for read-only parallel scans where transaction tracking is not needed.
     public func getPageConcurrent(pageID: Int) async throws -> DatabasePage {
+        if storageManager.mmapAvailable {
+            // Dirty pages must come from buffer pool (mmap shows stale on-disk version)
+            if bufferPoolManager.isDirty(pageID: pageID),
+               let cachedPage = bufferPoolManager.getCachedPage(pageID: pageID) {
+                return cachedPage
+            }
+            if let page = storageManager.readPageMmap(pageID: pageID) {
+                return page
+            }
+            // Page beyond mapped region — remap and retry
+            storageManager.remapMmap()
+            if let page = storageManager.readPageMmap(pageID: pageID) {
+                return page
+            }
+        }
+        // Fallback: buffer pool + pread
         if let cachedPage = bufferPoolManager.getCachedPage(pageID: pageID) {
             return cachedPage
         }
-        // Read directly from storage manager (pread is thread-safe, no actor hop needed)
         let page = try storageManager.readPage(pageID: pageID)
         await bufferPoolManager.cachePage(page)
         return page
     }
 
-    /// Batch read pages: checks cache, batch-reads misses in contiguous I/O.
+    /// Batch read pages: uses mmap when available, falls back to buffer pool + pread.
     /// Nonisolated for parallel scan use.
     public func getPagesConcurrent(pageIDs: [Int]) async throws -> [DatabasePage] {
-        try await bufferPoolManager.getPages(pageIDs: pageIDs)
+        if storageManager.mmapAvailable {
+            var pages = [DatabasePage]()
+            pages.reserveCapacity(pageIDs.count)
+            var needsRemap = false
+
+            for pageID in pageIDs {
+                if bufferPoolManager.isDirty(pageID: pageID),
+                   let cached = bufferPoolManager.getCachedPage(pageID: pageID) {
+                    pages.append(cached)
+                } else if let page = storageManager.readPageMmap(pageID: pageID) {
+                    pages.append(page)
+                } else {
+                    needsRemap = true
+                    break
+                }
+            }
+
+            if needsRemap {
+                storageManager.remapMmap()
+                pages.removeAll(keepingCapacity: true)
+                for pageID in pageIDs {
+                    if bufferPoolManager.isDirty(pageID: pageID),
+                       let cached = bufferPoolManager.getCachedPage(pageID: pageID) {
+                        pages.append(cached)
+                    } else if let page = storageManager.readPageMmap(pageID: pageID) {
+                        pages.append(page)
+                    } else {
+                        // Beyond mmap region even after remap — fall back to pread
+                        let page = try storageManager.readPage(pageID: pageID)
+                        pages.append(page)
+                    }
+                }
+            }
+            return pages
+        }
+        return try await bufferPoolManager.getPages(pageIDs: pageIDs)
+    }
+
+    /// Iterate over records on a page via mmap without building DatabasePage or [Record].
+    /// Returns false if the page has dirty data or mmap is unavailable (caller should fall back).
+    /// The visitor receives (recordID, payloadData) and returns true to continue or false to stop.
+    public func forEachRecordOnPageMmap(pageID: Int, _ visitor: (UInt64, Data) -> Bool) -> Bool {
+        guard storageManager.mmapAvailable, !bufferPoolManager.isDirty(pageID: pageID) else {
+            return false
+        }
+        return storageManager.forEachRecordMmap(pageID: pageID, visitor)
     }
 
     public func savePage(_ page: DatabasePage, transactionContext: TransactionContext? = nil, skipAfterImage: Bool = false) async throws {
@@ -1201,8 +1277,26 @@ public final class StorageEngine: @unchecked Sendable {
         return result.compactMap { $0 }
     }
 
+    /// Synchronous single-record fetch via mmap: no async overhead, no full page deserialization.
+    /// Combines ridPageMap lookup + isDirty check + mmap record read in one fast path.
+    /// Returns nil if mmap unavailable, page is dirty, record not in ridPageMap, or overflow record.
+    public func getRecordByIDSync(_ id: UInt64, tableName: String) -> Row? {
+        guard storageManager.mmapAvailable else { return nil }
+        let pageID: Int? = _state.withLock { $0.ridPageMap[tableName]?[id] }
+        guard let pageID else { return nil }
+        // Dirty pages haven't been flushed — mmap would show stale data
+        if bufferPoolManager.isDirty(pageID: pageID) { return nil }
+        let resolvedSchema = getTableSchema(tableName)
+        guard let recordData = storageManager.readRecordMmap(pageID: pageID, recordID: id) else { return nil }
+        return Row.fromBytesAuto(recordData, schema: resolvedSchema)
+    }
+
     /// Single-record fetch by RID: avoids Set overhead of getRecordsByIDs.
     public func getRecordByID(_ id: UInt64, tableName: String, transactionContext: TransactionContext? = nil) async throws -> Row? {
+        // Sync mmap fast path for non-transactional reads
+        if transactionContext == nil, let row = getRecordByIDSync(id, tableName: tableName) {
+            return row
+        }
         let schema = getTableSchema(tableName)
         let cachedPageID: Int? = _state.withLock { $0.ridPageMap[tableName]?[id] }
         if let pageID = cachedPageID {
