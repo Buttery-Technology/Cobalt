@@ -207,8 +207,8 @@ public struct DatabasePage: Sendable {
         guard let index = records.firstIndex(where: { $0.id == id }) else {
             return false
         }
-        let oldSize = index < recordSlots.count ? recordSlots[index].length : records[index].serialize().count
-        let newSize = newRecord.serialize().count
+        let oldSize = index < recordSlots.count ? recordSlots[index].length : records[index].serializedSize
+        let newSize = newRecord.serializedSize
         let sizeDiff = newSize - oldSize
         // Check if new record fits: freeSpaceOffset shrinks by sizeDiff
         let headerEnd = PantryConstants.PAGE_HEADER_SIZE + (recordCount * PantryConstants.SLOT_SIZE)
@@ -285,7 +285,7 @@ public struct DatabasePage: Sendable {
         guard let index = records.firstIndex(where: { $0.id == id }) else {
             return false
         }
-        let removedSize = index < recordSlots.count ? recordSlots[index].length : records[index].serialize().count
+        let removedSize = index < recordSlots.count ? recordSlots[index].length : records[index].serializedSize
         records.remove(at: index)
         if index < recordSlots.count { recordSlots.remove(at: index) }
         recordCount -= 1
