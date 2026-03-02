@@ -199,10 +199,9 @@ func runBenchmarks() async throws {
 
         record("Bulk INSERT", count, pantryInsertMs, sqliteInsertMs)
 
-        // ── Create indexes ──
+        // ── Create indexes + analyze in single scan ──
         let pantryIdxStart = ContinuousClock.now
-        try await pantry.createIndexes(table: "users", columns: ["age", "city"])
-        try await pantry.analyzeTable("users")
+        try await pantry.createIndexes(table: "users", columns: ["age", "city"], analyze: true)
         let pantryIdxMs = elapsedMs(pantryIdxStart)
 
         let sqliteIdxStart = ContinuousClock.now
