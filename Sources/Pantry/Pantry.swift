@@ -152,6 +152,54 @@ public actor PantryDatabase: Sendable {
         queryExecutor.invalidatePlanCache(forTable: table)
     }
 
+    /// Create multiple indexes on the same table with a single table scan.
+    /// Much faster than calling createIndex multiple times.
+    public func createIndexes(table: String, columns: [String]) async throws {
+        let schema = storageEngine.getTableSchema(table)
+
+        // Create all ColumnIndex objects
+        var columnIndexes: [(ColumnIndex, String, Int?)] = []
+        for column in columns {
+            let ci = try await indexManager.createIndex(tableName: table, columnName: column)
+            let colIdx = schema?.columnOrdinals[column]
+            columnIndexes.append((ci, column, colIdx))
+        }
+
+        // Single table scan — collect pairs for all indexes
+        let rawRecords = try await storageEngine.scanTableRaw(table)
+        var allPairs: [[(key: DBValue, row: Row)]] = Array(repeating: [], count: columns.count)
+        for i in 0..<columns.count { allPairs[i].reserveCapacity(rawRecords.count) }
+
+        for (record, data) in rawRecords {
+            let rid: DBValue = .integer(Int64(bitPattern: record.id))
+            for (i, (_, column, colIdx)) in columnIndexes.enumerated() {
+                let value: DBValue?
+                if let idx = colIdx {
+                    value = Row.extractColumnValue(from: data, columnIndex: idx)
+                    if value == nil || value == .null { continue }
+                } else {
+                    guard let row = Row.fromBytesAuto(data, schema: schema) else { continue }
+                    value = row.values[column]
+                    if value == nil { continue }
+                }
+                let slimValues: [String: DBValue] = ["__rid": rid, column: value!]
+                allPairs[i].append((key: value!, row: Row(values: slimValues)))
+            }
+        }
+
+        // Bulk load each index
+        for (i, (ci, _, _)) in columnIndexes.enumerated() {
+            if !allPairs[i].isEmpty {
+                try await ci.bulkLoad(pairs: allPairs[i])
+            }
+        }
+
+        for column in columns {
+            await storageEngine.markColumnIndexed(table, column: column)
+        }
+        queryExecutor.invalidatePlanCache(forTable: table)
+    }
+
     /// Create a partial index on a column — only rows matching `where` condition are indexed.
     /// Partial indexes are smaller and faster when queries always include the same filter.
     public func createPartialIndex(table: String, column: String, where condition: WhereCondition, include: [String]? = nil) async throws {

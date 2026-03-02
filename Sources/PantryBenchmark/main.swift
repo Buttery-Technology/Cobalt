@@ -201,8 +201,7 @@ func runBenchmarks() async throws {
 
         // ── Create indexes ──
         let pantryIdxStart = ContinuousClock.now
-        try await pantry.createIndex(table: "users", column: "age")
-        try await pantry.createIndex(table: "users", column: "city")
+        try await pantry.createIndexes(table: "users", columns: ["age", "city"])
         try await pantry.analyzeTable("users")
         let pantryIdxMs = elapsedMs(pantryIdxStart)
 
