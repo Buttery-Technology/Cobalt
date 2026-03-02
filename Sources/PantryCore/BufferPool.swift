@@ -1,27 +1,22 @@
 import Foundation
-/// Global monotonic access counter shared across all stripes for fair eviction scoring.
-private let globalAccessCounter = PantryLock<UInt64>(0)
+import Synchronization
 
-/// Per-stripe mutable state with frequency+recency tracking for ARC-style eviction
+/// Lock-free monotonic access counter shared across all stripes.
+private let globalAccessCounter = Atomic<UInt64>(0)
+
+/// Per-stripe mutable state with clock sweep eviction.
+/// Each page has a "referenced" bit. On eviction, the clock hand sweeps:
+/// if referenced, clear the bit and advance; if unreferenced, evict.
 private struct StripeState {
     var pageCache: [Int: DatabasePage] = [:]
     var dirtyPages = Set<Int>()
-    var accessOrder: [Int: UInt64] = [:]    // recency: global access counter value at last access
-    var accessFrequency: [Int: UInt32] = [:]  // frequency: total hit count per page
+    var referenced = Set<Int>()       // clock sweep: recently-accessed pages
+    var pageOrder: [Int] = []         // insertion-order list for clock sweep
+    var clockHand: Int = 0            // current position in pageOrder
     var hitCount: Int = 0
     var missCount: Int = 0
     var evictionCount: Int = 0
     var flushCount: Int = 0
-
-    /// Compute eviction score: lower = more evictable. Combines recency (70%) and frequency (30%).
-    /// Uses global access counter for fair cross-stripe comparison.
-    func evictionScore(pageID: Int, globalMax: UInt64) -> Double {
-        let recency = Double(accessOrder[pageID] ?? 0)
-        let frequency = Double(accessFrequency[pageID] ?? 1)
-        let normalizedRecency = globalMax > 0 ? recency / Double(globalMax) : 0
-        let logFreq = log2(frequency + 1) / log2(11.0)
-        return normalizedRecency * 0.7 + min(1.0, logFreq) * 0.3
-    }
 }
 
 /// Configuration for the background page writer
@@ -85,33 +80,30 @@ public final class BufferPoolManager: Sendable {
     private func backgroundFlushCycle() async {
         let maxPerCycle = bgWriterConfig.maxPagesPerCycle
 
-        // Collect candidate pages from all stripes
-        var candidates: [(Int, DatabasePage, PantryLock<StripeState>)] = []
+        // Collect dirty page IDs only (no page data copies)
+        var dirtyPageIDs: [(Int, PantryLock<StripeState>)] = []
         for s in stripes {
-            let pages: [(Int, DatabasePage)] = s.withLock { st in
+            let ids: [Int] = s.withLock { st in
                 let dirtyRatio = st.pageCache.isEmpty ? 0.0 : Double(st.dirtyPages.count) / Double(st.pageCache.count)
                 guard dirtyRatio >= bgWriterConfig.dirtyThreshold else { return [] }
-
-                let sorted = st.dirtyPages
-                    .compactMap { pageID -> (Int, UInt64, DatabasePage)? in
-                        guard let page = st.pageCache[pageID] else { return nil }
-                        return (pageID, st.accessOrder[pageID] ?? 0, page)
-                    }
-                    .sorted { $0.1 < $1.1 }
-
-                return sorted.map { ($0.0, $0.2) }
+                return Array(st.dirtyPages)
             }
-            for (pageID, page) in pages {
-                candidates.append((pageID, page, s))
+            for id in ids {
+                dirtyPageIDs.append((id, s))
             }
         }
 
-        // Sort by pageID for sequential I/O, then take up to maxPerCycle
-        candidates.sort { $0.0 < $1.0 }
+        // Sort by pageID for sequential I/O
+        dirtyPageIDs.sort { $0.0 < $1.0 }
 
         var totalFlushed = 0
-        for (pageID, var page, stripe) in candidates {
+        for (pageID, stripe) in dirtyPageIDs {
             guard totalFlushed < maxPerCycle else { break }
+            // Look up page at write time
+            let pageToWrite: DatabasePage? = stripe.withLock { st in
+                st.dirtyPages.contains(pageID) ? st.pageCache[pageID] : nil
+            }
+            guard var page = pageToWrite else { continue }
             do {
                 try await storageManager.writePage(&page, alreadySerialized: true)
                 stripe.withLock { st in
@@ -139,9 +131,7 @@ public final class BufferPoolManager: Sendable {
         let s = stripe(for: pageID)
         let cached: DatabasePage? = s.withLock { st in
             if let page = st.pageCache[pageID] {
-                let counter = globalAccessCounter.withLock { c -> UInt64 in c += 1; return c }
-                st.accessOrder[pageID] = counter
-                st.accessFrequency[pageID, default: 0] += 1
+                st.referenced.insert(pageID)
                 st.hitCount += 1
                 return page
             }
@@ -162,9 +152,7 @@ public final class BufferPoolManager: Sendable {
     public func getCachedPage(pageID: Int) -> DatabasePage? {
         stripe(for: pageID).withLock { st in
             if let page = st.pageCache[pageID] {
-                let counter = globalAccessCounter.withLock { c -> UInt64 in c += 1; return c }
-                st.accessOrder[pageID] = counter
-                st.accessFrequency[pageID, default: 0] += 1
+                st.referenced.insert(pageID)
                 st.hitCount += 1
                 return page
             }
@@ -175,8 +163,7 @@ public final class BufferPoolManager: Sendable {
     public func updatePage(_ page: DatabasePage) {
         stripe(for: page.pageID).withLock { st in
             st.pageCache[page.pageID] = page
-            let counter = globalAccessCounter.withLock { c -> UInt64 in c += 1; return c }
-            st.accessOrder[page.pageID] = counter
+            st.referenced.insert(page.pageID)
         }
     }
 
@@ -201,28 +188,56 @@ public final class BufferPoolManager: Sendable {
             try await evictFromStripe(index: idx)
         }
         stripes[idx].withLock { st in
+            if st.pageCache[page.pageID] == nil {
+                st.pageOrder.append(page.pageID)
+            }
             st.pageCache[page.pageID] = page
-            let counter = globalAccessCounter.withLock { c -> UInt64 in c += 1; return c }
-            st.accessOrder[page.pageID] = counter
-            st.accessFrequency[page.pageID] = 1
+            st.referenced.insert(page.pageID)
         }
     }
 
-    /// Evict the lowest-scoring page from a specific stripe using ARC (frequency+recency) scoring.
-    /// Prefers evicting clean pages; falls back to dirty pages if needed.
+    /// Clock sweep eviction: O(1) amortized. Sweeps from clockHand position,
+    /// clearing referenced bits until an unreferenced page is found.
+    /// Prefers clean pages to avoid I/O.
     private func evictFromStripe(index idx: Int) async throws {
         let victim: (Int, DatabasePage?)? = stripes[idx].withLock { st in
-            guard !st.pageCache.isEmpty else { return nil }
-
-            // Prefer evicting clean pages first (avoid I/O)
-            let cleanPages = st.accessOrder.keys.filter { !st.dirtyPages.contains($0) }
-            let candidates = cleanPages.isEmpty ? Array(st.accessOrder.keys) : cleanPages
-
-            let gmax = globalAccessCounter.withLock { $0 }
-            guard let bestVictim = candidates.min(by: { st.evictionScore(pageID: $0, globalMax: gmax) < st.evictionScore(pageID: $1, globalMax: gmax) }) else { return nil }
-
-            let dirtyPage: DatabasePage? = st.dirtyPages.contains(bestVictim) ? st.pageCache[bestVictim] : nil
-            return (bestVictim, dirtyPage)
+            guard !st.pageOrder.isEmpty else { return nil }
+            let n = st.pageOrder.count
+            // Up to 2 full sweeps: first pass skips dirty, second accepts dirty
+            for _ in 0..<(2 * n) {
+                if st.clockHand >= n { st.clockHand = 0 }
+                let pid = st.pageOrder[st.clockHand]
+                if st.referenced.contains(pid) {
+                    st.referenced.remove(pid)
+                    st.clockHand += 1
+                    continue
+                }
+                // Prefer clean pages on first sweep
+                if st.dirtyPages.contains(pid) {
+                    // Give dirty pages a second chance on first pass
+                    st.clockHand += 1
+                    continue
+                }
+                // Found a clean, unreferenced victim
+                let dirtyPage: DatabasePage? = nil
+                return (pid, dirtyPage)
+            }
+            // All pages referenced or dirty — evict first unreferenced (even if dirty)
+            for _ in 0..<n {
+                if st.clockHand >= n { st.clockHand = 0 }
+                let pid = st.pageOrder[st.clockHand]
+                if st.referenced.contains(pid) {
+                    st.referenced.remove(pid)
+                    st.clockHand += 1
+                    continue
+                }
+                let dirtyPage: DatabasePage? = st.dirtyPages.contains(pid) ? st.pageCache[pid] : nil
+                return (pid, dirtyPage)
+            }
+            // Everything referenced — force evict at clock hand
+            let pid = st.pageOrder[st.clockHand % n]
+            let dirtyPage: DatabasePage? = st.dirtyPages.contains(pid) ? st.pageCache[pid] : nil
+            return (pid, dirtyPage)
         }
         guard let (pageID, dirtyPage) = victim else { return }
 
@@ -232,8 +247,11 @@ public final class BufferPoolManager: Sendable {
         stripes[idx].withLock { st in
             st.dirtyPages.remove(pageID)
             st.pageCache.removeValue(forKey: pageID)
-            st.accessOrder.removeValue(forKey: pageID)
-            st.accessFrequency.removeValue(forKey: pageID)
+            st.referenced.remove(pageID)
+            if let orderIdx = st.pageOrder.firstIndex(of: pageID) {
+                st.pageOrder.remove(at: orderIdx)
+                if st.clockHand > orderIdx { st.clockHand -= 1 }
+            }
             st.evictionCount += 1
         }
     }
@@ -260,9 +278,12 @@ public final class BufferPoolManager: Sendable {
     public func evictPage(pageID: Int) {
         stripe(for: pageID).withLock { st in
             st.pageCache.removeValue(forKey: pageID)
-            st.accessOrder.removeValue(forKey: pageID)
-            st.accessFrequency.removeValue(forKey: pageID)
+            st.referenced.remove(pageID)
             st.dirtyPages.remove(pageID)
+            if let orderIdx = st.pageOrder.firstIndex(of: pageID) {
+                st.pageOrder.remove(at: orderIdx)
+                if st.clockHand > orderIdx { st.clockHand -= 1 }
+            }
         }
     }
 
@@ -323,37 +344,27 @@ public final class BufferPoolManager: Sendable {
             let pagesToFlush: [Int] = s.withLock { st in
                 let dirtyPageCount = st.dirtyPages.count
                 guard dirtyPageCount > st.pageCache.count / 4 || dirtyPageCount > capacityPerStripe / 4 else { return [] }
-                let sorted = st.dirtyPages.sorted { pageID1, pageID2 in
-                    let order1 = st.accessOrder[pageID1] ?? 0
-                    let order2 = st.accessOrder[pageID2] ?? 0
-                    return order1 < order2
-                }
-                return Array(sorted.prefix(max(1, dirtyPageCount / 4)))
+                // Flush unreferenced dirty pages first (coldest)
+                let unreferenced = st.dirtyPages.filter { !st.referenced.contains($0) }
+                let candidates = unreferenced.isEmpty ? Array(st.dirtyPages) : Array(unreferenced)
+                return Array(candidates.prefix(max(1, dirtyPageCount / 4)))
             }
 
             for pageID in pagesToFlush {
                 try await flushPage(pageID: pageID)
             }
 
-            // Evict clean pages if stripe is >90% full
-            s.withLock { st in
+            // Evict clean pages if stripe is >90% full using clock sweep
+            let evictCount: Int = s.withLock { st in
                 let cap = capacityPerStripe
                 if st.pageCache.count > Int(Double(cap) * 0.9) {
-                    let targetCount = Int(Double(cap) * 0.8)
-                    let evictionCount = st.pageCache.count - targetCount
-                    if evictionCount > 0 {
-                        let gmax = globalAccessCounter.withLock { $0 }
-                        let cleanPages = st.accessOrder.keys
-                            .filter { !st.dirtyPages.contains($0) }
-                            .sorted { st.evictionScore(pageID: $0, globalMax: gmax) < st.evictionScore(pageID: $1, globalMax: gmax) }
-                            .prefix(evictionCount)
-                        for pageID in cleanPages {
-                            st.pageCache.removeValue(forKey: pageID)
-                            st.accessOrder.removeValue(forKey: pageID)
-                            st.accessFrequency.removeValue(forKey: pageID)
-                            st.evictionCount += 1
-                        }
-                    }
+                    return st.pageCache.count - Int(Double(cap) * 0.8)
+                }
+                return 0
+            }
+            if evictCount > 0 {
+                for _ in 0..<evictCount {
+                    try? await evictFromStripe(index: stripes.firstIndex(where: { $0 === s }) ?? 0)
                 }
             }
         }
@@ -362,9 +373,11 @@ public final class BufferPoolManager: Sendable {
     public func cachePage(_ page: DatabasePage) async {
         let s = stripe(for: page.pageID)
         let needsEviction = s.withLock { st in
+            if st.pageCache[page.pageID] == nil {
+                st.pageOrder.append(page.pageID)
+            }
             st.pageCache[page.pageID] = page
-            let counter = globalAccessCounter.withLock { c -> UInt64 in c += 1; return c }
-            st.accessOrder[page.pageID] = counter
+            st.referenced.insert(page.pageID)
             return st.pageCache.count > capacityPerStripe
         }
         if needsEviction {

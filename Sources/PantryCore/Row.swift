@@ -74,22 +74,24 @@ extension Row {
         return buf
     }
 
-    /// Schema-based positional encoding with NULL bitmap.
-    /// Format:
+    /// Schema-based positional encoding with NULL bitmap and column offset table.
+    /// Format v3:
     /// ```
-    /// [1B magic 0xFF][1B version 0x02]
+    /// [1B magic 0xFF][1B version 0x03]
     /// [2B column count (UInt16)]
     /// [ceil(colCount/8) bytes NULL bitmap — bit=1 means NULL]
+    /// [2B * colCount offset table — byte offset from values start, 0xFFFF for NULL]
     /// per non-NULL column (in schema order):
     ///   [1B type tag][value payload]
     /// ```
-    /// NULL columns use only 1 bit instead of 1 byte (type tag).
+    /// The offset table enables O(1) random column access.
     public func toBytesPositional(schema: PantryTableSchema) -> Data {
         let colCount = schema.columns.count
         let bitmapBytes = (colCount + 7) / 8
-        var buf = Data(capacity: 4 + bitmapBytes + colCount * 10)
+        let offsetTableSize = colCount * 2
+        var buf = Data(capacity: 4 + bitmapBytes + offsetTableSize + colCount * 10)
         buf.append(0xFF) // magic
-        buf.append(0x02) // version 2: NULL bitmap
+        buf.append(0x03) // version 3: NULL bitmap + offset table
         buf.appendUInt16(UInt16(colCount))
 
         // Build NULL bitmap
@@ -102,15 +104,78 @@ extension Row {
         }
         buf.append(contentsOf: bitmap)
 
-        // Encode only non-NULL values
+        // Reserve space for offset table (fill with 0xFFFF initially)
+        let offsetTableStart = buf.count
+        for _ in 0..<colCount {
+            buf.appendUInt16(0xFFFF)
+        }
+        let valuesStart = buf.count
+
+        // Encode non-NULL values and record offsets
         for (i, col) in schema.columns.enumerated() {
             let isNull = (bitmap[i / 8] & (1 << (i % 8))) != 0
             if !isNull {
+                let relOffset = UInt16(buf.count - valuesStart)
+                // Write offset into the reserved table slot
+                var leOffset = relOffset.littleEndian
+                withUnsafeBytes(of: &leOffset) { ptr in
+                    let pos = offsetTableStart + i * 2
+                    buf.replaceSubrange(pos..<(pos + 2), with: ptr)
+                }
                 let value = values[col.name] ?? .null
                 Row.encodeDBValue(value, into: &buf)
             }
         }
         return buf
+    }
+
+    /// Decode from positional format v3 (NULL bitmap + offset table) using schema for column names.
+    public static func fromBytesPositionalV3(_ data: Data, schema: PantryTableSchema) -> Row? {
+        guard data.count >= 4,
+              data[data.startIndex] == 0xFF,
+              data[data.startIndex + 1] == 0x03 else { return nil }
+        var offset = 2
+        guard let colCount = data.readUInt16(at: &offset) else { return nil }
+
+        let encodedCount = Int(colCount)
+        let bitmapBytes = (encodedCount + 7) / 8
+        guard offset + bitmapBytes <= data.count else { return nil }
+        let bitmap = Array(data[offset..<(offset + bitmapBytes)])
+        offset += bitmapBytes
+
+        // Skip offset table (2B per column)
+        let offsetTableSize = encodedCount * 2
+        guard offset + offsetTableSize <= data.count else { return nil }
+        offset += offsetTableSize
+
+        // Decode values sequentially (same as v2 from here)
+        var values = [String: DBValue]()
+        values.reserveCapacity(max(encodedCount, schema.columns.count))
+        let decodableCount = min(encodedCount, schema.columns.count)
+        for i in 0..<decodableCount {
+            let col = schema.columns[i]
+            let isNull = (bitmap[i / 8] & (1 << (i % 8))) != 0
+            if isNull {
+                values[col.name] = .null
+            } else {
+                guard let value = decodeDBValue(from: data, at: &offset) else { return nil }
+                values[col.name] = value
+            }
+        }
+        if encodedCount > schema.columns.count {
+            for i in schema.columns.count..<encodedCount {
+                let isNull = (bitmap[i / 8] & (1 << (i % 8))) != 0
+                if !isNull {
+                    guard skipDBValue(in: data, at: &offset) else { return nil }
+                }
+            }
+        }
+        if encodedCount < schema.columns.count {
+            for i in encodedCount..<schema.columns.count {
+                values[schema.columns[i].name] = .null
+            }
+        }
+        return Row(values: values)
     }
 
     /// Decode from positional format v2 (NULL bitmap) using schema for column names.
@@ -194,7 +259,9 @@ extension Row {
         if data.count >= 2, data[data.startIndex] == 0xFF {
             if let schema = schema {
                 let version = data[data.startIndex + 1]
-                if version == 0x02 {
+                if version == 0x03 {
+                    return fromBytesPositionalV3(data, schema: schema)
+                } else if version == 0x02 {
                     return fromBytesPositionalV2(data, schema: schema)
                 } else if version == 0x01 {
                     return fromBytesPositionalV1(data, schema: schema)
@@ -272,11 +339,11 @@ extension Row {
         return nil
     }
 
-    /// Extract a single column value from positional-encoded (v2) binary data by column index.
-    /// Navigates the NULL bitmap, skips preceding non-NULL values via skipDBValue, decodes target.
+    /// Extract a single column value from positional-encoded (v2/v3) binary data by column index.
+    /// v3: Uses offset table for O(1) jump. v2: Skips preceding non-NULL values sequentially.
     public static func columnValuePositional(at index: Int, colCount: Int, from data: Data) -> DBValue? {
-        // v2 format: [0xFF][0x02][2B colCount][bitmap][values...]
-        guard data.count >= 4, data[data.startIndex] == 0xFF, data[data.startIndex + 1] == 0x02 else { return nil }
+        guard data.count >= 4, data[data.startIndex] == 0xFF else { return nil }
+        let version = data[data.startIndex + 1]
         guard index < colCount else { return nil }
 
         let bitmapBytes = (colCount + 7) / 8
@@ -289,7 +356,22 @@ extension Row {
             return .null
         }
 
-        // Skip preceding non-NULL values to reach the target
+        if version == 0x03 {
+            // v3: use offset table for O(1) access
+            let offsetTableStart = bitmapStart + bitmapBytes
+            let offsetPos = offsetTableStart + index * 2
+            guard offsetPos + 2 <= data.count else { return nil }
+            let relOffset = data.withUnsafeBytes {
+                UInt16(littleEndian: $0.loadUnaligned(fromByteOffset: offsetPos, as: UInt16.self))
+            }
+            guard relOffset != 0xFFFF else { return .null }
+            let valuesStart = offsetTableStart + colCount * 2
+            var offset = valuesStart + Int(relOffset)
+            return decodeDBValue(from: data, at: &offset)
+        }
+
+        // v2: sequential skip
+        guard version == 0x02 else { return nil }
         var offset = bitmapStart + bitmapBytes
         for i in 0..<index {
             let byteIdx = data[data.startIndex + bitmapStart + i / 8]
@@ -299,7 +381,6 @@ extension Row {
             }
         }
 
-        // Decode the target value
         return decodeDBValue(from: data, at: &offset)
     }
 

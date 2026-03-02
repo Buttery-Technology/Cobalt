@@ -19,6 +19,7 @@ public actor WriteAheadLog: Sendable {
     private var currentLogPosition: UInt64 = 0
     private var nextLSN: UInt64 = 1
     private var logCache: [UInt64: LogRecord] = [:]
+    private var logCacheFIFO: [UInt64] = []  // insertion-order LSN list for O(1) eviction
     private let logCacheLimit = 1000
     private let storageManager: StorageManager
     private let groupCommitConfig: GroupCommitConfig
@@ -746,13 +747,15 @@ public actor WriteAheadLog: Sendable {
     private func cacheLogRecord(lsn: UInt64, type: LogRecordType, txID: UInt64, timestamp: UInt64, content: LogContent) {
         let record = LogRecord(lsn: lsn, type: type, transactionID: txID, timestamp: timestamp, content: content)
         logCache[lsn] = record
+        logCacheFIFO.append(lsn)
 
         if logCache.count > logCacheLimit {
-            let sortedKeys = logCache.keys.sorted()
-            let keysToRemove = sortedKeys.prefix(logCache.count - logCacheLimit)
-            for key in keysToRemove {
-                logCache.removeValue(forKey: key)
+            // FIFO eviction: remove oldest entries from front
+            let excess = logCache.count - logCacheLimit
+            for lsnToRemove in logCacheFIFO.prefix(excess) {
+                logCache.removeValue(forKey: lsnToRemove)
             }
+            logCacheFIFO.removeFirst(excess)
         }
     }
 
@@ -835,6 +838,7 @@ public actor WriteAheadLog: Sendable {
         logFileHandle = try FileHandle(forUpdating: URL(fileURLWithPath: logFilePath))
         currentLogPosition = 0
         logCache.removeAll()
+        logCacheFIFO.removeAll()
         nextLSN = 1
         try writeLogHeader()
     }
