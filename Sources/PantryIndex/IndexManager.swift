@@ -437,12 +437,13 @@ public actor IndexManager: IndexHook, Sendable {
     public func removeFromIndexesBatch(records: [(id: UInt64, row: Row)], tableName: String) async throws {
         guard let tableIndexes = indexes[tableName] else { return }
 
+        // Build pairs for each index, then delete in parallel
+        var indexWork: [(ColumnIndex, [(key: DBValue, rid: DBValue)])] = []
         for (_, columnIndex) in tableIndexes {
-            let condition = await columnIndex.partialCondition
+            let condition = columnIndex.partialCondition
             let compoundCols = columnIndex.compoundColumns
             let colName = columnIndex.columnName
 
-            // Collect key-rid pairs for batch delete
             var pairs: [(key: DBValue, rid: DBValue)] = []
             pairs.reserveCapacity(records.count)
             for (id, row) in records {
@@ -457,7 +458,18 @@ public actor IndexManager: IndexHook, Sendable {
                     pairs.append((key: value, rid: rid))
                 }
             }
-            try await columnIndex.deleteBatch(pairs: pairs)
+            if !pairs.isEmpty {
+                indexWork.append((columnIndex, pairs))
+            }
+        }
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for (columnIndex, pairs) in indexWork {
+                group.addTask {
+                    try await columnIndex.deleteBatch(pairs: pairs)
+                }
+            }
+            try await group.waitForAll()
         }
     }
 
@@ -466,8 +478,10 @@ public actor IndexManager: IndexHook, Sendable {
     public func removeFromIndexesBatchRaw(records: [(id: UInt64, data: Data)], tableName: String, schema: PantryTableSchema) async throws {
         guard let tableIndexes = indexes[tableName] else { return }
 
+        // Build pairs for each index (CPU-bound), then delete in parallel
+        var indexWork: [(ColumnIndex, [(key: DBValue, rid: DBValue)])] = []
         for (_, columnIndex) in tableIndexes {
-            let condition = await columnIndex.partialCondition
+            let condition = columnIndex.partialCondition
             let compoundCols = columnIndex.compoundColumns
             let colName = columnIndex.columnName
 
@@ -481,7 +495,6 @@ public actor IndexManager: IndexHook, Sendable {
                 guard colIndices.count == columns.count else { continue }
                 for (id, data) in records {
                     if condition != nil {
-                        // Need full row for partial index condition check
                         guard let row = Row.fromBytesAuto(data, schema: schema),
                               evaluateConditionForIndex(condition!, row: row) else { continue }
                     }
@@ -506,8 +519,19 @@ public actor IndexManager: IndexHook, Sendable {
                 }
             }
 
-            // Batch delete: sorts internally for cache locality, avoids per-delete root save
-            try await columnIndex.deleteBatch(pairs: pairs)
+            if !pairs.isEmpty {
+                indexWork.append((columnIndex, pairs))
+            }
+        }
+
+        // Delete from all indexes concurrently
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for (columnIndex, pairs) in indexWork {
+                group.addTask {
+                    try await columnIndex.deleteBatch(pairs: pairs)
+                }
+            }
+            try await group.waitForAll()
         }
     }
 

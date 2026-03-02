@@ -1059,33 +1059,17 @@ public actor QueryExecutor: Sendable {
                 return UInt64(bitPattern: ridSigned)
             })
 
-            // Raw data path: skip full Row deserialization, use lazy eval + raw index removal
             let idxSchema = storageEngine.getTableSchema(table)
-            let idxColMap = idxSchema?.columnOrdinals
             if idxSchema != nil {
-                let rawRecords = try await storageEngine.getRecordDataByIDs(matchingRIDs, tableName: table, transactionContext: transactionContext)
-                var matchingRaw: [(id: UInt64, pageID: Int, data: Data?)] = []
-                matchingRaw.reserveCapacity(rawRecords.count)
-                for (record, recordPageID) in rawRecords {
-                    // Lazy eval to verify condition without full Row decode
-                    if let colMap = idxColMap,
-                       let lazyResult = evaluateConditionLazy(condition, data: record.data, columnIndexMap: colMap) {
-                        if lazyResult {
-                            matchingRaw.append((id: record.id, pageID: recordPageID, data: record.data))
-                        }
-                        continue
-                    }
-                    // Fallback: full Row decode for complex conditions
-                    guard let row = Row.fromBytesAuto(record.data, schema: idxSchema),
-                          evaluateCondition(condition, row: row) else { continue }
-                    matchingRaw.append((id: record.id, pageID: recordPageID, data: record.data))
+                // Single-pass: delete from pages AND collect raw data for index removal
+                let (deleted, rawData) = try await storageEngine.deleteByRIDs(matchingRIDs, tableName: table, transactionContext: transactionContext)
+
+                // Remove from indexes using collected raw data
+                if !rawData.isEmpty {
+                    try await indexManager.removeFromIndexesBatchRaw(records: rawData, tableName: table, schema: idxSchema!)
+                    invalidateResultCache(forTable: table)
                 }
-                if !matchingRaw.isEmpty {
-                    try await storageEngine.deleteRecordsBatchRaw(matchingRaw, tableName: table, transactionContext: transactionContext)
-                    let modifiedPages = Set(matchingRaw.map { $0.pageID })
-                    invalidateResultCache(forTable: table, modifiedPages: modifiedPages)
-                }
-                return matchingRaw.count
+                return deleted
             }
 
             // Fallback: original Row-based path

@@ -720,6 +720,127 @@ public actor StorageEngine: Sendable {
         }
     }
 
+    /// Single-pass delete by RIDs: finds records, deletes from pages, collects raw data for index removal.
+    /// Avoids the double page-load of getRecordDataByIDs + deleteRecordsBatchRaw.
+    public func deleteByRIDs(_ ids: Set<UInt64>, tableName: String, transactionContext: TransactionContext? = nil) async throws -> (deleted: Int, rawData: [(id: UInt64, data: Data)]) {
+        guard !ids.isEmpty else { return (0, []) }
+
+        let schema = tableRegistry.getTableInfo(name: tableName)?.schema
+        var remaining = ids
+        var totalDeleted = 0
+        var rawIndexRemovals: [(id: UInt64, data: Data)] = []
+        rawIndexRemovals.reserveCapacity(ids.count)
+        var modifiedPageIDs: [Int] = []
+
+        // Group RIDs by page using the cache
+        var idsByPage = [Int: [UInt64]]()
+        var uncached = [UInt64]()
+        if let cache = ridPageMap[tableName], !cache.isEmpty {
+            for id in ids {
+                if let pageID = cache[id] { idsByPage[pageID, default: []].append(id) }
+                else { uncached.append(id) }
+            }
+        } else {
+            uncached = Array(ids)
+        }
+
+        // Process cached pages — single load for both data extraction and deletion
+        for pageID in idsByPage.keys.sorted() {
+            let pageIds = idsByPage[pageID]!
+            var page = try await getPage(pageID: pageID, transactionContext: transactionContext)
+            let idSet = Set(pageIds)
+            var deletedFromPage = 0
+
+            for record in page.records where idSet.contains(record.id) {
+                var data = record.data
+                if record.isOverflow {
+                    let reassembled = try await reassembleOverflowRecord(record)
+                    data = reassembled.data
+                }
+
+                if let txContext = transactionContext {
+                    try await logManager.logRecordDelete(txID: txContext.transactionID, pageID: pageID, recordID: record.id, data: data)
+                }
+
+                if page.deleteRecord(id: record.id) {
+                    deletedFromPage += 1
+                    if record.isOverflow, let overflowStart = record.overflowPageID {
+                        try await freeOverflowPages(startingAt: overflowStart)
+                    }
+                    rawIndexRemovals.append((id: record.id, data: data))
+                    ridPageMap[tableName]?.removeValue(forKey: record.id)
+                    remaining.remove(record.id)
+                }
+            }
+
+            if deletedFromPage > 0 {
+                if transactionContext != nil {
+                    try await savePage(page, transactionContext: transactionContext, skipAfterImage: true)
+                } else {
+                    try await savePageDeferred(page)
+                }
+                totalDeleted += deletedFromPage
+                modifiedPageIDs.append(pageID)
+            }
+        }
+
+        // Process uncached RIDs — scan pages
+        if !remaining.isEmpty {
+            let pageList = tableRegistry.getTableInfo(name: tableName)?.pageList ?? []
+            for currentPageID in pageList {
+                guard !remaining.isEmpty else { break }
+                var page = try await getPage(pageID: currentPageID, transactionContext: transactionContext)
+                var deletedFromPage = 0
+
+                for record in page.records where remaining.contains(record.id) {
+                    var data = record.data
+                    if record.isOverflow {
+                        let reassembled = try await reassembleOverflowRecord(record)
+                        data = reassembled.data
+                    }
+                    ridPageMap[tableName, default: [:]][record.id] = currentPageID
+
+                    if let txContext = transactionContext {
+                        try await logManager.logRecordDelete(txID: txContext.transactionID, pageID: currentPageID, recordID: record.id, data: data)
+                    }
+
+                    if page.deleteRecord(id: record.id) {
+                        deletedFromPage += 1
+                        if record.isOverflow, let overflowStart = record.overflowPageID {
+                            try await freeOverflowPages(startingAt: overflowStart)
+                        }
+                        rawIndexRemovals.append((id: record.id, data: data))
+                        ridPageMap[tableName]?.removeValue(forKey: record.id)
+                        remaining.remove(record.id)
+                    }
+                }
+
+                if deletedFromPage > 0 {
+                    if transactionContext != nil {
+                        try await savePage(page, transactionContext: transactionContext, skipAfterImage: true)
+                    } else {
+                        try await savePageDeferred(page)
+                    }
+                    totalDeleted += deletedFromPage
+                    modifiedPageIDs.append(currentPageID)
+                }
+            }
+        }
+
+        // Flush dirty pages for non-transactional deletes
+        if transactionContext == nil && totalDeleted > 0 {
+            try await flushDirtyPages(Set(modifiedPageIDs))
+        }
+
+        if totalDeleted > 0 {
+            guard var freshInfo = tableRegistry.getTableInfo(name: tableName) else { return (totalDeleted, rawIndexRemovals) }
+            freshInfo.recordCount = max(0, freshInfo.recordCount - totalDeleted)
+            tableRegistry.updateTableInfo(freshInfo)
+        }
+
+        return (totalDeleted, rawIndexRemovals)
+    }
+
     /// Try to replace a record in-place on its current page. Returns true if successful.
     /// Falls back to false when: record not found, new data doesn't fit, or record is overflow.
     /// Pass `knownPageID` to skip the sequential scan for the record's page.
