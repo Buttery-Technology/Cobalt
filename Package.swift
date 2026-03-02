@@ -22,5 +22,13 @@ let package = Package(
         .testTarget(name: "PantryIndexTests", dependencies: ["PantryIndex"]),
         .testTarget(name: "PantryQueryTests", dependencies: ["PantryQuery"]),
         .testTarget(name: "PantryTests", dependencies: ["Pantry"]),
+        .systemLibrary(name: "CSQLite"),
+        .executableTarget(
+            name: "PantryBenchmark",
+            dependencies: ["Pantry", "CSQLite"],
+            linkerSettings: [
+                .unsafeFlags(["-L/opt/homebrew/opt/sqlite/lib"]),
+            ]
+        ),
     ]
 )

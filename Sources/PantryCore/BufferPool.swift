@@ -12,11 +12,32 @@ private struct StripeState {
     var dirtyPages = Set<Int>()
     var referenced = Set<Int>()       // clock sweep: recently-accessed pages
     var pageOrder: [Int] = []         // insertion-order list for clock sweep
+    var pageIndex: [Int: Int] = [:]   // pageID → index in pageOrder for O(1) lookup
     var clockHand: Int = 0            // current position in pageOrder
     var hitCount: Int = 0
     var missCount: Int = 0
     var evictionCount: Int = 0
     var flushCount: Int = 0
+
+    /// Remove a page from pageOrder in O(1) by swap-removing with the last element.
+    mutating func removeFromPageOrder(pageID: Int) {
+        guard let idx = pageIndex[pageID] else { return }
+        let lastIdx = pageOrder.count - 1
+        if idx != lastIdx {
+            let movedPID = pageOrder[lastIdx]
+            pageOrder[idx] = movedPID
+            pageIndex[movedPID] = idx
+        }
+        pageOrder.removeLast()
+        pageIndex.removeValue(forKey: pageID)
+        // Adjust clock hand
+        if clockHand > idx && clockHand > 0 {
+            clockHand -= 1
+        }
+        if !pageOrder.isEmpty && clockHand >= pageOrder.count {
+            clockHand = 0
+        }
+    }
 }
 
 /// Configuration for the background page writer
@@ -189,6 +210,7 @@ public final class BufferPoolManager: Sendable {
         }
         stripes[idx].withLock { st in
             if st.pageCache[page.pageID] == nil {
+                st.pageIndex[page.pageID] = st.pageOrder.count
                 st.pageOrder.append(page.pageID)
             }
             st.pageCache[page.pageID] = page
@@ -248,10 +270,7 @@ public final class BufferPoolManager: Sendable {
             st.dirtyPages.remove(pageID)
             st.pageCache.removeValue(forKey: pageID)
             st.referenced.remove(pageID)
-            if let orderIdx = st.pageOrder.firstIndex(of: pageID) {
-                st.pageOrder.remove(at: orderIdx)
-                if st.clockHand > orderIdx { st.clockHand -= 1 }
-            }
+            st.removeFromPageOrder(pageID: pageID)
             st.evictionCount += 1
         }
     }
@@ -280,10 +299,7 @@ public final class BufferPoolManager: Sendable {
             st.pageCache.removeValue(forKey: pageID)
             st.referenced.remove(pageID)
             st.dirtyPages.remove(pageID)
-            if let orderIdx = st.pageOrder.firstIndex(of: pageID) {
-                st.pageOrder.remove(at: orderIdx)
-                if st.clockHand > orderIdx { st.clockHand -= 1 }
-            }
+            st.removeFromPageOrder(pageID: pageID)
         }
     }
 
