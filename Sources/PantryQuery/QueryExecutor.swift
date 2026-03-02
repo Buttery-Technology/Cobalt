@@ -190,25 +190,33 @@ public final class QueryExecutor: @unchecked Sendable {
 
                 // With WHERE, overfetch to account for filtered-out rows
                 let fetchLimit = condition != nil ? totalNeeded * 4 : totalNeeded
-                let indexRows = try await index.searchRangeWithLimit(from: nil, to: nil, limit: fetchLimit, ascending: ascending)
+                let indexRows: [Row]
+                if let cached = index.searchRangeWithLimitCached(from: nil, to: nil, limit: fetchLimit, ascending: ascending) {
+                    indexRows = cached
+                } else {
+                    indexRows = try await index.searchRangeWithLimit(from: nil, to: nil, limit: fetchLimit, ascending: ascending)
+                }
 
                 var orderedRows: [Row]
                 if isCovering {
                     // Covering index: use index rows directly, skip full record fetch
                     orderedRows = indexRows
                 } else {
-                    // Non-covering: fetch full rows by RID
-                    let rids = Set(indexRows.compactMap { row -> UInt64? in
+                    // Non-covering: fetch full rows by RID, preserving index order
+                    let ridList = indexRows.compactMap { row -> UInt64? in
                         guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
                         return UInt64(bitPattern: ridSigned)
-                    })
-                    let fullRecords = try await storageEngine.getRecordsByIDs(rids, tableName: table, transactionContext: transactionContext)
+                    }
+                    let fullRecords = try await storageEngine.getRecordsByIDs(Set(ridList), tableName: table, transactionContext: transactionContext)
 
-                    // Re-sort by the index order (getRecordsByIDs doesn't preserve order)
-                    let ridToRow = Dictionary(fullRecords.map { (record, row) in (record.id, row) }, uniquingKeysWith: { a, _ in a })
-                    orderedRows = indexRows.compactMap { indexRow -> Row? in
-                        guard case .integer(let ridSigned) = indexRow.values["__rid"] else { return nil }
-                        return ridToRow[UInt64(bitPattern: ridSigned)]
+                    // For small result sets, use linear scan to preserve order (avoids dictionary allocation)
+                    if ridList.count <= 64 {
+                        orderedRows = ridList.compactMap { targetRID in
+                            fullRecords.first { $0.0.id == targetRID }?.1
+                        }
+                    } else {
+                        let ridToRow = Dictionary(fullRecords.map { ($0.0.id, $0.1) }, uniquingKeysWith: { a, _ in a })
+                        orderedRows = ridList.compactMap { ridToRow[$0] }
                     }
                 }
 
@@ -407,7 +415,7 @@ public final class QueryExecutor: @unchecked Sendable {
 
                 // Streaming approach: collect batches of left keys, batch-probe index, batch-fetch right records
                 var pendingKeys = [(key: DBValue, recordData: Data)]()
-                let batchSize = min(totalNeeded, 64)
+                let batchSize = max(totalNeeded, 128)
 
                 for pageID in pageIDs {
                     if result.count >= totalNeeded { break }

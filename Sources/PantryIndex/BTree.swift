@@ -103,6 +103,97 @@ public final class BTree: @unchecked Sendable {
         return nil
     }
 
+    /// Synchronous cache-only range scan with limit. Returns nil on any cache miss.
+    public func searchRangeWithLimitCached(from startKey: DBValue?, to endKey: DBValue?, limit: Int, ascending: Bool = true) -> [Row]? {
+        guard let rootId = rootId,
+              let root = nodeStore.loadNodeCached(nodeId: rootId) else {
+            return nil
+        }
+        var results: [Row] = []
+        results.reserveCapacity(limit)
+        if ascending {
+            if !collectRangeLimitedCached(node: root, startKey: startKey, endKey: endKey, results: &results, limit: limit) { return nil }
+        } else {
+            if !collectRangeReverseLimitedCached(node: root, startKey: startKey, endKey: endKey, results: &results, limit: limit) { return nil }
+        }
+        return results
+    }
+
+    /// Sync ascending range scan. Returns false on cache miss.
+    private func collectRangeLimitedCached(node: BTreeNode, startKey: DBValue?, endKey: DBValue?, results: inout [Row], limit: Int) -> Bool {
+        guard let (leaf, startIndex) = findLeafAndIndexCached(from: node, key: startKey) else { return false }
+        var currentLeaf: BTreeNode? = leaf
+        var i = startIndex
+        while let leaf = currentLeaf, results.count < limit {
+            while i < leaf.keys.count && results.count < limit {
+                if let end = endKey, leaf.keys[i] > end { return true }
+                results.append(leaf.values[i])
+                i += 1
+            }
+            if let nextId = leaf.nextLeafId {
+                guard let next = nodeStore.loadNodeCached(nodeId: nextId) else { return false }
+                currentLeaf = next
+                i = 0
+            } else {
+                currentLeaf = nil
+            }
+        }
+        return true
+    }
+
+    /// Sync descending range scan. Returns false on cache miss.
+    private func collectRangeReverseLimitedCached(node: BTreeNode, startKey: DBValue?, endKey: DBValue?, results: inout [Row], limit: Int) -> Bool {
+        guard let (leaf, endIndex) = findLeafAndIndexReverseCached(from: node, key: endKey) else { return false }
+        var currentLeaf: BTreeNode? = leaf
+        var i = endIndex
+        while let leaf = currentLeaf, results.count < limit {
+            while i >= 0 && results.count < limit {
+                if let start = startKey, leaf.keys[i] < start { return true }
+                results.append(leaf.values[i])
+                i -= 1
+            }
+            if let prevId = leaf.prevLeafId {
+                guard let prev = nodeStore.loadNodeCached(nodeId: prevId) else { return false }
+                currentLeaf = prev
+                i = (prev.keys.count) - 1
+            } else {
+                currentLeaf = nil
+            }
+        }
+        return true
+    }
+
+    /// Sync find leaf for ascending scan. Returns nil on cache miss.
+    private func findLeafAndIndexCached(from node: BTreeNode, key: DBValue?) -> (BTreeNode, Int)? {
+        var current = node
+        while !current.isLeaf {
+            let childIdx = key.map { lowerBound(current.keys, $0) } ?? 0
+            guard let childId = current.children?[childIdx],
+                  let child = nodeStore.loadNodeCached(nodeId: childId) else { return nil }
+            current = child
+        }
+        let startIdx = key.map { lowerBound(current.keys, $0) } ?? 0
+        return (current, startIdx)
+    }
+
+    /// Sync find leaf for descending scan. Returns nil on cache miss.
+    private func findLeafAndIndexReverseCached(from node: BTreeNode, key: DBValue?) -> (BTreeNode, Int)? {
+        var current = node
+        while !current.isLeaf {
+            let childIdx: Int
+            if let k = key {
+                childIdx = min(upperBound(current.keys, k), (current.children?.count ?? 1) - 1)
+            } else {
+                childIdx = (current.children?.count ?? 1) - 1
+            }
+            guard let childId = current.children?[childIdx],
+                  let child = nodeStore.loadNodeCached(nodeId: childId) else { return nil }
+            current = child
+        }
+        let endIdx = key.map { upperBound(current.keys, $0) - 1 } ?? (current.keys.count - 1)
+        return (current, endIdx)
+    }
+
     /// Range scan from a lower bound, collecting rows while predicate returns true.
     /// Exploits B-tree sort order: once predicate fails, no further matches exist.
     public func searchRangeWhile(from startKey: DBValue?, predicate: @Sendable (DBValue) -> Bool) async throws -> [Row] {
@@ -183,6 +274,7 @@ public final class BTree: @unchecked Sendable {
             return []
         }
         var results: [Row] = []
+        results.reserveCapacity(limit)
         if ascending {
             try await collectRangeLimited(node: root, startKey: startKey, endKey: endKey, results: &results, limit: limit)
         } else {
