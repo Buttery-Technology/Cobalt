@@ -873,16 +873,23 @@ public actor QueryExecutor: Sendable {
                     ? try await storageEngine.getPageConcurrent(pageID: pageID)
                     : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
                 var pageModified = false
+                var allPatchable = true
                 for (newRecord, updatedRow) in updates {
-                    if page.replaceRecord(id: newRecord.id, with: newRecord) {
+                    // Try same-size patch first (patches data buffer immediately)
+                    if page.replaceRecordAndPatch(id: newRecord.id, with: newRecord) {
                         pageModified = true
+                    } else if page.replaceRecord(id: newRecord.id, with: newRecord) {
+                        pageModified = true
+                        allPatchable = false
                     } else {
                         try await storageEngine.deleteRecord(id: newRecord.id, tableName: table, transactionContext: transactionContext, knownPageID: pageID)
                         try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
+                        allPatchable = false
                     }
                     updatedCount += 1
                 }
                 if pageModified {
+                    if !allPatchable { page.allPatched = false }
                     if transactionContext == nil {
                         try await storageEngine.savePageDeferred(page)
                     } else {
@@ -910,6 +917,7 @@ public actor QueryExecutor: Sendable {
                 ? try await storageEngine.getPageConcurrent(pageID: pageID)
                 : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
             var pageModified = false
+            var allPatchable = true
             var overflowUpdates: [(Record, Row)]  = [] // records that couldn't be replaced in-place
 
             for var record in page.records {
@@ -932,16 +940,21 @@ public actor QueryExecutor: Sendable {
                     let rowData = updateSchema != nil ? updatedRow.toBytesPositional(schema: updateSchema!) : updatedRow.toBytes()
                     let newRecord = Record(id: record.id, data: rowData)
 
-                    if page.replaceRecord(id: record.id, with: newRecord) {
+                    if page.replaceRecordAndPatch(id: record.id, with: newRecord) {
                         pageModified = true
+                    } else if page.replaceRecord(id: record.id, with: newRecord) {
+                        pageModified = true
+                        allPatchable = false
                     } else {
                         overflowUpdates.append((newRecord, updatedRow))
+                        allPatchable = false
                     }
                     updatedCount += 1
                 }
             }
 
             if pageModified {
+                if !allPatchable { page.allPatched = false }
                 if transactionContext == nil {
                     try await storageEngine.savePageDeferred(page)
                 } else {
