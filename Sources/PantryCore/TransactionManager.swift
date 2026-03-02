@@ -10,9 +10,9 @@ public actor TransactionManager: Sendable {
     /// MVCC: global monotonic version counter, incremented on each commit
     private var globalVersion: UInt64 = 0
 
-    /// Write conflict index: recordID → set of txIDs that have written it
-    /// Enables O(n) conflict detection instead of O(n*m)
-    private var recordWriteOwners: [UInt64: Set<UInt64>] = [:]
+    /// Write conflict index: recordID → txID of the single active writer.
+    /// First-writer-wins: if a second txn tries to write the same record, it's a conflict.
+    private var recordWriteOwners: [UInt64: UInt64] = [:]
 
     /// MVCC: tracks the lowest snapshot version still in use by an active transaction.
     /// Versions below this are safe for garbage collection. Updated on begin/commit/rollback.
@@ -90,26 +90,19 @@ public actor TransactionManager: Sendable {
         }
     }
 
-    /// Register a record write for conflict tracking
-    public func registerWrite(txID: UInt64, recordID: UInt64) {
-        recordWriteOwners[recordID, default: []].insert(txID)
+    /// Register a record write for conflict tracking.
+    /// First-writer-wins: if another active txn already owns this record, throws immediately.
+    public func registerWrite(txID: UInt64, recordID: UInt64) throws {
+        if let existingOwner = recordWriteOwners[recordID], existingOwner != txID {
+            throw PantryError.writeWriteConflict
+        }
+        recordWriteOwners[recordID] = txID
     }
 
-    /// MVCC: detect write-write conflicts using the conflict index — O(n) per commit
+    /// MVCC: detect write-write conflicts — now a no-op since conflicts are caught eagerly in registerWrite.
     private func detectWriteWriteConflicts(_ txContext: TransactionContext) async throws {
-        let myWrittenIDs = await txContext.writtenRecordIDs
-        guard !myWrittenIDs.isEmpty else { return }
-
-        let myTxID = txContext.transactionID
-        for recordID in myWrittenIDs {
-            if let owners = recordWriteOwners[recordID] {
-                // Conflict if another active transaction also wrote this record
-                let otherWriters = owners.subtracting([myTxID])
-                if !otherWriters.isEmpty {
-                    throw PantryError.writeWriteConflict
-                }
-            }
-        }
+        // Conflicts are detected eagerly at write time via registerWrite().
+        // This method is retained for the commit path but no work is needed.
     }
 
     public func rollbackTransaction(_ txContext: TransactionContext) async throws {
@@ -136,8 +129,7 @@ public actor TransactionManager: Sendable {
     /// Remove a transaction's entries from the conflict index
     private func cleanupConflictIndex(txID: UInt64, writtenIDs: Set<UInt64>) {
         for recordID in writtenIDs {
-            recordWriteOwners[recordID]?.remove(txID)
-            if recordWriteOwners[recordID]?.isEmpty == true {
+            if recordWriteOwners[recordID] == txID {
                 recordWriteOwners.removeValue(forKey: recordID)
             }
         }
