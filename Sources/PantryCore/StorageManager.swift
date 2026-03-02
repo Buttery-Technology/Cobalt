@@ -156,6 +156,67 @@ public final class StorageManager: Sendable {
         return page
     }
 
+    /// Read multiple pages in a single I/O operation when they are contiguous.
+    /// Groups page IDs into contiguous runs and issues one pread per run.
+    public func readPages(pageIDs: [Int]) throws -> [DatabasePage] {
+        guard !pageIDs.isEmpty else { return [] }
+        let fileFD = try requireFD()
+
+        // Sort and group into contiguous runs
+        let sorted = pageIDs.sorted()
+        var pages = [DatabasePage]()
+        pages.reserveCapacity(sorted.count)
+
+        var runStart = sorted[0]
+        var runCount = 1
+
+        func readRun(start: Int, count: Int) throws {
+            let totalBytes = count * diskPageSize
+            let offset = off_t(start) * off_t(diskPageSize)
+            var rawData = Data(count: totalBytes)
+            let bytesRead = rawData.withUnsafeMutableBytes { rawBuf -> Int in
+                guard let baseAddr = rawBuf.baseAddress else { return 0 }
+                return pread(fileFD, baseAddr, totalBytes, offset)
+            }
+            guard bytesRead == totalBytes else {
+                // Fallback to individual reads on partial read
+                for i in 0..<count {
+                    pages.append(try readPage(pageID: start + i))
+                }
+                return
+            }
+            for i in 0..<count {
+                let pageStart = i * diskPageSize
+                let pageEnd = pageStart + diskPageSize
+                let pageSlice = rawData.subdata(in: pageStart..<pageEnd)
+
+                let pageData: Data
+                if let provider = encryptionProvider {
+                    pageData = try provider.decrypt(pageSlice)
+                } else {
+                    pageData = pageSlice
+                }
+
+                var page = DatabasePage(pageID: start + i, data: pageData)
+                page.loadRecords()
+                pages.append(page)
+            }
+        }
+
+        for idx in 1..<sorted.count {
+            if sorted[idx] == sorted[idx - 1] + 1 {
+                runCount += 1
+            } else {
+                try readRun(start: runStart, count: runCount)
+                runStart = sorted[idx]
+                runCount = 1
+            }
+        }
+        try readRun(start: runStart, count: runCount)
+
+        return pages
+    }
+
     /// Flush pending writes to disk
     public func sync() throws {
         let fileFD = try requireFD()

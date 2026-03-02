@@ -19,11 +19,13 @@ private struct QueryResultCacheKey: Hashable {
     let modifiersSignature: String
 }
 
-/// Cached query result with generation tracking
+/// Cached query result with generation tracking and page-level invalidation
 private struct CachedQueryResult {
     let rows: [Row]
     let generation: UInt64
     var lastAccess: UInt64
+    /// Pages accessed to produce this result. nil = unknown (conservative invalidation).
+    let accessedPages: Set<Int>?
 }
 
 /// Executes SELECT, INSERT, UPDATE, DELETE queries against the storage engine.
@@ -66,10 +68,20 @@ public actor QueryExecutor: Sendable {
         planner.invalidateCache(forTable: table)
     }
 
-    /// Invalidate result cache for a specific table (called after mutations)
-    private func invalidateResultCache(forTable table: String) {
+    /// Invalidate result cache for a specific table (called after mutations).
+    /// If modifiedPages is provided, only entries whose accessed pages overlap are invalidated.
+    private func invalidateResultCache(forTable table: String, modifiedPages: Set<Int>? = nil) {
         tableGenerations[table, default: 0] += 1
-        resultCache = resultCache.filter { $0.key.table != table }
+        if let modified = modifiedPages {
+            resultCache = resultCache.filter { entry in
+                guard entry.key.table == table else { return true }
+                // If entry has no page tracking (nil), conservatively invalidate
+                guard let accessed = entry.value.accessedPages else { return false }
+                return accessed.isDisjoint(with: modified)
+            }
+        } else {
+            resultCache = resultCache.filter { $0.key.table != table }
+        }
     }
 
     /// Look up a cached query result, returns nil on miss or stale generation
@@ -84,7 +96,7 @@ public actor QueryExecutor: Sendable {
     }
 
     /// Store a query result in the cache with LRU eviction
-    private func storeResultCache(key: QueryResultCacheKey, rows: [Row]) {
+    private func storeResultCache(key: QueryResultCacheKey, rows: [Row], accessedPages: Set<Int>? = nil) {
         // Don't cache very large result sets (>10K rows)
         guard rows.count <= 10_000 else { return }
 
@@ -100,7 +112,8 @@ public actor QueryExecutor: Sendable {
         resultCache[key] = CachedQueryResult(
             rows: rows,
             generation: tableGenerations[key.table, default: 0],
-            lastAccess: resultCacheCounter
+            lastAccess: resultCacheCounter,
+            accessedPages: accessedPages
         )
     }
 
@@ -203,6 +216,10 @@ public actor QueryExecutor: Sendable {
             return needed.isEmpty ? nil : needed
         }()
 
+        // Projected decode: only when explicit columns are requested (not SELECT *)
+        // so we don't lose unselected columns that downstream code might need.
+        let projectCols: Set<String>? = (columns != nil) ? overflowNeededColumns : nil
+
         switch plan {
         case .indexOnlyScan:
             if let condition = condition,
@@ -214,7 +231,7 @@ public actor QueryExecutor: Sendable {
                 }
                 if let scanLimit = scanLimit { rows = Array(rows.prefix(scanLimit)) }
             } else {
-                rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, schema: selectSchema, transactionContext: transactionContext)
+                rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, projectColumns: projectCols, schema: selectSchema, transactionContext: transactionContext)
             }
 
         case .indexScan:
@@ -230,11 +247,11 @@ public actor QueryExecutor: Sendable {
                     .filter { evaluateCondition(condition, row: $0) }
                 if let scanLimit = scanLimit { rows = Array(rows.prefix(scanLimit)) }
             } else {
-                rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, schema: selectSchema, transactionContext: transactionContext)
+                rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, projectColumns: projectCols, schema: selectSchema, transactionContext: transactionContext)
             }
 
         case .tableScan:
-            rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, schema: selectSchema, transactionContext: transactionContext)
+            rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, projectColumns: projectCols, schema: selectSchema, transactionContext: transactionContext)
         }
 
         // Apply query modifiers: DISTINCT, ORDER BY, OFFSET, LIMIT
@@ -280,11 +297,13 @@ public actor QueryExecutor: Sendable {
                 }
                 return Row(values: projectedValues)
             }
-            if let key = cacheKey { storeResultCache(key: key, rows: projected) }
+            let scannedPages = Set(pageIDs)
+            if let key = cacheKey { storeResultCache(key: key, rows: projected, accessedPages: scannedPages) }
             return projected
         }
 
-        if let key = cacheKey { storeResultCache(key: key, rows: rows) }
+        let scannedPages = Set(pageIDs)
+        if let key = cacheKey { storeResultCache(key: key, rows: rows, accessedPages: scannedPages) }
         return rows
     }
 
@@ -717,6 +736,7 @@ public actor QueryExecutor: Sendable {
             let fullRecords = try await storageEngine.getRecordsByIDsWithPages(matchingRIDs, tableName: table, transactionContext: transactionContext)
 
             var updatedCount = 0
+            var modifiedPages = Set<Int>()
             for (record, row, recordPageID) in fullRecords where evaluateCondition(condition, row: row) {
                 var updatedValues = row.values
                 for (key, value) in values { updatedValues[key] = value }
@@ -729,9 +749,10 @@ public actor QueryExecutor: Sendable {
                     try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext, knownPageID: recordPageID)
                     try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
                 }
+                modifiedPages.insert(recordPageID)
                 updatedCount += 1
             }
-            if updatedCount > 0 { invalidateResultCache(forTable: table) }
+            if updatedCount > 0 { invalidateResultCache(forTable: table, modifiedPages: modifiedPages) }
             return updatedCount
         }
 
@@ -788,39 +809,57 @@ public actor QueryExecutor: Sendable {
             let fullRecords = try await storageEngine.getRecordsByIDsWithPages(matchingRIDs, tableName: table, transactionContext: transactionContext)
 
             var deletedCount = 0
+            var modifiedPages = Set<Int>()
             for (record, row, recordPageID) in fullRecords where evaluateCondition(condition, row: row) {
                 try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext, knownPageID: recordPageID)
+                modifiedPages.insert(recordPageID)
                 deletedCount += 1
             }
-            if deletedCount > 0 { invalidateResultCache(forTable: table) }
+            if deletedCount > 0 { invalidateResultCache(forTable: table, modifiedPages: modifiedPages) }
             return deletedCount
         }
 
-        // Table scan path
+        // Table scan path — walk pages directly, collect matching records, batch-delete per page
         let deleteSchema = storageEngine.getTableSchema(table)
-        let rawRecords = try await storageEngine.scanTableRaw(table, transactionContext: transactionContext)
-        var deletedCount = 0
         let deleteColMap = deleteSchema?.columnOrdinals
 
-        for (record, data) in rawRecords {
-            if condition == nil {
-                try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
-                deletedCount += 1
-            } else {
-                // Lazy filter: skip full row decode for non-matching records
-                if let colMap = deleteColMap {
-                    if let lazyResult = evaluateConditionLazy(condition!, data: data, columnIndexMap: colMap) {
-                        if !lazyResult { continue }
+        var matchingRecords: [(id: UInt64, pageID: Int, row: Row?)] = []
+        for pageID in pageIDs {
+            let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+            for var record in page.records {
+                if condition == nil {
+                    // Unconditional delete — decode row for index removal
+                    let row: Row?
+                    if record.isOverflow {
+                        let full = try await storageEngine.reassembleOverflowRecord(record)
+                        row = Row.fromBytesAuto(full.data, schema: deleteSchema)
+                    } else {
+                        row = Row.fromBytesAuto(record.data, schema: deleteSchema)
                     }
+                    matchingRecords.append((id: record.id, pageID: pageID, row: row))
+                } else {
+                    var data = record.data
+                    if record.isOverflow {
+                        record = try await storageEngine.reassembleOverflowRecord(record)
+                        data = record.data
+                    }
+                    if let colMap = deleteColMap {
+                        if let lazyResult = evaluateConditionLazy(condition!, data: data, columnIndexMap: colMap) {
+                            if !lazyResult { continue }
+                        }
+                    }
+                    guard let row = Row.fromBytesAuto(data, schema: deleteSchema), evaluateCondition(condition!, row: row) else { continue }
+                    matchingRecords.append((id: record.id, pageID: pageID, row: row))
                 }
-                guard let row = Row.fromBytesAuto(data, schema: deleteSchema), evaluateCondition(condition!, row: row) else { continue }
-                try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
-                deletedCount += 1
             }
         }
 
-        if deletedCount > 0 { invalidateResultCache(forTable: table) }
-        return deletedCount
+        if !matchingRecords.isEmpty {
+            try await storageEngine.deleteRecordsBatch(matchingRecords, tableName: table, transactionContext: transactionContext)
+            let modifiedPages = Set(matchingRecords.map { $0.pageID })
+            invalidateResultCache(forTable: table, modifiedPages: modifiedPages)
+        }
+        return matchingRecords.count
     }
 
     // MARK: - AGGREGATE
@@ -1562,7 +1601,15 @@ public actor QueryExecutor: Sendable {
 
     // MARK: - Parallel Table Scan
 
-    private func parallelTableScan(pageIDs: [Int], condition: WhereCondition?, limit: Int? = nil, neededColumns: Set<String>? = nil, schema: PantryTableSchema? = nil, transactionContext: TransactionContext?) async throws -> [Row] {
+    /// Decode a row, using projected decode when possible for fewer allocations.
+    private nonisolated func decodeRow(_ data: Data, schema: PantryTableSchema?, neededColumns: Set<String>?) -> Row? {
+        if let schema = schema, let needed = neededColumns {
+            return Row.fromBytesProjectedV3(data, schema: schema, neededColumns: needed)
+        }
+        return Row.fromBytesAuto(data, schema: schema)
+    }
+
+    private func parallelTableScan(pageIDs: [Int], condition: WhereCondition?, limit: Int? = nil, neededColumns: Set<String>? = nil, projectColumns: Set<String>? = nil, schema: PantryTableSchema? = nil, transactionContext: TransactionContext?) async throws -> [Row] {
         if let condition = condition {
             let conditionColumns = columnsReferenced(in: condition)
             let useLazy = conditionColumns.count <= 3
@@ -1598,11 +1645,11 @@ public actor QueryExecutor: Sendable {
                             record = try await storageEngine.reassembleOverflowRecord(record)
                         }
                         if useLazy, let result = evaluateConditionLazy(condition, data: record.data, columnIndexMap: columnIndexMap) {
-                            if result, let row = Row.fromBytesAuto(record.data, schema: schema) {
+                            if result, let row = decodeRow(record.data, schema: schema, neededColumns: projectColumns) {
                                 rows.append(row)
                                 if rows.count >= limit { return rows }
                             }
-                        } else if let row = Row.fromBytesAuto(record.data, schema: schema), evaluateCondition(condition, row: row) {
+                        } else if let row = decodeRow(record.data, schema: schema, neededColumns: projectColumns), evaluateCondition(condition, row: row) {
                             rows.append(row)
                             if rows.count >= limit { return rows }
                         }
@@ -1622,10 +1669,11 @@ public actor QueryExecutor: Sendable {
                     let chunkPageIDs = Array(pageIDs[start..<end])
                     group.addTask { [storageEngine] in
                         var chunkRows: [Row] = []
-                        for pageID in chunkPageIDs {
-                            let page = useConcurrent
-                                ? try await storageEngine.getPageConcurrent(pageID: pageID)
-                                : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+                        // Batch read all pages in this chunk
+                        let chunkPages: [DatabasePage] = useConcurrent
+                            ? try await storageEngine.getPagesConcurrent(pageIDs: chunkPageIDs)
+                            : try await { var p = [DatabasePage](); for id in chunkPageIDs { p.append(try await storageEngine.getPage(pageID: id, transactionContext: transactionContext)) }; return p }()
+                        for page in chunkPages {
                             for var record in page.records {
                                 if record.isOverflow {
                                     if let needed = neededColumns,
@@ -1638,10 +1686,10 @@ public actor QueryExecutor: Sendable {
                                     record = try await storageEngine.reassembleOverflowRecord(record)
                                 }
                                 if useLazy, let result = self.evaluateConditionLazy(condition, data: record.data, columnIndexMap: columnIndexMap) {
-                                    if result, let row = Row.fromBytesAuto(record.data, schema: schema) {
+                                    if result, let row = self.decodeRow(record.data, schema: schema, neededColumns: projectColumns) {
                                         chunkRows.append(row)
                                     }
-                                } else if let row = Row.fromBytesAuto(record.data, schema: schema), self.evaluateCondition(condition, row: row) {
+                                } else if let row = self.decodeRow(record.data, schema: schema, neededColumns: projectColumns), self.evaluateCondition(condition, row: row) {
                                     chunkRows.append(row)
                                 }
                             }
@@ -1670,7 +1718,7 @@ public actor QueryExecutor: Sendable {
                             }
                             record = try await storageEngine.reassembleOverflowRecord(record)
                         }
-                        if let row = Row.fromBytesAuto(record.data, schema: schema) {
+                        if let row = decodeRow(record.data, schema: schema, neededColumns: projectColumns) {
                             rows.append(row)
                             if rows.count >= limit { return rows }
                         }
@@ -1690,10 +1738,10 @@ public actor QueryExecutor: Sendable {
                     let chunkPageIDs = Array(pageIDs[start..<end])
                     group.addTask { [storageEngine, schema] in
                         var chunkRows: [Row] = []
-                        for pageID in chunkPageIDs {
-                            let page = useConcurrent
-                                ? try await storageEngine.getPageConcurrent(pageID: pageID)
-                                : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+                        let chunkPages: [DatabasePage] = useConcurrent
+                            ? try await storageEngine.getPagesConcurrent(pageIDs: chunkPageIDs)
+                            : try await { var p = [DatabasePage](); for id in chunkPageIDs { p.append(try await storageEngine.getPage(pageID: id, transactionContext: transactionContext)) }; return p }()
+                        for page in chunkPages {
                             for var record in page.records {
                                 if record.isOverflow {
                                     if let needed = neededColumns,
@@ -1703,7 +1751,7 @@ public actor QueryExecutor: Sendable {
                                     }
                                     record = try await storageEngine.reassembleOverflowRecord(record)
                                 }
-                                if let row = Row.fromBytesAuto(record.data, schema: schema) {
+                                if let row = self.decodeRow(record.data, schema: schema, neededColumns: projectColumns) {
                                     chunkRows.append(row)
                                 }
                             }

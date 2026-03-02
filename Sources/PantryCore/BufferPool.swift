@@ -385,6 +385,52 @@ public final class BufferPoolManager: Sendable {
         }
     }
 
+    // MARK: - Batch Page Read
+
+    /// Read multiple pages, returning cached pages and batch-reading cache misses.
+    /// Returns pages in the same order as input pageIDs.
+    public func getPages(pageIDs: [Int]) async throws -> [DatabasePage] {
+        // Partition into hits and misses
+        var result = [DatabasePage?](repeating: nil, count: pageIDs.count)
+        var missIndices: [Int] = []  // indices into pageIDs array
+        var missPageIDs: [Int] = []  // actual page IDs to read
+
+        for (i, pageID) in pageIDs.enumerated() {
+            let s = stripe(for: pageID)
+            let cached: DatabasePage? = s.withLock { st in
+                if let page = st.pageCache[pageID] {
+                    st.referenced.insert(pageID)
+                    st.hitCount += 1
+                    return page
+                }
+                st.missCount += 1
+                return nil
+            }
+            if let cached {
+                result[i] = cached
+            } else {
+                missIndices.append(i)
+                missPageIDs.append(pageID)
+            }
+        }
+
+        // Batch read all misses
+        if !missPageIDs.isEmpty {
+            let readPages = try storageManager.readPages(pageIDs: missPageIDs)
+            // readPages returns in sorted order; map back to miss indices
+            var pageByID = [Int: DatabasePage]()
+            for page in readPages {
+                pageByID[page.pageID] = page
+                try await addToCache(page)
+            }
+            for i in missIndices {
+                result[i] = pageByID[pageIDs[i]]
+            }
+        }
+
+        return result.compactMap { $0 }
+    }
+
     // MARK: - Prefetching
 
     /// Prefetch pages into the buffer pool asynchronously.
