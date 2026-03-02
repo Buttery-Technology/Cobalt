@@ -142,6 +142,16 @@ public actor StorageEngine: Sendable {
         return loadedPage
     }
 
+    /// Non-actor read path: checks buffer pool cache first (no actor hop needed for hits).
+    /// Falls back to actor-isolated getPage on cache miss.
+    /// Use for read-only parallel scans where transaction tracking is not needed.
+    public nonisolated func getPageConcurrent(pageID: Int) async throws -> DatabasePage {
+        if let cachedPage = bufferPoolManager.getCachedPage(pageID: pageID) {
+            return cachedPage
+        }
+        return try await getPage(pageID: pageID)
+    }
+
     public func savePage(_ page: DatabasePage, transactionContext: TransactionContext? = nil, skipAfterImage: Bool = false) async throws {
         var beforePageData: Data? = nil
 
@@ -353,13 +363,21 @@ public actor StorageEngine: Sendable {
         return record
     }
 
-    public func deleteRecord(id: UInt64, tableName: String, transactionContext: TransactionContext? = nil) async throws {
+    /// Delete a record, optionally skipping the page scan if pageID is known.
+    public func deleteRecord(id: UInt64, tableName: String, transactionContext: TransactionContext? = nil, knownPageID: Int? = nil) async throws {
         guard tableRegistry.getTableInfo(name: tableName) != nil else {
             throw PantryError.tableNotFound(name: tableName)
         }
 
-        let pageID = try await findPageContainingRecord(id: id, tableName: tableName)
-        var page = try await getPage(pageID: pageID, transactionContext: transactionContext)
+        let pageID: Int
+        let foundPage: DatabasePage
+        if let known = knownPageID {
+            pageID = known
+            foundPage = try await getPage(pageID: known, transactionContext: transactionContext)
+        } else {
+            (pageID, foundPage) = try await findPageContainingRecord(id: id, tableName: tableName)
+        }
+        var page = foundPage
 
         // Decode the row before deletion so indexes can be updated
         // Also check for overflow pages that need to be freed
@@ -418,9 +436,17 @@ public actor StorageEngine: Sendable {
 
     /// Try to replace a record in-place on its current page. Returns true if successful.
     /// Falls back to false when: record not found, new data doesn't fit, or record is overflow.
-    public func replaceRecordInPlace(id: UInt64, newRecord: Record, tableName: String, transactionContext: TransactionContext? = nil) async throws -> Bool {
-        let pageID = try await findPageContainingRecord(id: id, tableName: tableName)
-        var page = try await getPage(pageID: pageID, transactionContext: transactionContext)
+    /// Pass `knownPageID` to skip the sequential scan for the record's page.
+    public func replaceRecordInPlace(id: UInt64, newRecord: Record, tableName: String, transactionContext: TransactionContext? = nil, knownPageID: Int? = nil) async throws -> Bool {
+        let pageID: Int
+        let foundPage: DatabasePage
+        if let known = knownPageID {
+            pageID = known
+            foundPage = try await getPage(pageID: known, transactionContext: transactionContext)
+        } else {
+            (pageID, foundPage) = try await findPageContainingRecord(id: id, tableName: tableName)
+        }
+        var page = foundPage
 
         // Don't attempt in-place for overflow records
         if let existing = page.records.first(where: { $0.id == id }), existing.isOverflow {
@@ -531,6 +557,7 @@ public actor StorageEngine: Sendable {
 
     /// Batch lookup: fetch full (Record, Row) pairs for a set of record IDs in a single table scan.
     /// Much more efficient than N individual getRecord calls.
+    /// Uses concurrent page reads when no transaction context.
     /// Pass `neededColumns` to enable lazy overflow loading.
     public func getRecordsByIDs(_ ids: Set<UInt64>, tableName: String, transactionContext: TransactionContext? = nil, neededColumns: Set<String>? = nil) async throws -> [(Record, Row)] {
         guard let tableInfo = tableRegistry.getTableInfo(name: tableName) else {
@@ -540,31 +567,126 @@ public actor StorageEngine: Sendable {
         let idsSchema = tableInfo.schema
         var remaining = ids
         var results: [(Record, Row)] = []
-        var currentPageID = tableInfo.firstPageID
-        var visited: Set<Int> = []
 
-        while currentPageID != 0 && !remaining.isEmpty {
-            guard visited.insert(currentPageID).inserted else {
-                throw PantryError.corruptPage(pageID: currentPageID)
-            }
-            let page = try await getPage(pageID: currentPageID, transactionContext: transactionContext)
-            for var record in page.records {
-                guard remaining.contains(record.id) else { continue }
-                if record.isOverflow {
-                    if let needed = neededColumns,
-                       let partialRow = Row.fromBytesPartial(record.data, neededColumns: needed) {
-                        results.append((record, partialRow))
-                        remaining.remove(record.id)
-                        continue
+        // Use cached page list for faster iteration
+        let pageIDs = tableInfo.pageList ?? []
+
+        if !pageIDs.isEmpty {
+            for currentPageID in pageIDs {
+                guard !remaining.isEmpty else { break }
+                let page = transactionContext == nil
+                    ? try await getPageConcurrent(pageID: currentPageID)
+                    : try await getPage(pageID: currentPageID, transactionContext: transactionContext)
+                for var record in page.records {
+                    guard remaining.contains(record.id) else { continue }
+                    if record.isOverflow {
+                        if let needed = neededColumns,
+                           let partialRow = Row.fromBytesPartial(record.data, neededColumns: needed) {
+                            results.append((record, partialRow))
+                            remaining.remove(record.id)
+                            continue
+                        }
+                        record = try await reassembleOverflowRecord(record)
                     }
-                    record = try await reassembleOverflowRecord(record)
-                }
-                if let row = Row.fromBytesAuto(record.data, schema: idsSchema) {
-                    results.append((record, row))
-                    remaining.remove(record.id)
+                    if let row = Row.fromBytesAuto(record.data, schema: idsSchema) {
+                        results.append((record, row))
+                        remaining.remove(record.id)
+                    }
                 }
             }
-            currentPageID = page.nextPageID
+        } else {
+            // Fallback: walk linked list
+            var currentPageID = tableInfo.firstPageID
+            var visited: Set<Int> = []
+            while currentPageID != 0 && !remaining.isEmpty {
+                guard visited.insert(currentPageID).inserted else {
+                    throw PantryError.corruptPage(pageID: currentPageID)
+                }
+                let page = try await getPage(pageID: currentPageID, transactionContext: transactionContext)
+                for var record in page.records {
+                    guard remaining.contains(record.id) else { continue }
+                    if record.isOverflow {
+                        if let needed = neededColumns,
+                           let partialRow = Row.fromBytesPartial(record.data, neededColumns: needed) {
+                            results.append((record, partialRow))
+                            remaining.remove(record.id)
+                            continue
+                        }
+                        record = try await reassembleOverflowRecord(record)
+                    }
+                    if let row = Row.fromBytesAuto(record.data, schema: idsSchema) {
+                        results.append((record, row))
+                        remaining.remove(record.id)
+                    }
+                }
+                currentPageID = page.nextPageID
+            }
+        }
+
+        return results
+    }
+
+    /// Batch lookup returning (Record, Row, pageID) tuples for direct page access in DELETE/UPDATE.
+    /// Uses cached page list and concurrent reads when available.
+    public func getRecordsByIDsWithPages(_ ids: Set<UInt64>, tableName: String, transactionContext: TransactionContext? = nil, neededColumns: Set<String>? = nil) async throws -> [(Record, Row, Int)] {
+        guard let tableInfo = tableRegistry.getTableInfo(name: tableName) else {
+            throw PantryError.tableNotFound(name: tableName)
+        }
+
+        let idsSchema = tableInfo.schema
+        var remaining = ids
+        var results: [(Record, Row, Int)] = []
+        let pageIDs = tableInfo.pageList ?? []
+
+        if !pageIDs.isEmpty {
+            for currentPageID in pageIDs {
+                guard !remaining.isEmpty else { break }
+                let page = transactionContext == nil
+                    ? try await getPageConcurrent(pageID: currentPageID)
+                    : try await getPage(pageID: currentPageID, transactionContext: transactionContext)
+                for var record in page.records {
+                    guard remaining.contains(record.id) else { continue }
+                    if record.isOverflow {
+                        if let needed = neededColumns,
+                           let partialRow = Row.fromBytesPartial(record.data, neededColumns: needed) {
+                            results.append((record, partialRow, currentPageID))
+                            remaining.remove(record.id)
+                            continue
+                        }
+                        record = try await reassembleOverflowRecord(record)
+                    }
+                    if let row = Row.fromBytesAuto(record.data, schema: idsSchema) {
+                        results.append((record, row, currentPageID))
+                        remaining.remove(record.id)
+                    }
+                }
+            }
+        } else {
+            var currentPageID = tableInfo.firstPageID
+            var visited: Set<Int> = []
+            while currentPageID != 0 && !remaining.isEmpty {
+                guard visited.insert(currentPageID).inserted else {
+                    throw PantryError.corruptPage(pageID: currentPageID)
+                }
+                let page = try await getPage(pageID: currentPageID, transactionContext: transactionContext)
+                for var record in page.records {
+                    guard remaining.contains(record.id) else { continue }
+                    if record.isOverflow {
+                        if let needed = neededColumns,
+                           let partialRow = Row.fromBytesPartial(record.data, neededColumns: needed) {
+                            results.append((record, partialRow, currentPageID))
+                            remaining.remove(record.id)
+                            continue
+                        }
+                        record = try await reassembleOverflowRecord(record)
+                    }
+                    if let row = Row.fromBytesAuto(record.data, schema: idsSchema) {
+                        results.append((record, row, currentPageID))
+                        remaining.remove(record.id)
+                    }
+                }
+                currentPageID = page.nextPageID
+            }
         }
 
         return results
@@ -954,7 +1076,7 @@ public actor StorageEngine: Sendable {
         throw PantryError.recordNotFound(id: id)
     }
 
-    private func findPageContainingRecord(id: UInt64, tableName: String) async throws -> Int {
+    private func findPageContainingRecord(id: UInt64, tableName: String) async throws -> (Int, DatabasePage) {
         guard let tableInfo = tableRegistry.getTableInfo(name: tableName) else {
             throw PantryError.tableNotFound(name: tableName)
         }
@@ -967,7 +1089,7 @@ public actor StorageEngine: Sendable {
             }
             let page = try await getPage(pageID: currentPageID)
             if page.records.contains(where: { $0.id == id }) {
-                return currentPageID
+                return (currentPageID, page)
             }
             currentPageID = page.nextPageID
         }

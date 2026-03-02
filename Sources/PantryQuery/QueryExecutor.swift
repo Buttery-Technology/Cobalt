@@ -242,7 +242,7 @@ public actor QueryExecutor: Sendable {
             }
 
             if let orderBy = mods.orderBy, !orderBy.isEmpty {
-                rows.sort { a, b in
+                let comparator: (Row, Row) -> Bool = { a, b in
                     for clause in orderBy {
                         let aVal = a.values[clause.column] ?? .null
                         let bVal = b.values[clause.column] ?? .null
@@ -251,6 +251,14 @@ public actor QueryExecutor: Sendable {
                         return clause.direction == .ascending ? less : !less
                     }
                     return false
+                }
+
+                // Top-N optimization: when LIMIT is set, use bounded heap instead of full sort
+                let totalNeeded = (mods.limit ?? Int.max) + (mods.offset ?? 0)
+                if totalNeeded < rows.count && totalNeeded < Int.max {
+                    rows = topN(rows, n: totalNeeded, by: comparator)
+                } else {
+                    rows.sort(by: comparator)
                 }
             }
 
@@ -665,19 +673,19 @@ public actor QueryExecutor: Sendable {
                 guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
                 return UInt64(bitPattern: ridSigned)
             })
-            let fullRecords = try await storageEngine.getRecordsByIDs(matchingRIDs, tableName: table, transactionContext: transactionContext)
+            let fullRecords = try await storageEngine.getRecordsByIDsWithPages(matchingRIDs, tableName: table, transactionContext: transactionContext)
 
             var updatedCount = 0
-            for (record, row) in fullRecords where evaluateCondition(condition, row: row) {
+            for (record, row, recordPageID) in fullRecords where evaluateCondition(condition, row: row) {
                 var updatedValues = row.values
                 for (key, value) in values { updatedValues[key] = value }
                 let updatedRow = Row(values: updatedValues)
 
                 let rowData = updateSchema != nil ? updatedRow.toBytesPositional(schema: updateSchema!) : updatedRow.toBytes()
                 let newRecord = Record(id: record.id, data: rowData)
-                let replaced = try await storageEngine.replaceRecordInPlace(id: record.id, newRecord: newRecord, tableName: table, transactionContext: transactionContext)
+                let replaced = try await storageEngine.replaceRecordInPlace(id: record.id, newRecord: newRecord, tableName: table, transactionContext: transactionContext, knownPageID: recordPageID)
                 if !replaced {
-                    try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
+                    try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext, knownPageID: recordPageID)
                     try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
                 }
                 updatedCount += 1
@@ -727,11 +735,11 @@ public actor QueryExecutor: Sendable {
                 guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
                 return UInt64(bitPattern: ridSigned)
             })
-            let fullRecords = try await storageEngine.getRecordsByIDs(matchingRIDs, tableName: table, transactionContext: transactionContext)
+            let fullRecords = try await storageEngine.getRecordsByIDsWithPages(matchingRIDs, tableName: table, transactionContext: transactionContext)
 
             var deletedCount = 0
-            for (record, row) in fullRecords where evaluateCondition(condition, row: row) {
-                try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
+            for (record, row, recordPageID) in fullRecords where evaluateCondition(condition, row: row) {
+                try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext, knownPageID: recordPageID)
                 deletedCount += 1
             }
             if deletedCount > 0 { invalidateResultCache(forTable: table) }
@@ -1479,6 +1487,7 @@ public actor QueryExecutor: Sendable {
 
             let cpuCount = max(1, ProcessInfo.processInfo.activeProcessorCount)
             let chunkCount = max(1, min(pageIDs.count, cpuCount))
+            let useConcurrent = transactionContext == nil
             return try await withThrowingTaskGroup(of: (Int, [Row]).self) { group in
                 for chunkIdx in 0..<chunkCount {
                     let start = chunkIdx * pageIDs.count / chunkCount
@@ -1488,7 +1497,9 @@ public actor QueryExecutor: Sendable {
                     group.addTask { [storageEngine] in
                         var chunkRows: [Row] = []
                         for pageID in chunkPageIDs {
-                            let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+                            let page = useConcurrent
+                                ? try await storageEngine.getPageConcurrent(pageID: pageID)
+                                : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
                             for var record in page.records {
                                 if record.isOverflow {
                                     if let needed = neededColumns,
@@ -1544,6 +1555,7 @@ public actor QueryExecutor: Sendable {
 
             let cpuCount = max(1, ProcessInfo.processInfo.activeProcessorCount)
             let chunkCount = max(1, min(pageIDs.count, cpuCount))
+            let useConcurrent = transactionContext == nil
             return try await withThrowingTaskGroup(of: (Int, [Row]).self) { group in
                 for chunkIdx in 0..<chunkCount {
                     let start = chunkIdx * pageIDs.count / chunkCount
@@ -1553,7 +1565,9 @@ public actor QueryExecutor: Sendable {
                     group.addTask { [storageEngine, schema] in
                         var chunkRows: [Row] = []
                         for pageID in chunkPageIDs {
-                            let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+                            let page = useConcurrent
+                                ? try await storageEngine.getPageConcurrent(pageID: pageID)
+                                : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
                             for var record in page.records {
                                 if record.isOverflow {
                                     if let needed = neededColumns,
@@ -1575,6 +1589,56 @@ public actor QueryExecutor: Sendable {
                 for try await result in group { indexed.append(result) }
                 return indexed.sorted { $0.0 < $1.0 }.flatMap { $0.1 }
             }
+        }
+    }
+
+    // MARK: - Top-N Selection
+
+    /// Select the top N elements from an array using a bounded max-heap.
+    /// O(n log k) where k = n, much faster than O(n log n) full sort when k << n.
+    private nonisolated func topN(_ elements: [Row], n: Int, by areInIncreasingOrder: (Row, Row) -> Bool) -> [Row] {
+        guard n > 0 else { return [] }
+        if n >= elements.count {
+            return elements.sorted(by: areInIncreasingOrder)
+        }
+
+        // Build a max-heap of size n (reverse comparator: worst element at top)
+        var heap = Array(elements.prefix(n))
+        // Heapify
+        for i in stride(from: heap.count / 2 - 1, through: 0, by: -1) {
+            siftDown(&heap, i, areInIncreasingOrder)
+        }
+
+        // For remaining elements, if smaller than heap top, replace and re-heapify
+        for i in n..<elements.count {
+            if areInIncreasingOrder(elements[i], heap[0]) {
+                heap[0] = elements[i]
+                siftDown(&heap, 0, areInIncreasingOrder)
+            }
+        }
+
+        // Sort the heap to get final ordering
+        return heap.sorted(by: areInIncreasingOrder)
+    }
+
+    /// Sift down in a max-heap (largest-first, where "largest" = !areInIncreasingOrder)
+    private nonisolated func siftDown(_ heap: inout [Row], _ index: Int, _ areInIncreasingOrder: (Row, Row) -> Bool) {
+        var parent = index
+        let count = heap.count
+        while true {
+            var largest = parent
+            let left = 2 * parent + 1
+            let right = 2 * parent + 2
+            // "largest" here means the element that should be evicted first (worst in sort order)
+            if left < count && areInIncreasingOrder(heap[largest], heap[left]) {
+                largest = left
+            }
+            if right < count && areInIncreasingOrder(heap[largest], heap[right]) {
+                largest = right
+            }
+            if largest == parent { break }
+            heap.swapAt(parent, largest)
+            parent = largest
         }
     }
 
