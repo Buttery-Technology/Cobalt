@@ -889,57 +889,59 @@ public actor QueryExecutor: Sendable {
                 return UInt64(bitPattern: ridSigned)
             })
 
-            // Use raw data path: fetch records without Row deserialization
-            let rawRecords = try await storageEngine.getRecordDataByIDs(matchingRIDs, tableName: table, transactionContext: transactionContext)
+            // Single-pass: group RIDs by page, load each page once, patch + replace in place
             let colMap = updateSchema?.columnOrdinals
-
-            // Group updates by page for batched writes
-            var updatesByPage = [Int: [(newRecord: Record, fallbackRow: Row?)]]()
-            for (record, recordPageID) in rawRecords {
-                // Lazy filter: verify condition on raw bytes without full Row decode
-                if let colMap = colMap {
-                    if let lazyResult = evaluateConditionLazy(condition, data: record.data, columnIndexMap: colMap) {
-                        if !lazyResult { continue }
-                    }
-                }
-
-                // Fast path: patch raw bytes in-place (skips Row decode entirely)
-                if let schema = updateSchema,
-                   let patchedData = Row.patchPositionalData(record.data, schema: schema, updates: values) {
-                    let newRecord = Record(id: record.id, data: patchedData)
-                    updatesByPage[recordPageID, default: []].append((newRecord: newRecord, fallbackRow: nil))
-                } else {
-                    // Slow path: full decode + merge + re-encode
-                    guard let row = Row.fromBytesAuto(record.data, schema: updateSchema) else { continue }
-                    guard evaluateCondition(condition, row: row) else { continue }
-                    var updatedValues = row.values
-                    for (key, value) in values { updatedValues[key] = value }
-                    let updatedRow = Row(values: updatedValues)
-                    let rowData = updateSchema != nil ? updatedRow.toBytesPositional(schema: updateSchema!) : updatedRow.toBytes()
-                    let newRecord = Record(id: record.id, data: rowData)
-                    updatesByPage[recordPageID, default: []].append((newRecord: newRecord, fallbackRow: updatedRow))
-                }
-            }
+            let ridPages = await storageEngine.getRIDPageMapping(matchingRIDs, tableName: table)
 
             var updatedCount = 0
             var modifiedPages = Set<Int>()
-            for (pageID, updates) in updatesByPage {
+
+            // Process pages with cached RID-to-page mapping
+            for (pageID, pageRIDs) in ridPages.cached {
                 var page = transactionContext == nil
                     ? try await storageEngine.getPageConcurrent(pageID: pageID)
                     : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+                let ridSet = Set(pageRIDs)
                 var pageModified = false
                 var allPatchable = true
-                for (newRecord, fallbackRow) in updates {
-                    if page.replaceRecordAndPatch(id: newRecord.id, with: newRecord) {
-                        pageModified = true
-                    } else if page.replaceRecord(id: newRecord.id, with: newRecord) {
-                        pageModified = true
-                        allPatchable = false
+
+                for record in page.records where ridSet.contains(record.id) {
+                    // Lazy filter: verify condition on raw bytes without full Row decode
+                    if let colMap = colMap {
+                        if let lazyResult = evaluateConditionLazy(condition, data: record.data, columnIndexMap: colMap) {
+                            if !lazyResult { continue }
+                        }
+                    }
+
+                    // Fast path: patch raw bytes in-place (skips Row decode entirely)
+                    if let schema = updateSchema,
+                       let patchedData = Row.patchPositionalData(record.data, schema: schema, updates: values) {
+                        let newRecord = Record(id: record.id, data: patchedData)
+                        if page.replaceRecordAndPatch(id: record.id, with: newRecord) {
+                            pageModified = true
+                        } else if page.replaceRecord(id: record.id, with: newRecord) {
+                            pageModified = true
+                            allPatchable = false
+                        }
                     } else {
-                        let updatedRow = fallbackRow ?? Row.fromBytesAuto(newRecord.data, schema: updateSchema)!
-                        try await storageEngine.deleteRecord(id: newRecord.id, tableName: table, transactionContext: transactionContext, knownPageID: pageID)
-                        try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
-                        allPatchable = false
+                        // Slow path: full decode + merge + re-encode
+                        guard let row = Row.fromBytesAuto(record.data, schema: updateSchema) else { continue }
+                        guard evaluateCondition(condition, row: row) else { continue }
+                        var updatedValues = row.values
+                        for (key, value) in values { updatedValues[key] = value }
+                        let updatedRow = Row(values: updatedValues)
+                        let rowData = updateSchema != nil ? updatedRow.toBytesPositional(schema: updateSchema!) : updatedRow.toBytes()
+                        let newRecord = Record(id: record.id, data: rowData)
+                        if page.replaceRecordAndPatch(id: record.id, with: newRecord) {
+                            pageModified = true
+                        } else if page.replaceRecord(id: record.id, with: newRecord) {
+                            pageModified = true
+                            allPatchable = false
+                        } else {
+                            try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext, knownPageID: pageID)
+                            try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
+                            allPatchable = false
+                        }
                     }
                     updatedCount += 1
                 }
@@ -951,6 +953,34 @@ public actor QueryExecutor: Sendable {
                         try await storageEngine.savePage(page, transactionContext: transactionContext)
                     }
                     modifiedPages.insert(pageID)
+                }
+            }
+
+            // Fallback: scan for uncached RIDs
+            if !ridPages.uncached.isEmpty {
+                let rawRecords = try await storageEngine.getRecordDataByIDs(Set(ridPages.uncached), tableName: table, transactionContext: transactionContext)
+                for (record, recordPageID) in rawRecords {
+                    if let colMap = colMap {
+                        if let lazyResult = evaluateConditionLazy(condition, data: record.data, columnIndexMap: colMap) {
+                            if !lazyResult { continue }
+                        }
+                    }
+                    if let schema = updateSchema,
+                       let patchedData = Row.patchPositionalData(record.data, schema: schema, updates: values) {
+                        let newRecord = Record(id: record.id, data: patchedData)
+                        try await storageEngine.replaceRecordInPlace(id: record.id, newRecord: newRecord, tableName: table, transactionContext: transactionContext, knownPageID: recordPageID)
+                    } else {
+                        guard let row = Row.fromBytesAuto(record.data, schema: updateSchema) else { continue }
+                        guard evaluateCondition(condition, row: row) else { continue }
+                        var updatedValues = row.values
+                        for (key, value) in values { updatedValues[key] = value }
+                        let updatedRow = Row(values: updatedValues)
+                        let rowData = updateSchema != nil ? updatedRow.toBytesPositional(schema: updateSchema!) : updatedRow.toBytes()
+                        let newRecord = Record(id: record.id, data: rowData)
+                        try await storageEngine.replaceRecordInPlace(id: record.id, newRecord: newRecord, tableName: table, transactionContext: transactionContext, knownPageID: recordPageID)
+                    }
+                    updatedCount += 1
+                    modifiedPages.insert(recordPageID)
                 }
             }
 

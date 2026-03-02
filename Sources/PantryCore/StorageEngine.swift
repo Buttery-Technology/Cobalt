@@ -1196,6 +1196,22 @@ public actor StorageEngine: Sendable {
         return results
     }
 
+    /// Get RID-to-page mapping from cache, partitioned into cached and uncached RIDs.
+    /// Enables single-pass page access without loading pages just to find records.
+    public func getRIDPageMapping(_ ids: Set<UInt64>, tableName: String) -> (cached: [Int: [UInt64]], uncached: [UInt64]) {
+        var byPage = [Int: [UInt64]]()
+        var uncached = [UInt64]()
+        if let cache = ridPageMap[tableName], !cache.isEmpty {
+            for id in ids {
+                if let pageID = cache[id] { byPage[pageID, default: []].append(id) }
+                else { uncached.append(id) }
+            }
+        } else {
+            uncached = Array(ids)
+        }
+        return (cached: byPage, uncached: uncached)
+    }
+
     /// Like getRecordsByIDsWithPages but returns raw Data instead of decoded Row.
     /// Skips full Row deserialization for callers that only need raw bytes.
     public func getRecordDataByIDs(_ ids: Set<UInt64>, tableName: String, transactionContext: TransactionContext? = nil) async throws -> [(Record, Int)] {
