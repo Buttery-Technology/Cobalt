@@ -822,19 +822,35 @@ public actor QueryExecutor: Sendable {
             }
         }
 
-        // Phase 1: Serialize all records, then batch-insert with page-level batching
+        // Phase 1: Serialize all records in parallel, then batch-insert with page-level batching
         let bulkSchema = storageEngine.getTableSchema(table)
-        var serializedRecords = [Record]()
-        serializedRecords.reserveCapacity(rows.count)
-        var insertedPairs: [(Record, Row)] = []
-        insertedPairs.reserveCapacity(rows.count)
 
-        for row in rows {
-            let rowData = bulkSchema != nil ? row.toBytesPositional(schema: bulkSchema!) : row.toBytes()
-            let recordID = generateRecordID()
-            let record = Record(id: recordID, data: rowData)
+        // Pre-generate all record IDs sequentially
+        var recordIDs = [UInt64]()
+        recordIDs.reserveCapacity(rows.count)
+        for _ in rows { recordIDs.append(generateRecordID()) }
+
+        // Parallel serialization: serialize rows on multiple cores
+        let rowCount = rows.count
+        var serializedData = [Data?](repeating: nil, count: rowCount)
+        if let schema = bulkSchema {
+            serializedData.withUnsafeMutableBufferPointer { buf in
+                DispatchQueue.concurrentPerform(iterations: rowCount) { i in
+                    buf[i] = rows[i].toBytesPositional(schema: schema)
+                }
+            }
+        } else {
+            for i in 0..<rowCount { serializedData[i] = rows[i].toBytes() }
+        }
+
+        var serializedRecords = [Record]()
+        serializedRecords.reserveCapacity(rowCount)
+        var insertedPairs: [(Record, Row)] = []
+        insertedPairs.reserveCapacity(rowCount)
+        for i in 0..<rowCount {
+            let record = Record(id: recordIDs[i], data: serializedData[i]!)
             serializedRecords.append(record)
-            insertedPairs.append((record, row))
+            insertedPairs.append((record, rows[i]))
         }
 
         // Batch insert: fills pages to capacity before writing (much fewer I/O ops)
