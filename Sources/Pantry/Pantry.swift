@@ -187,11 +187,17 @@ public actor PantryDatabase: Sendable {
             }
         }
 
-        // Bulk load each index
-        for (i, (ci, _, _)) in columnIndexes.enumerated() {
-            if !allPairs[i].isEmpty {
-                try await ci.bulkLoad(pairs: allPairs[i])
+        // Bulk load all indexes concurrently
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for (i, (ci, _, _)) in columnIndexes.enumerated() {
+                let pairs = allPairs[i]
+                if !pairs.isEmpty {
+                    group.addTask {
+                        try await ci.bulkLoad(pairs: pairs)
+                    }
+                }
             }
+            try await group.waitForAll()
         }
 
         for column in columns {
