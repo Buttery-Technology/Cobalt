@@ -221,11 +221,10 @@ public struct DatabasePage: Sendable {
         guard let index = records.firstIndex(where: { $0.id == id }) else {
             return false
         }
+        let removedSize = records[index].serialize().count
         records.remove(at: index)
         recordCount -= 1
-        // Recompute freeSpaceOffset from actual serialized sizes (handles overflow headers)
-        let totalRecordSize = records.reduce(0) { $0 + $1.serialize().count }
-        freeSpaceOffset = PantryConstants.PAGE_SIZE - totalRecordSize
+        freeSpaceOffset += removedSize
         return true
     }
 

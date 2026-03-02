@@ -81,40 +81,46 @@ public final class BufferPoolManager: Sendable {
     }
 
     /// Single background flush cycle: flush oldest dirty pages from stripes that exceed threshold
+    /// Pages are sorted by pageID for sequential disk I/O.
     private func backgroundFlushCycle() async {
-        var totalFlushed = 0
         let maxPerCycle = bgWriterConfig.maxPagesPerCycle
 
+        // Collect candidate pages from all stripes
+        var candidates: [(Int, DatabasePage, PantryLock<StripeState>)] = []
         for s in stripes {
-            guard totalFlushed < maxPerCycle else { break }
-
-            let pagesToFlush: [(Int, DatabasePage)] = s.withLock { st in
+            let pages: [(Int, DatabasePage)] = s.withLock { st in
                 let dirtyRatio = st.pageCache.isEmpty ? 0.0 : Double(st.dirtyPages.count) / Double(st.pageCache.count)
                 guard dirtyRatio >= bgWriterConfig.dirtyThreshold else { return [] }
 
-                // Pick oldest dirty pages first
                 let sorted = st.dirtyPages
                     .compactMap { pageID -> (Int, UInt64, DatabasePage)? in
                         guard let page = st.pageCache[pageID] else { return nil }
                         return (pageID, st.accessOrder[pageID] ?? 0, page)
                     }
                     .sorted { $0.1 < $1.1 }
-                    .prefix(maxPerCycle - totalFlushed)
 
                 return sorted.map { ($0.0, $0.2) }
             }
+            for (pageID, page) in pages {
+                candidates.append((pageID, page, s))
+            }
+        }
 
-            for (pageID, var page) in pagesToFlush {
-                do {
-                    try await storageManager.writePage(&page, alreadySerialized: true)
-                    s.withLock { st in
-                        st.dirtyPages.remove(pageID)
-                        st.flushCount += 1
-                    }
-                    totalFlushed += 1
-                } catch {
-                    // Background flush errors are non-critical — page remains dirty for later
+        // Sort by pageID for sequential I/O, then take up to maxPerCycle
+        candidates.sort { $0.0 < $1.0 }
+
+        var totalFlushed = 0
+        for (pageID, var page, stripe) in candidates {
+            guard totalFlushed < maxPerCycle else { break }
+            do {
+                try await storageManager.writePage(&page, alreadySerialized: true)
+                stripe.withLock { st in
+                    st.dirtyPages.remove(pageID)
+                    st.flushCount += 1
                 }
+                totalFlushed += 1
+            } catch {
+                // Background flush errors are non-critical
             }
         }
     }
@@ -263,8 +269,10 @@ public final class BufferPoolManager: Sendable {
     // MARK: - Flushing
 
     public func flushAllDirtyPages() async throws {
+        // Collect all dirty pages across stripes, sorted by pageID for sequential I/O
+        var allDirtyPages: [(Int, DatabasePage, PantryLock<StripeState>)] = []
         for s in stripes {
-            let pagesToFlush: [(Int, DatabasePage)] = s.withLock { st in
+            let pages: [(Int, DatabasePage)] = s.withLock { st in
                 st.dirtyPages.compactMap { pageID in
                     guard let page = st.pageCache[pageID] else {
                         st.dirtyPages.remove(pageID)
@@ -273,13 +281,19 @@ public final class BufferPoolManager: Sendable {
                     return (pageID, page)
                 }
             }
+            for (pageID, page) in pages {
+                allDirtyPages.append((pageID, page, s))
+            }
+        }
 
-            for (pageID, var page) in pagesToFlush {
-                try await storageManager.writePage(&page, alreadySerialized: true)
-                s.withLock { st in
-                    st.flushCount += 1
-                    st.dirtyPages.remove(pageID)
-                }
+        // Sort by pageID for sequential disk writes
+        allDirtyPages.sort { $0.0 < $1.0 }
+
+        for (pageID, var page, stripe) in allDirtyPages {
+            try await storageManager.writePage(&page, alreadySerialized: true)
+            stripe.withLock { st in
+                st.flushCount += 1
+                st.dirtyPages.remove(pageID)
             }
         }
         try await storageManager.sync()
