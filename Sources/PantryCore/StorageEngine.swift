@@ -1265,80 +1265,80 @@ public actor StorageEngine: Sendable {
 
     /// Collect per-column distinct value counts for a table by sampling.
     /// Updates the table's columnStats in the registry.
+    /// Analyze table using pre-scanned raw records (avoids duplicate scan)
+    public func analyzeTableFromRaw(_ tableName: String, rawRecords: [(Record, Data)]) async throws {
+        guard var info = tableRegistry.getTableInfo(name: tableName) else {
+            throw PantryError.tableNotFound(name: tableName)
+        }
+        analyzeRecords(rawRecords, info: &info)
+        tableRegistry.updateTableInfo(info)
+    }
+
     public func analyzeTable(_ tableName: String) async throws {
         guard var info = tableRegistry.getTableInfo(name: tableName) else {
             throw PantryError.tableNotFound(name: tableName)
         }
+        let rawRecords = try await scanTableRaw(tableName)
+        analyzeRecords(rawRecords, info: &info)
+        tableRegistry.updateTableInfo(info)
+    }
 
-        let columnNames = info.schema.columns.map { $0.name }
-        var distinctSets: [String: Set<String>] = [:]
-        var nullCounts: [String: Int] = [:]
-        var minValues: [String: String] = [:]
-        var maxValues: [String: String] = [:]
-        var allValues: [String: [String]] = [:]  // for histogram building
-        var totalRows = 0
+    /// Core analysis logic — collects column statistics from raw records
+    private func analyzeRecords(_ rawRecords: [(Record, Data)], info: inout TableInfo) {
+        let schema = info.schema
+        let columnNames = schema.columns.map { $0.name }
+        let colCount = columnNames.count
+        let colOrdinals = columnNames.map { schema.columnOrdinals[$0] }
 
-        for col in columnNames {
-            distinctSets[col] = Set()
-            nullCounts[col] = 0
-            allValues[col] = []
-        }
+        var distinctSets = Array(repeating: Set<String>(), count: colCount)
+        var nullCounts = Array(repeating: 0, count: colCount)
+        var minValues = Array<String?>(repeating: nil, count: colCount)
+        var maxValues = Array<String?>(repeating: nil, count: colCount)
+        var sampleValues = (0..<colCount).map { _ in [String]() }
+        let totalRows = rawRecords.count
 
-        // Single scan to collect statistics
-        var currentPageID = info.firstPageID
-        var visited: Set<Int> = []
-        while currentPageID != 0 {
-            guard visited.insert(currentPageID).inserted else { break }
-            let page = try await getPage(pageID: currentPageID)
-            for record in page.records {
-                if let row = Row.fromBytesAuto(record.data, schema: info.schema) {
-                    totalRows += 1
-                    for col in columnNames {
-                        if let value = row.values[col] {
-                            if value == .null {
-                                nullCounts[col, default: 0] += 1
-                            } else {
-                                let key = value.statsKey
-                                distinctSets[col]?.insert(key)
-                                // Track min/max
-                                if minValues[col] == nil || key < minValues[col]! { minValues[col] = key }
-                                if maxValues[col] == nil || key > maxValues[col]! { maxValues[col] = key }
-                                // Sample values for histogram (cap at 10K to avoid memory bloat)
-                                if (allValues[col]?.count ?? 0) < 10_000 {
-                                    allValues[col]?.append(key)
-                                }
-                            }
-                        } else {
-                            nullCounts[col, default: 0] += 1
-                        }
+        for (_, data) in rawRecords {
+            for i in 0..<colCount {
+                guard let ordinal = colOrdinals[i] else { continue }
+                guard let value = Row.extractColumnValue(from: data, columnIndex: ordinal) else {
+                    nullCounts[i] += 1
+                    continue
+                }
+                if value == .null {
+                    nullCounts[i] += 1
+                } else {
+                    let key = value.statsKey
+                    distinctSets[i].insert(key)
+                    if minValues[i] == nil || key < minValues[i]! { minValues[i] = key }
+                    if maxValues[i] == nil || key > maxValues[i]! { maxValues[i] = key }
+                    if sampleValues[i].count < 10_000 {
+                        sampleValues[i].append(key)
                     }
                 }
             }
-            currentPageID = page.nextPageID
         }
 
-        // Build histograms and update stats
-        for col in columnNames {
+        for i in 0..<colCount {
+            let col = columnNames[i]
             let existing = info.columnStats[col] ?? ColumnStats()
             var boundaries: [String] = []
-            if let vals = allValues[col], vals.count >= 64 {
-                let sorted = vals.sorted()
+            if sampleValues[i].count >= 64 {
+                let sorted = sampleValues[i].sorted()
                 let bucketSize = sorted.count / 64
-                for i in 1..<64 {
-                    boundaries.append(sorted[i * bucketSize])
+                for j in 1..<64 {
+                    boundaries.append(sorted[j * bucketSize])
                 }
             }
             info.columnStats[col] = ColumnStats(
-                distinctCount: distinctSets[col]?.count ?? 0,
+                distinctCount: distinctSets[i].count,
                 isIndexed: existing.isIndexed,
-                nullCount: nullCounts[col] ?? 0,
+                nullCount: nullCounts[i],
                 totalCount: totalRows,
-                minValue: minValues[col],
-                maxValue: maxValues[col],
+                minValue: minValues[i],
+                maxValue: maxValues[i],
                 histogramBoundaries: boundaries
             )
         }
-        tableRegistry.updateTableInfo(info)
     }
 
     /// Mark a column as indexed in the table stats (for query planner)

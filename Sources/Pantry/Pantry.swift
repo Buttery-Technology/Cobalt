@@ -154,7 +154,7 @@ public actor PantryDatabase: Sendable {
 
     /// Create multiple indexes on the same table with a single table scan.
     /// Much faster than calling createIndex multiple times.
-    public func createIndexes(table: String, columns: [String]) async throws {
+    public func createIndexes(table: String, columns: [String], analyze: Bool = false) async throws {
         let schema = storageEngine.getTableSchema(table)
 
         // Create all ColumnIndex objects
@@ -198,6 +198,11 @@ public actor PantryDatabase: Sendable {
             await storageEngine.markColumnIndexed(table, column: column)
         }
         queryExecutor.invalidatePlanCache(forTable: table)
+
+        // Optionally analyze table using same raw records (avoids duplicate scan)
+        if analyze {
+            try await storageEngine.analyzeTableFromRaw(table, rawRecords: rawRecords)
+        }
     }
 
     /// Create a partial index on a column — only rows matching `where` condition are indexed.
