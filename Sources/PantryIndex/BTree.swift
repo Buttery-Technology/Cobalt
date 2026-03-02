@@ -23,6 +23,9 @@ public final class BTree: @unchecked Sendable {
         rootId
     }
 
+    /// Whether this B-tree is empty (no root node)
+    public var isEmpty: Bool { rootId == nil }
+
     // MARK: - Insert
 
     public func insert(key: DBValue, row: Row) async throws {

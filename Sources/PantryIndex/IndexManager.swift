@@ -30,6 +30,9 @@ public actor ColumnIndex: Sendable {
         self.bloomFilter = BloomFilter(expectedElements: expectedElements, falsePositiveRate: 0.001)
     }
 
+    /// Whether this index has no entries (B-tree root is nil)
+    public var isEmpty: Bool { btree.isEmpty }
+
     /// Whether this is a compound (multi-column) index
     public var isCompound: Bool { compoundColumns != nil }
 
@@ -396,7 +399,13 @@ public actor IndexManager: IndexHook, Sendable {
             }
 
             if !pairs.isEmpty {
-                try await columnIndex.insertBatch(pairs: pairs)
+                // Use bulkLoad (O(n)) for empty indexes, insertBatch (O(n log n)) otherwise
+                let indexEmpty = await columnIndex.isEmpty
+                if indexEmpty {
+                    try await columnIndex.bulkLoad(pairs: pairs)
+                } else {
+                    try await columnIndex.insertBatch(pairs: pairs)
+                }
             }
         }
     }

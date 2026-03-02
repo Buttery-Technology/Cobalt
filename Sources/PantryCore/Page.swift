@@ -180,7 +180,7 @@ public struct DatabasePage: Sendable {
 
     /// Add a record to this page. Returns false if not enough space.
     public mutating func addRecord(_ record: Record) -> Bool {
-        addRecord(record, knownSerializedSize: record.serialize().count)
+        addRecord(record, knownSerializedSize: record.serializedSize)
     }
 
     /// Add a record with a pre-computed serialized size to avoid double serialization.
