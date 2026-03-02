@@ -782,23 +782,26 @@ public actor QueryExecutor: Sendable {
         // Validate primary key uniqueness in batch
         let schema = storageEngine.getTableSchema(table)
         if let pkColumn = schema?.primaryKeyColumn {
-            var seenPKs = Set<String>()
+            let existingCount = planner.registry.getTableInfo(name: table)?.recordCount ?? 0
+            var seenPKs = Set<DBValue>()
+            seenPKs.reserveCapacity(rows.count)
             for row in rows {
                 if let pkValue = row.values[pkColumn.name], pkValue != .null {
-                    let key = "\(pkValue)"
-                    guard seenPKs.insert(key).inserted else {
+                    guard seenPKs.insert(pkValue).inserted else {
                         throw PantryError.primaryKeyViolation
                     }
-                    // Check existing data via index or scan
-                    if let indexed = try await indexManager.attemptIndexLookup(
-                        tableName: table,
-                        condition: .equals(column: pkColumn.name, value: pkValue)
-                    ), !indexed.isEmpty {
-                        throw PantryError.primaryKeyViolation
-                    } else if !(await indexManager.hasIndex(tableName: table, columnName: pkColumn.name)) {
-                        let existing = try await executeSelect(from: table, columns: [pkColumn.name], where: .equals(column: pkColumn.name, value: pkValue), transactionContext: transactionContext)
-                        if !existing.isEmpty {
+                    // Only check against existing data if table is non-empty
+                    if existingCount > 0 {
+                        if let indexed = try await indexManager.attemptIndexLookup(
+                            tableName: table,
+                            condition: .equals(column: pkColumn.name, value: pkValue)
+                        ), !indexed.isEmpty {
                             throw PantryError.primaryKeyViolation
+                        } else if !(await indexManager.hasIndex(tableName: table, columnName: pkColumn.name)) {
+                            let existing = try await executeSelect(from: table, columns: [pkColumn.name], where: .equals(column: pkColumn.name, value: pkValue), transactionContext: transactionContext)
+                            if !existing.isEmpty {
+                                throw PantryError.primaryKeyViolation
+                            }
                         }
                     }
                 } else if !pkColumn.isNullable {
@@ -859,22 +862,46 @@ public actor QueryExecutor: Sendable {
             })
             let fullRecords = try await storageEngine.getRecordsByIDsWithPages(matchingRIDs, tableName: table, transactionContext: transactionContext)
 
-            var updatedCount = 0
-            var modifiedPages = Set<Int>()
+            // Group updates by page for batched writes
+            var updatesByPage = [Int: [(Record, Row)]]()
             for (record, row, recordPageID) in fullRecords where evaluateCondition(condition, row: row) {
                 var updatedValues = row.values
                 for (key, value) in values { updatedValues[key] = value }
                 let updatedRow = Row(values: updatedValues)
-
                 let rowData = updateSchema != nil ? updatedRow.toBytesPositional(schema: updateSchema!) : updatedRow.toBytes()
                 let newRecord = Record(id: record.id, data: rowData)
-                let replaced = try await storageEngine.replaceRecordInPlace(id: record.id, newRecord: newRecord, tableName: table, transactionContext: transactionContext, knownPageID: recordPageID)
-                if !replaced {
-                    try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext, knownPageID: recordPageID)
-                    try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
+                updatesByPage[recordPageID, default: []].append((newRecord, updatedRow))
+            }
+
+            var updatedCount = 0
+            var modifiedPages = Set<Int>()
+            for (pageID, updates) in updatesByPage {
+                var page = transactionContext == nil
+                    ? try await storageEngine.getPageConcurrent(pageID: pageID)
+                    : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+                var pageModified = false
+                for (newRecord, updatedRow) in updates {
+                    if page.replaceRecord(id: newRecord.id, with: newRecord) {
+                        pageModified = true
+                    } else {
+                        try await storageEngine.deleteRecord(id: newRecord.id, tableName: table, transactionContext: transactionContext, knownPageID: pageID)
+                        try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
+                    }
+                    updatedCount += 1
                 }
-                modifiedPages.insert(recordPageID)
-                updatedCount += 1
+                if pageModified {
+                    if transactionContext == nil {
+                        try await storageEngine.savePageDeferred(page)
+                    } else {
+                        try await storageEngine.savePage(page, transactionContext: transactionContext)
+                    }
+                    modifiedPages.insert(pageID)
+                }
+            }
+
+            // Flush all modified pages at once
+            if transactionContext == nil && !modifiedPages.isEmpty {
+                try await storageEngine.flushDirtyPages(modifiedPages)
             }
             if updatedCount > 0 { invalidateResultCache(forTable: table, modifiedPages: modifiedPages) }
             return updatedCount
@@ -922,7 +949,11 @@ public actor QueryExecutor: Sendable {
             }
 
             if pageModified {
-                try await storageEngine.savePage(page, transactionContext: transactionContext)
+                if transactionContext == nil {
+                    try await storageEngine.savePageDeferred(page)
+                } else {
+                    try await storageEngine.savePage(page, transactionContext: transactionContext)
+                }
                 modifiedPages.insert(pageID)
             }
 
@@ -931,6 +962,11 @@ public actor QueryExecutor: Sendable {
                 try await storageEngine.deleteRecord(id: newRecord.id, tableName: table, transactionContext: transactionContext, knownPageID: pageID)
                 try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
             }
+        }
+
+        // Flush all modified pages to disk at once (deferred writes)
+        if transactionContext == nil && !modifiedPages.isEmpty {
+            try await storageEngine.flushDirtyPages(modifiedPages)
         }
 
         if updatedCount > 0 { invalidateResultCache(forTable: table, modifiedPages: modifiedPages) }
@@ -1039,6 +1075,12 @@ public actor QueryExecutor: Sendable {
             default:
                 break
             }
+        }
+
+        // COUNT(*) or COUNT(col) with simple range condition on indexed column → B-tree range count
+        if case .count = function, let condition = condition {
+            let indexCount = try await indexAcceleratedCount(table: table, condition: condition)
+            if let result = indexCount { return result }
         }
 
         // Streaming aggregate: scan pages directly, extract only the needed column
@@ -1310,6 +1352,70 @@ public actor QueryExecutor: Sendable {
             }
         }
         return .compound([.double(sum), .integer(count)])
+    }
+
+    /// Try to answer COUNT using a B-tree range count on an indexed column.
+    /// Returns nil if the condition can't be served by an index.
+    private func indexAcceleratedCount(table: String, condition: WhereCondition) async throws -> DBValue? {
+        switch condition {
+        case .greaterThan(let col, let value):
+            if let index = await indexManager.getIndex(tableName: table, columnName: col) {
+                // age > 30 → count from 30 (exclusive). Use the next representable value as lower bound.
+                let startKey = incrementKey(value)
+                let count = try await index.countRange(from: startKey, to: nil)
+                return .integer(count)
+            }
+        case .greaterThanOrEqual(let col, let value):
+            if let index = await indexManager.getIndex(tableName: table, columnName: col) {
+                let count = try await index.countRange(from: value, to: nil)
+                return .integer(count)
+            }
+        case .lessThan(let col, let value):
+            if let index = await indexManager.getIndex(tableName: table, columnName: col) {
+                // Use decrementKey for exclusive upper bound
+                let endKey = decrementKey(value)
+                let count = try await index.countRange(from: nil, to: endKey)
+                return .integer(count)
+            }
+        case .lessThanOrEqual(let col, let value):
+            if let index = await indexManager.getIndex(tableName: table, columnName: col) {
+                let count = try await index.countRange(from: nil, to: value)
+                return .integer(count)
+            }
+        case .between(let col, let minVal, let maxVal):
+            if let index = await indexManager.getIndex(tableName: table, columnName: col) {
+                let count = try await index.countRange(from: minVal, to: maxVal)
+                return .integer(count)
+            }
+        case .equals(let col, let value):
+            if let index = await indexManager.getIndex(tableName: table, columnName: col) {
+                if let rows = try await index.search(key: value) {
+                    return .integer(Int64(rows.count))
+                }
+            }
+        default:
+            break
+        }
+        return nil
+    }
+
+    /// Return the next representable value (for exclusive lower bound in range count).
+    private nonisolated func incrementKey(_ value: DBValue) -> DBValue {
+        switch value {
+        case .integer(let v): return .integer(v + 1)
+        case .double(let v): return .double(v.nextUp)
+        case .string(let s): return .string(s + "\0")
+        default: return value
+        }
+    }
+
+    /// Return the previous representable value (for exclusive upper bound in range count).
+    private nonisolated func decrementKey(_ value: DBValue) -> DBValue {
+        switch value {
+        case .integer(let v): return .integer(v - 1)
+        case .double(let v): return .double(v.nextDown)
+        default: return value
+        }
     }
 
     private nonisolated func numericValue(_ value: DBValue?) -> Double? {
