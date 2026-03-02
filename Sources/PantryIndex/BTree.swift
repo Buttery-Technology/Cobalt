@@ -63,6 +63,46 @@ public final class BTree: @unchecked Sendable {
         return try await searchNode(node: root, key: key)
     }
 
+    /// Synchronous search using only cached B-tree nodes. Returns nil on any cache miss.
+    /// Eliminates all async overhead for warm-cache lookups.
+    public func searchCached(key: DBValue) -> [Row]? {
+        guard let rootId = rootId,
+              let root = nodeStore.loadNodeCached(nodeId: rootId) else {
+            return nil
+        }
+        return searchNodeCached(node: root, key: key)
+    }
+
+    private func searchNodeCached(node: BTreeNode, key: DBValue) -> [Row]? {
+        var i = lowerBound(node.keys, key)
+
+        if node.isLeaf {
+            var results: [Row] = []
+            var currentLeaf: BTreeNode? = node
+            var j = i
+            while let leaf = currentLeaf {
+                while j < leaf.keys.count && leaf.keys[j] == key {
+                    results.append(leaf.values[j])
+                    j += 1
+                }
+                if j >= leaf.keys.count, let nextId = leaf.nextLeafId {
+                    guard let next = nodeStore.loadNodeCached(nodeId: nextId) else { return nil }
+                    currentLeaf = next
+                    j = 0
+                } else {
+                    break
+                }
+            }
+            return results
+        }
+
+        if let childId = node.children?[i],
+           let child = nodeStore.loadNodeCached(nodeId: childId) {
+            return searchNodeCached(node: child, key: key)
+        }
+        return nil
+    }
+
     /// Range scan from a lower bound, collecting rows while predicate returns true.
     /// Exploits B-tree sort order: once predicate fails, no further matches exist.
     public func searchRangeWhile(from startKey: DBValue?, predicate: @Sendable (DBValue) -> Bool) async throws -> [Row] {

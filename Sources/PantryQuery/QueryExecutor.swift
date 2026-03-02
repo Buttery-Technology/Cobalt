@@ -278,30 +278,50 @@ public final class QueryExecutor: @unchecked Sendable {
 
         switch plan {
         case .indexOnlyScan:
-            if let condition = condition,
-               let indexed = try await indexManager.attemptIndexLookup(tableName: table, condition: condition) {
-                rows = indexed.map { row in
-                    var vals = row.values
-                    vals.removeValue(forKey: "__rid")
-                    return Row(values: vals)
+            if let condition = condition {
+                // Try synchronous cache-only path first, fall back to async
+                let indexed: [Row]?
+                if let cached = indexManager.attemptIndexLookupCached(tableName: table, condition: condition) {
+                    indexed = cached
+                } else {
+                    indexed = try await indexManager.attemptIndexLookup(tableName: table, condition: condition)
                 }
-                if let scanLimit = scanLimit { rows = Array(rows.prefix(scanLimit)) }
+                if let indexed {
+                    rows = indexed.map { row in
+                        var vals = row.values
+                        vals.removeValue(forKey: "__rid")
+                        return Row(values: vals)
+                    }
+                    if let scanLimit = scanLimit { rows = Array(rows.prefix(scanLimit)) }
+                } else {
+                    rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, projectColumns: projectCols, schema: selectSchema, transactionContext: transactionContext)
+                }
             } else {
                 rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, projectColumns: projectCols, schema: selectSchema, transactionContext: transactionContext)
             }
 
         case .indexScan:
-            if let condition = condition,
-               let indexed = try await indexManager.attemptIndexLookup(tableName: table, condition: condition) {
-                let matchingRIDs = Set(indexed.compactMap { row -> UInt64? in
-                    guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
-                    return UInt64(bitPattern: ridSigned)
-                })
-                let fullRecords = try await storageEngine.getRecordsByIDs(matchingRIDs, tableName: table, transactionContext: transactionContext, neededColumns: overflowNeededColumns)
-                rows = fullRecords
-                    .map { $0.1 }
-                    .filter { evaluateCondition(condition, row: $0) }
-                if let scanLimit = scanLimit { rows = Array(rows.prefix(scanLimit)) }
+            if let condition = condition {
+                // Try synchronous cache-only path first, fall back to async
+                let indexed: [Row]?
+                if let cached = indexManager.attemptIndexLookupCached(tableName: table, condition: condition) {
+                    indexed = cached
+                } else {
+                    indexed = try await indexManager.attemptIndexLookup(tableName: table, condition: condition)
+                }
+                if let indexed {
+                    let matchingRIDs = Set(indexed.compactMap { row -> UInt64? in
+                        guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
+                        return UInt64(bitPattern: ridSigned)
+                    })
+                    let fullRecords = try await storageEngine.getRecordsByIDs(matchingRIDs, tableName: table, transactionContext: transactionContext, neededColumns: overflowNeededColumns)
+                    rows = fullRecords
+                        .map { $0.1 }
+                        .filter { evaluateCondition(condition, row: $0) }
+                    if let scanLimit = scanLimit { rows = Array(rows.prefix(scanLimit)) }
+                } else {
+                    rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, projectColumns: projectCols, schema: selectSchema, transactionContext: transactionContext)
+                }
             } else {
                 rows = try await parallelTableScan(pageIDs: pageIDs, condition: condition, limit: scanLimit, neededColumns: overflowNeededColumns, projectColumns: projectCols, schema: selectSchema, transactionContext: transactionContext)
             }

@@ -97,6 +97,20 @@ public final class ColumnIndex: @unchecked Sendable {
         try await btree.bulkLoad(sortedPairs: sorted)
     }
 
+    /// Synchronous search using only cached B-tree nodes. Returns nil on cache miss.
+    /// Returns .some([]) for definitive bloom/hash misses, .some(rows) for hits, nil for cache miss.
+    public func searchCached(key: DBValue) -> [Row]? {
+        let shouldSearch = _mutable.withLock { s -> Bool in
+            if s.keyHashSet.count < Self.maxHashSetSize && !s.keyHashSet.contains(key.indexKey.hashValue) {
+                return false
+            }
+            return s.bloomFilter.contains(key.indexKey)
+        }
+        if !shouldSearch { return [] }
+        guard let results = btree.searchCached(key: key) else { return nil }
+        return results.map { reconstructRow($0, key: key) }
+    }
+
     /// Search for rows matching a key, using hash set + bloom filter for fast negatives
     public func search(key: DBValue) async throws -> [Row]? {
         let shouldSearch = _mutable.withLock { s -> Bool in
@@ -572,6 +586,15 @@ public final class IndexManager: IndexHook, @unchecked Sendable {
             }
             try await group.waitForAll()
         }
+    }
+
+    /// Synchronous cache-only index lookup for .equals conditions. Returns nil on cache miss.
+    public func attemptIndexLookupCached(tableName: String, condition: WhereCondition) -> [Row]? {
+        guard case .equals(let column, let value) = condition else { return nil }
+        if value == .null { return [] }
+        let index: ColumnIndex? = _indexes.withLock { $0[tableName]?[column] }
+        guard let index else { return nil }
+        return index.searchCached(key: value)
     }
 
     /// Attempt to use indexes for a query condition
