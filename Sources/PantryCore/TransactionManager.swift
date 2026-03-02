@@ -192,6 +192,9 @@ public actor TransactionManager: Sendable {
 
     // MARK: - Checkpointing
 
+    /// LSN of the most recent checkpoint (for persistence by StorageEngine)
+    public private(set) var lastCheckpointLSN: UInt64 = 0
+
     public func createCheckpoint() async throws {
         guard activeTransactions.isEmpty else {
             throw PantryError.invalidTransactionState
@@ -211,7 +214,8 @@ public actor TransactionManager: Sendable {
 
         // Write checkpoint record then truncate WAL
         let count = UInt32(activeTransactions.count)
-        try await logManager.createCheckpoint(activeTransactionCount: count)
+        let lsn = try await logManager.createCheckpoint(activeTransactionCount: count)
+        lastCheckpointLSN = lsn
         try await logManager.truncate()
     }
 

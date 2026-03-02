@@ -22,11 +22,21 @@ public struct DBMetadata: Codable, Sendable {
     public var freeListHead: Int
     public var indexRegistryPageID: Int
     public var freeSpaceBitmapPageID: Int
+    public var checkpointLSN: UInt64
 
-    public init(freeListHead: Int = 0, indexRegistryPageID: Int = 0, freeSpaceBitmapPageID: Int = 0) {
+    public init(freeListHead: Int = 0, indexRegistryPageID: Int = 0, freeSpaceBitmapPageID: Int = 0, checkpointLSN: UInt64 = 0) {
         self.freeListHead = freeListHead
         self.indexRegistryPageID = indexRegistryPageID
         self.freeSpaceBitmapPageID = freeSpaceBitmapPageID
+        self.checkpointLSN = checkpointLSN
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        freeListHead = try container.decode(Int.self, forKey: .freeListHead)
+        indexRegistryPageID = try container.decode(Int.self, forKey: .indexRegistryPageID)
+        freeSpaceBitmapPageID = try container.decodeIfPresent(Int.self, forKey: .freeSpaceBitmapPageID) ?? 0
+        checkpointLSN = try container.decodeIfPresent(UInt64.self, forKey: .checkpointLSN) ?? 0
     }
 }
 

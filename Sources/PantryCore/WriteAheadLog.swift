@@ -520,7 +520,21 @@ public actor WriteAheadLog: Sendable {
 
     // MARK: - Checkpointing
 
-    public func createCheckpoint(activeTransactionCount: UInt32) throws {
+    /// LSN at or before which all records have been checkpointed (skip during recovery)
+    private var checkpointLSN: UInt64 = 0
+
+    /// Set the checkpoint LSN (called during init from persisted metadata)
+    public func setCheckpointLSN(_ lsn: UInt64) {
+        checkpointLSN = lsn
+    }
+
+    /// Get the current checkpoint LSN
+    public func getCheckpointLSN() -> UInt64 {
+        checkpointLSN
+    }
+
+    @discardableResult
+    public func createCheckpoint(activeTransactionCount: UInt32) throws -> UInt64 {
         let lsn = nextLSN
         nextLSN += 1
 
@@ -533,6 +547,8 @@ public actor WriteAheadLog: Sendable {
 
         try writeLogRecord(logData)
         try logFileHandle?.synchronize()
+        checkpointLSN = lsn
+        return lsn
     }
 
     // MARK: - Log Record I/O
@@ -616,6 +632,11 @@ public actor WriteAheadLog: Sendable {
         let parsedLSNs = Set(records.map { $0.lsn })
         for (_, cachedRecord) in logCache where !parsedLSNs.contains(cachedRecord.lsn) {
             records.append(cachedRecord)
+        }
+
+        // Filter out records at or before the checkpoint LSN (already checkpointed)
+        if checkpointLSN > 0 {
+            records = records.filter { $0.lsn > checkpointLSN }
         }
 
         return records

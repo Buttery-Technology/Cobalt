@@ -1,5 +1,12 @@
 import Foundation
 
+/// Serializable snapshot of a BloomFilter's state for persistence
+public struct BloomFilterSnapshot: Codable, Sendable {
+    public let bitArray: [UInt64]
+    public let hashFunctions: Int
+    public let size: Int
+}
+
 /// Probabilistic data structure for fast negative lookups.
 /// A negative result is definitive; a positive result may be a false positive.
 /// Uses a packed UInt64 bitset for ~8x memory reduction over [Bool].
@@ -39,6 +46,24 @@ public struct BloomFilter: Sendable, Codable {
             }
         }
         return true
+    }
+
+    /// Capture the current state as a serializable snapshot
+    public var snapshot: BloomFilterSnapshot {
+        BloomFilterSnapshot(bitArray: bitArray, hashFunctions: hashFunctions, size: size)
+    }
+
+    /// Restore a bloom filter from a persisted snapshot
+    public static func fromSnapshot(_ snap: BloomFilterSnapshot) -> BloomFilter? {
+        guard snap.size > 0, snap.hashFunctions > 0, snap.bitArray.count == (snap.size + 63) / 64 else { return nil }
+        return BloomFilter(bitArray: snap.bitArray, hashFunctions: snap.hashFunctions, size: snap.size)
+    }
+
+    /// Private memberwise init for snapshot restoration
+    private init(bitArray: [UInt64], hashFunctions: Int, size: Int) {
+        self.bitArray = bitArray
+        self.hashFunctions = hashFunctions
+        self.size = size
     }
 
     /// Deterministic FNV-1a hash (safe across process restarts unlike Swift's Hasher)

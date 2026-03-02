@@ -272,8 +272,39 @@ extension Row {
         return nil
     }
 
+    /// Extract a single column value from positional-encoded (v2) binary data by column index.
+    /// Navigates the NULL bitmap, skips preceding non-NULL values via skipDBValue, decodes target.
+    public static func columnValuePositional(at index: Int, colCount: Int, from data: Data) -> DBValue? {
+        // v2 format: [0xFF][0x02][2B colCount][bitmap][values...]
+        guard data.count >= 4, data[data.startIndex] == 0xFF, data[data.startIndex + 1] == 0x02 else { return nil }
+        guard index < colCount else { return nil }
+
+        let bitmapBytes = (colCount + 7) / 8
+        let bitmapStart = 4  // after magic(1) + version(1) + colCount(2)
+        guard bitmapStart + bitmapBytes <= data.count else { return nil }
+
+        // Check NULL bitmap for target column
+        let targetByte = data[data.startIndex + bitmapStart + index / 8]
+        if (targetByte & (1 << (index % 8))) != 0 {
+            return .null
+        }
+
+        // Skip preceding non-NULL values to reach the target
+        var offset = bitmapStart + bitmapBytes
+        for i in 0..<index {
+            let byteIdx = data[data.startIndex + bitmapStart + i / 8]
+            let isNull = (byteIdx & (1 << (i % 8))) != 0
+            if !isNull {
+                guard skipDBValue(in: data, at: &offset) else { return nil }
+            }
+        }
+
+        // Decode the target value
+        return decodeDBValue(from: data, at: &offset)
+    }
+
     /// Skip past a DBValue in binary data without decoding it.
-    private static func skipDBValue(in data: Data, at offset: inout Int) -> Bool {
+    public static func skipDBValue(in data: Data, at offset: inout Int) -> Bool {
         guard offset < data.count else { return false }
         let tag = data[offset]
         offset += 1
