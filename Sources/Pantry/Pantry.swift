@@ -77,7 +77,7 @@ public actor PantryDatabase: Sendable {
 
     public func dropTable(_ name: String) async throws {
         try await storageEngine.dropTable(name)
-        await indexManager.removeIndexes(tableName: name)
+        indexManager.removeIndexes(tableName: name)
     }
 
     public func tableExists(_ name: String) async -> Bool {
@@ -98,7 +98,7 @@ public actor PantryDatabase: Sendable {
 
     /// Create an index on a column, optionally with INCLUDE columns for covering index scans
     public func createIndex(table: String, column: String, include: [String]? = nil) async throws {
-        let columnIndex = try await indexManager.createIndex(tableName: table, columnName: column, includeColumns: include)
+        let columnIndex = indexManager.createIndex(tableName: table, columnName: column, includeColumns: include)
 
         // Populate the index from existing data — extract only needed columns from raw data
         let schema = storageEngine.getTableSchema(table)
@@ -159,7 +159,7 @@ public actor PantryDatabase: Sendable {
         // Create all ColumnIndex objects
         var columnIndexes: [(ColumnIndex, String, Int?)] = []
         for column in columns {
-            let ci = try await indexManager.createIndex(tableName: table, columnName: column)
+            let ci = indexManager.createIndex(tableName: table, columnName: column)
             let colIdx = schema?.columnOrdinals[column]
             columnIndexes.append((ci, column, colIdx))
         }
@@ -251,7 +251,7 @@ public actor PantryDatabase: Sendable {
     /// Create a partial index on a column — only rows matching `where` condition are indexed.
     /// Partial indexes are smaller and faster when queries always include the same filter.
     public func createPartialIndex(table: String, column: String, where condition: WhereCondition, include: [String]? = nil) async throws {
-        let columnIndex = try await indexManager.createIndex(tableName: table, columnName: column, includeColumns: include, partialCondition: condition)
+        let columnIndex = indexManager.createIndex(tableName: table, columnName: column, includeColumns: include, partialCondition: condition)
 
         // Populate the index from existing data that matches the condition — bulk load
         let rows = try await storageEngine.scanTable(table)
@@ -278,7 +278,7 @@ public actor PantryDatabase: Sendable {
     }
 
     public func createCompoundIndex(table: String, columns: [String]) async throws {
-        let columnIndex = try await indexManager.createCompoundIndex(tableName: table, columns: columns)
+        let columnIndex = try indexManager.createCompoundIndex(tableName: table, columns: columns)
 
         // Populate the index from existing data — extract only needed columns from raw data
         let schema = storageEngine.getTableSchema(table)
@@ -321,11 +321,11 @@ public actor PantryDatabase: Sendable {
     }
 
     public func listIndexes(on table: String) async -> [(column: String, isCompound: Bool)] {
-        await indexManager.listIndexes(tableName: table)
+        indexManager.listIndexes(tableName: table)
     }
 
     public func dropIndex(table: String, column: String) async {
-        await indexManager.dropIndex(tableName: table, columnName: column)
+        indexManager.dropIndex(tableName: table, columnName: column)
         await storageEngine.markColumnNotIndexed(table, column: column)
         queryExecutor.invalidatePlanCache(forTable: table)
     }
@@ -393,7 +393,7 @@ public actor PantryDatabase: Sendable {
 
     /// Combine two query results using UNION, UNION ALL, INTERSECT, or EXCEPT
     public func combine(_ operation: SetOperation, left: [Row], right: [Row]) async -> [Row] {
-        await queryExecutor.executeSetOperation(operation, left: left, right: right)
+        queryExecutor.executeSetOperation(operation, left: left, right: right)
     }
 
     // MARK: - DML
