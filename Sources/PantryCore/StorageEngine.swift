@@ -138,7 +138,7 @@ public actor StorageEngine: Sendable {
     public func getPage(pageID: Int, transactionContext: TransactionContext? = nil) async throws -> DatabasePage {
         if let cachedPage = bufferPoolManager.getCachedPage(pageID: pageID) {
             if let txContext = transactionContext {
-                await txContext.recordAccess(pageID: pageID, isWrite: false)
+                txContext.recordAccess(pageID: pageID, isWrite: false)
             }
             return cachedPage
         }
@@ -147,7 +147,7 @@ public actor StorageEngine: Sendable {
         await bufferPoolManager.cachePage(loadedPage)
 
         if let txContext = transactionContext {
-            await txContext.recordAccess(pageID: pageID, isWrite: false)
+            txContext.recordAccess(pageID: pageID, isWrite: false)
         }
         return loadedPage
     }
@@ -175,11 +175,11 @@ public actor StorageEngine: Sendable {
         var beforePageData: Data? = nil
 
         if let txContext = transactionContext {
-            await txContext.markModified(pageID: page.pageID)
-            await txContext.recordAccess(pageID: page.pageID, isWrite: true)
+            txContext.markModified(pageID: page.pageID)
+            txContext.recordAccess(pageID: page.pageID, isWrite: true)
 
             // Capture before-image for WAL rollback (only once per page per transaction)
-            let alreadyLogged = await txContext.beforeImagePages.contains(page.pageID)
+            let alreadyLogged = txContext.hasBeforeImage(pageID: page.pageID)
             if !alreadyLogged {
                 // Try buffer pool first (avoids disk I/O on hot path), fall back to disk
                 if let cachedBefore = bufferPoolManager.getCachedPage(pageID: page.pageID) {
@@ -193,7 +193,7 @@ public actor StorageEngine: Sendable {
                         try await logManager.logPageBeforeImage(txID: txContext.transactionID, page: beforePage)
                     }
                 }
-                await txContext.recordBeforeImage(pageID: page.pageID)
+                txContext.recordBeforeImage(pageID: page.pageID)
             }
         }
 
