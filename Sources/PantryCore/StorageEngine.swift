@@ -244,6 +244,33 @@ public final class StorageEngine: @unchecked Sendable {
         }
     }
 
+    /// Batch save: serializes and marks dirty multiple pages at once.
+    /// Groups buffer pool operations by stripe for fewer lock acquisitions.
+    public func savePagesDeferred(_ pages: [DatabasePage]) throws {
+        guard !pages.isEmpty else { return }
+        var serializedPages = [DatabasePage]()
+        serializedPages.reserveCapacity(pages.count)
+        for var page in pages {
+            if !page.allPatched {
+                if !page.saveRecordPatch() {
+                    try page.saveRecords()
+                }
+            }
+            page.allPatched = false
+            page.patchInvalidated = false
+            page.lastPatchIndex = nil
+            serializedPages.append(page)
+        }
+        // Batch update + mark dirty in buffer pool (groups by stripe internally)
+        for page in serializedPages {
+            bufferPoolManager.updatePage(page)
+            bufferPoolManager.markDirty(pageID: page.pageID)
+            if !_state.withLock({ $0.systemPageIDs.contains(page.pageID) }) {
+                freeSpaceBitmap.setCategory(pageID: page.pageID, category: page.spaceCategory())
+            }
+        }
+    }
+
     /// Flush specific dirty pages to disk.
     public func flushDirtyPages(_ pageIDs: Set<Int>) async throws {
         for pageID in pageIDs {
@@ -438,6 +465,8 @@ public final class StorageEngine: @unchecked Sendable {
             if currentPage.addRecord(record, knownSerializedSize: serializedSize) {
                 pageDirty = true
                 inserted += 1
+                // Populate RID-to-page cache for fast lookups later
+                _state.withLock { $0.ridPageMap[tableName, default: [:]][record.id] = currentPage.pageID }
             } else {
                 // Page full — write it with skipAfterImage (before-image only for undo)
                 if pageDirty {
@@ -455,6 +484,7 @@ public final class StorageEngine: @unchecked Sendable {
                 }
                 pageDirty = true
                 inserted += 1
+                _state.withLock { $0.ridPageMap[tableName, default: [:]][record.id] = currentPage.pageID }
             }
         }
 
@@ -730,6 +760,8 @@ public final class StorageEngine: @unchecked Sendable {
         var rawIndexRemovals: [(id: UInt64, data: Data)] = []
         rawIndexRemovals.reserveCapacity(ids.count)
         var modifiedPageIDs: [Int] = []
+        // Collect modified pages for batch save (non-transactional)
+        var deferredPages: [DatabasePage] = []
 
         // Group RIDs by page using the cache
         var idsByPage = [Int: [UInt64]]()
@@ -777,7 +809,7 @@ public final class StorageEngine: @unchecked Sendable {
                 if transactionContext != nil {
                     try await savePage(page, transactionContext: transactionContext, skipAfterImage: true)
                 } else {
-                    try await savePageDeferred(page)
+                    deferredPages.append(page)
                 }
                 totalDeleted += deletedFromPage
                 modifiedPageIDs.append(pageID)
@@ -819,7 +851,7 @@ public final class StorageEngine: @unchecked Sendable {
                     if transactionContext != nil {
                         try await savePage(page, transactionContext: transactionContext, skipAfterImage: true)
                     } else {
-                        try await savePageDeferred(page)
+                        deferredPages.append(page)
                     }
                     totalDeleted += deletedFromPage
                     modifiedPageIDs.append(currentPageID)
@@ -827,8 +859,9 @@ public final class StorageEngine: @unchecked Sendable {
             }
         }
 
-        // Flush dirty pages for non-transactional deletes
-        if transactionContext == nil && totalDeleted > 0 {
+        // Batch save all deferred pages at once, then flush to disk
+        if transactionContext == nil && !deferredPages.isEmpty {
+            try savePagesDeferred(deferredPages)
             try await flushDirtyPages(Set(modifiedPageIDs))
         }
 
@@ -1091,6 +1124,98 @@ public final class StorageEngine: @unchecked Sendable {
         }
 
         return results
+    }
+
+    /// Fetch records by ordered RID list, returning results in the SAME order as input.
+    /// Groups RIDs by page for efficient batch loading, then restores original order.
+    public func getRecordsByIDsOrdered(_ orderedIDs: [UInt64], tableName: String, transactionContext: TransactionContext? = nil) async throws -> [Row] {
+        guard !orderedIDs.isEmpty else { return [] }
+        guard let tableInfo = tableRegistry.getTableInfo(name: tableName) else {
+            throw PantryError.tableNotFound(name: tableName)
+        }
+
+        let schema = tableInfo.schema
+        var result = [Row?](repeating: nil, count: orderedIDs.count)
+
+        // Build RID → position(s) mapping and group by page using RID cache
+        var ridToPositions = [UInt64: [Int]](minimumCapacity: orderedIDs.count)
+        for (i, rid) in orderedIDs.enumerated() {
+            ridToPositions[rid, default: []].append(i)
+        }
+
+        var idsByPage = [Int: [UInt64]]()
+        var uncachedIDs = [UInt64]()
+        let ridCache = _state.withLock { $0.ridPageMap[tableName] }
+        if let cache = ridCache, !cache.isEmpty {
+            for rid in orderedIDs {
+                if let pageID = cache[rid] {
+                    idsByPage[pageID, default: []].append(rid)
+                } else {
+                    uncachedIDs.append(rid)
+                }
+            }
+        } else {
+            uncachedIDs = orderedIDs
+        }
+
+        // Load cached pages
+        for (pageID, pageRIDs) in idsByPage {
+            let page = transactionContext == nil
+                ? try await getPageConcurrent(pageID: pageID)
+                : try await getPage(pageID: pageID, transactionContext: transactionContext)
+            let idSet = Set(pageRIDs)
+            for record in page.records where idSet.contains(record.id) {
+                if let row = Row.fromBytesAuto(record.data, schema: schema),
+                   let positions = ridToPositions[record.id] {
+                    for pos in positions {
+                        result[pos] = row
+                    }
+                }
+            }
+        }
+
+        // Scan for uncached RIDs
+        if !uncachedIDs.isEmpty {
+            let uncachedSet = Set(uncachedIDs)
+            var remaining = uncachedSet
+            let pageList = tableInfo.pageList ?? []
+            for currentPageID in pageList {
+                guard !remaining.isEmpty else { break }
+                let page = transactionContext == nil
+                    ? try await getPageConcurrent(pageID: currentPageID)
+                    : try await getPage(pageID: currentPageID, transactionContext: transactionContext)
+                for record in page.records {
+                    _state.withLock { $0.ridPageMap[tableName, default: [:]][record.id] = currentPageID }
+                    guard remaining.contains(record.id) else { continue }
+                    if let row = Row.fromBytesAuto(record.data, schema: schema),
+                       let positions = ridToPositions[record.id] {
+                        for pos in positions {
+                            result[pos] = row
+                        }
+                    }
+                    remaining.remove(record.id)
+                }
+            }
+        }
+
+        return result.compactMap { $0 }
+    }
+
+    /// Single-record fetch by RID: avoids Set overhead of getRecordsByIDs.
+    public func getRecordByID(_ id: UInt64, tableName: String, transactionContext: TransactionContext? = nil) async throws -> Row? {
+        let schema = getTableSchema(tableName)
+        let cachedPageID: Int? = _state.withLock { $0.ridPageMap[tableName]?[id] }
+        if let pageID = cachedPageID {
+            let page = transactionContext == nil
+                ? try await getPageConcurrent(pageID: pageID)
+                : try await getPage(pageID: pageID, transactionContext: transactionContext)
+            for record in page.records where record.id == id {
+                return Row.fromBytesAuto(record.data, schema: schema)
+            }
+        }
+        // Fallback to general path
+        let records = try await getRecordsByIDs(Set([id]), tableName: tableName, transactionContext: transactionContext)
+        return records.first?.1
     }
 
     /// Batch lookup returning (Record, Row, pageID) tuples for direct page access in DELETE/UPDATE.

@@ -149,6 +149,36 @@ public final class PageBackedNodeStore: @unchecked Sendable {
         }
     }
 
+    /// Load a full root-to-leaf path from cache under a single lock acquisition.
+    /// Returns the leaf node, or nil if any node in the path is a cache miss.
+    public func loadPathCached(rootId: UUID, searchKey: DBValue) -> BTreeNode? {
+        state.withLock { s in
+            guard var current = s.nodeCache[rootId] else { return nil }
+            s.nodeCacheCounter += 1
+            s.nodeCacheOrder[rootId] = s.nodeCacheCounter
+            while !current.isLeaf {
+                // Binary search for correct child
+                let idx = Self.lowerBound(current.keys, searchKey)
+                guard let childId = current.children?[idx],
+                      let child = s.nodeCache[childId] else { return nil }
+                s.nodeCacheCounter += 1
+                s.nodeCacheOrder[childId] = s.nodeCacheCounter
+                current = child
+            }
+            return current
+        }
+    }
+
+    /// Binary search for the first index where keys[index] >= key (lower bound)
+    private static func lowerBound(_ keys: [DBValue], _ key: DBValue) -> Int {
+        var lo = 0, hi = keys.count
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2
+            if keys[mid] < key { lo = mid + 1 } else { hi = mid }
+        }
+        return lo
+    }
+
     /// Remove a node from the page map and cache (e.g. after merge absorbs it)
     public func removeNode(nodeId: UUID) {
         state.withLock { s in
