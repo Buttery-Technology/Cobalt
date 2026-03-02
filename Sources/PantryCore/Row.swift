@@ -129,6 +129,75 @@ extension Row {
         return buf
     }
 
+    /// Pre-computed patch info: column ordinal + serialized new value bytes.
+    /// Build once before a page loop, reuse for every record.
+    public struct PatchTemplate {
+        public let columnIndex: Int
+        public let newValueBytes: Data
+        public let newIsNull: Bool
+
+        public init?(columnName: String, newValue: DBValue, schema: PantryTableSchema) {
+            guard let idx = schema.columnOrdinals[columnName] else { return nil }
+            self.columnIndex = idx
+            self.newIsNull = (newValue == .null)
+            if newIsNull {
+                self.newValueBytes = Data()
+            } else {
+                var buf = Data()
+                Row.encodeDBValue(newValue, into: &buf)
+                self.newValueBytes = buf
+            }
+        }
+    }
+
+    /// Build pre-computed patch templates for a set of column updates.
+    /// Returns nil if any column name is not found in schema.
+    public static func buildPatchTemplates(updates: [String: DBValue], schema: PantryTableSchema) -> [PatchTemplate]? {
+        var templates = [PatchTemplate]()
+        templates.reserveCapacity(updates.count)
+        for (colName, newVal) in updates {
+            guard let t = PatchTemplate(columnName: colName, newValue: newVal, schema: schema) else { return nil }
+            templates.append(t)
+        }
+        return templates
+    }
+
+    /// Patch using pre-computed templates — avoids per-record column ordinal lookups and value encoding.
+    public static func patchPositionalDataPrecomputed(_ data: Data, templates: [PatchTemplate]) -> Data? {
+        let base = data.startIndex
+        guard data.count >= 4,
+              data[base] == 0xFF,
+              data[base + 1] == 0x03 else { return nil }
+
+        let colCount = Int(UInt16(data[base + 2]) | (UInt16(data[base + 3]) << 8))
+        let bitmapBytes = (colCount + 7) / 8
+        let bitmapStart = base + 4
+        let offsetTableStart = bitmapStart + bitmapBytes
+        let valuesStart = offsetTableStart + colCount * 2
+
+        guard valuesStart <= data.endIndex else { return nil }
+
+        var patched = data
+        for t in templates {
+            guard t.columnIndex < colCount else { return nil }
+            let isCurrentlyNull = (data[bitmapStart + t.columnIndex / 8] & (1 << UInt8(t.columnIndex % 8))) != 0
+            if isCurrentlyNull != t.newIsNull { return nil }
+            if isCurrentlyNull { continue }
+
+            let offsetPos = offsetTableStart + t.columnIndex * 2
+            let relOffset = Int(UInt16(data[offsetPos]) | (UInt16(data[offsetPos + 1]) << 8))
+            let valueStart = valuesStart + relOffset
+
+            var endOffset = valueStart
+            guard skipDBValue(in: data, at: &endOffset) else { return nil }
+            let oldSize = endOffset - valueStart
+
+            guard t.newValueBytes.count == oldSize else { return nil }
+            patched.replaceSubrange(valueStart..<endOffset, with: t.newValueBytes)
+        }
+        return patched
+    }
+
     /// Patch specific columns in positional v3 data without full deserialization.
     /// Returns patched data if all updates are same-size, nil otherwise (fall through to full path).
     public static func patchPositionalData(_ data: Data, schema: PantryTableSchema, updates: [String: DBValue]) -> Data? {

@@ -17,6 +17,15 @@ private struct QueryResultCacheKey: Hashable {
     let conditionSignature: String
     let columns: [String]?
     let modifiersSignature: String
+    /// Additional tables involved (e.g., join targets). Empty for single-table queries.
+    let joinTables: [String]
+    init(table: String, conditionSignature: String, columns: [String]?, modifiersSignature: String, joinTables: [String] = []) {
+        self.table = table
+        self.conditionSignature = conditionSignature
+        self.columns = columns
+        self.modifiersSignature = modifiersSignature
+        self.joinTables = joinTables
+    }
 }
 
 /// Cached query result with generation tracking and page-level invalidation
@@ -26,6 +35,8 @@ private struct CachedQueryResult {
     var lastAccess: UInt64
     /// Pages accessed to produce this result. nil = unknown (conservative invalidation).
     let accessedPages: Set<Int>?
+    /// Generations of additional tables at cache time (for join queries).
+    let joinGenerations: [String: UInt64]
 }
 
 /// Executes SELECT, INSERT, UPDATE, DELETE queries against the storage engine.
@@ -78,12 +89,16 @@ public final class QueryExecutor: @unchecked Sendable {
             cs.tableGenerations[table, default: 0] += 1
             if let modified = modifiedPages {
                 cs.resultCache = cs.resultCache.filter { entry in
-                    guard entry.key.table == table else { return true }
+                    // Invalidate if primary table matches or if this table is a join target
+                    let involves = entry.key.table == table || entry.key.joinTables.contains(table)
+                    guard involves else { return true }
                     guard let accessed = entry.value.accessedPages else { return false }
                     return accessed.isDisjoint(with: modified)
                 }
             } else {
-                cs.resultCache = cs.resultCache.filter { $0.key.table != table }
+                cs.resultCache = cs.resultCache.filter { entry in
+                    entry.key.table != table && !entry.key.joinTables.contains(table)
+                }
             }
         }
     }
@@ -94,6 +109,10 @@ public final class QueryExecutor: @unchecked Sendable {
             guard let cached = cs.resultCache[key],
                   cached.generation == cs.tableGenerations[key.table, default: 0] else {
                 return nil
+            }
+            // For join queries, also verify all join table generations are still valid
+            for (jt, gen) in cached.joinGenerations {
+                guard gen == cs.tableGenerations[jt, default: 0] else { return nil }
             }
             cs.resultCacheCounter += 1
             cs.resultCache[key]?.lastAccess = cs.resultCacheCounter
@@ -133,12 +152,19 @@ public final class QueryExecutor: @unchecked Sendable {
                 }
             }
 
+            // Capture generations for all join tables
+            var joinGens = [String: UInt64]()
+            for jt in key.joinTables {
+                joinGens[jt] = cs.tableGenerations[jt, default: 0]
+            }
+
             cs.resultCacheCounter += 1
             cs.resultCache[key] = CachedQueryResult(
                 rows: rows,
                 generation: cs.tableGenerations[key.table, default: 0],
                 lastAccess: cs.resultCacheCounter,
-                accessedPages: accessedPages
+                accessedPages: accessedPages,
+                joinGenerations: joinGens
             )
         }
     }
@@ -165,6 +191,33 @@ public final class QueryExecutor: @unchecked Sendable {
 
         var rows: [Row]
 
+        // Ultra-fast path: equality lookup on indexed column with LIMIT 1 (e.g., WHERE pk = ? LIMIT 1)
+        // Fuses index lookup + single record fetch, bypassing query planner entirely.
+        if let cond = condition, let mods = modifiers, mods.limit == 1, !mods.distinct,
+           (mods.orderBy == nil || mods.orderBy!.isEmpty) {
+            if case .equals(let column, let value) = cond, value != .null {
+                if let index = indexManager.getIndex(tableName: table, columnName: column) {
+                    if let indexRows = index.searchCached(key: value), !indexRows.isEmpty {
+                        if case .integer(let ridSigned) = indexRows[0].values["__rid"] {
+                            let rid = UInt64(bitPattern: ridSigned)
+                            if let row = try await storageEngine.getRecordByID(rid, tableName: table, transactionContext: transactionContext) {
+                                var resultRows: [Row]
+                                if let columns = columns, !columns.isEmpty {
+                                    let projected = columns.reduce(into: [String: DBValue]()) { r, c in r[c] = row.values[c] ?? .null }
+                                    resultRows = [Row(values: projected)]
+                                } else {
+                                    resultRows = [row]
+                                }
+                                if let key = cacheKey { storeResultCache(key: key, rows: resultRows) }
+                                return resultRows
+                            }
+                        }
+                    }
+                    // Fall through on cache miss — normal path will handle it
+                }
+            }
+        }
+
         // Fast path: ORDER BY + LIMIT on a single indexed column → index-ordered scan with early exit
         // Works with or without WHERE condition. For WHERE, overfetches and filters.
         if let mods = modifiers,
@@ -190,34 +243,27 @@ public final class QueryExecutor: @unchecked Sendable {
 
                 // With WHERE, overfetch to account for filtered-out rows
                 let fetchLimit = condition != nil ? totalNeeded * 4 : totalNeeded
-                let indexRows: [Row]
-                if let cached = index.searchRangeWithLimitCached(from: nil, to: nil, limit: fetchLimit, ascending: ascending) {
-                    indexRows = cached
-                } else {
-                    indexRows = try await index.searchRangeWithLimit(from: nil, to: nil, limit: fetchLimit, ascending: ascending)
-                }
 
                 var orderedRows: [Row]
                 if isCovering {
-                    // Covering index: use index rows directly, skip full record fetch
+                    // Covering index: fetch Row-based results directly
+                    let indexRows: [Row]
+                    if let cached = index.searchRangeWithLimitCached(from: nil, to: nil, limit: fetchLimit, ascending: ascending) {
+                        indexRows = cached
+                    } else {
+                        indexRows = try await index.searchRangeWithLimit(from: nil, to: nil, limit: fetchLimit, ascending: ascending)
+                    }
                     orderedRows = indexRows
                 } else {
-                    // Non-covering: fetch full rows by RID, preserving index order
-                    let ridList = indexRows.compactMap { row -> UInt64? in
-                        guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
-                        return UInt64(bitPattern: ridSigned)
-                    }
-                    let fullRecords = try await storageEngine.getRecordsByIDs(Set(ridList), tableName: table, transactionContext: transactionContext)
-
-                    // For small result sets, use linear scan to preserve order (avoids dictionary allocation)
-                    if ridList.count <= 64 {
-                        orderedRows = ridList.compactMap { targetRID in
-                            fullRecords.first { $0.0.id == targetRID }?.1
-                        }
+                    // Non-covering: RID-only scan avoids intermediate Row allocation
+                    let orderedRIDs: [UInt64]
+                    if let cached = index.searchRangeWithLimitRIDsCached(from: nil, to: nil, limit: fetchLimit, ascending: ascending) {
+                        orderedRIDs = cached
                     } else {
-                        let ridToRow = Dictionary(fullRecords.map { ($0.0.id, $0.1) }, uniquingKeysWith: { a, _ in a })
-                        orderedRows = ridList.compactMap { ridToRow[$0] }
+                        orderedRIDs = try await index.searchRangeWithLimitRIDs(from: nil, to: nil, limit: fetchLimit, ascending: ascending)
                     }
+                    // Fetch full rows preserving index order (no Set, no dictionary)
+                    orderedRows = try await storageEngine.getRecordsByIDsOrdered(orderedRIDs, tableName: table, transactionContext: transactionContext)
                 }
 
                 // Apply WHERE filter if present
@@ -235,11 +281,14 @@ public final class QueryExecutor: @unchecked Sendable {
 
                     // Project columns
                     if let columns = columns, !columns.isEmpty {
-                        return rows.map { row in
-                            let projected = columns.reduce(into: [String: DBValue]()) { r, c in r[c] = row.values[c] ?? .null }
-                            return Row(values: projected)
+                        let projected = rows.map { row in
+                            let p = columns.reduce(into: [String: DBValue]()) { r, c in r[c] = row.values[c] ?? .null }
+                            return Row(values: p)
                         }
+                        if let key = cacheKey { storeResultCache(key: key, rows: projected) }
+                        return projected
                     }
+                    if let key = cacheKey { storeResultCache(key: key, rows: rows) }
                     return rows
                 }
                 // Not enough rows from overfetch — fall through to full scan
@@ -274,20 +323,9 @@ public final class QueryExecutor: @unchecked Sendable {
                 if isCovering {
                     orderedRows = indexRows
                 } else {
-                    // Batch-fetch full rows by RID, preserving index order
-                    let ridList = indexRows.compactMap { row -> UInt64? in
-                        guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
-                        return UInt64(bitPattern: ridSigned)
-                    }
-                    let fullRecords = try await storageEngine.getRecordsByIDs(Set(ridList), tableName: table, transactionContext: transactionContext)
-                    if ridList.count <= 64 {
-                        orderedRows = ridList.compactMap { targetRID in
-                            fullRecords.first { $0.0.id == targetRID }?.1
-                        }
-                    } else {
-                        let ridToRow = Dictionary(fullRecords.map { ($0.0.id, $0.1) }, uniquingKeysWith: { a, _ in a })
-                        orderedRows = ridList.compactMap { ridToRow[$0] }
-                    }
+                    // Use RID-only scan + ordered fetch to preserve index order
+                    let orderedRIDs = try await index.searchRangeWithLimitRIDs(from: nil, to: nil, limit: Int.max, ascending: ascending)
+                    orderedRows = try await storageEngine.getRecordsByIDsOrdered(orderedRIDs, tableName: table, transactionContext: transactionContext)
                 }
 
                 // Apply WHERE filter if present
@@ -464,6 +502,25 @@ public final class QueryExecutor: @unchecked Sendable {
     // MARK: - JOIN
 
     public func executeJoin(from table: String, joins: [JoinClause], columns: [String]? = nil, where condition: WhereCondition? = nil, modifiers: QueryModifiers? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {
+        // Query result cache for JOINs: skip for transactional queries
+        let joinCacheKey: QueryResultCacheKey?
+        if transactionContext == nil {
+            let joinSig = joins.map { "\($0.type):\($0.table).\($0.rightColumn)=\($0.leftColumn)" }.joined(separator: "|")
+            let key = QueryResultCacheKey(
+                table: table,
+                conditionSignature: (condition.map { queryConditionSignature($0) } ?? "") + "J:" + joinSig,
+                columns: columns,
+                modifiersSignature: modifiers.map { queryModifiersSignature($0) } ?? "",
+                joinTables: joins.map { $0.table }
+            )
+            if let cached = lookupResultCache(key: key) {
+                return cached
+            }
+            joinCacheKey = key
+        } else {
+            joinCacheKey = nil
+        }
+
         // Fast path: single INNER JOIN + LIMIT + index on right join column
         // Streams through left table and probes right index, stopping at LIMIT.
         // Avoids scanning the right table entirely and can short-circuit left scan.
@@ -553,6 +610,7 @@ public final class QueryExecutor: @unchecked Sendable {
                         return Row(values: projected)
                     }
                 }
+                if let key = joinCacheKey { storeResultCache(key: key, rows: result) }
                 return result
             }
         }
@@ -806,12 +864,15 @@ public final class QueryExecutor: @unchecked Sendable {
 
         // Project columns
         if let columns = columns, !columns.isEmpty {
-            return result.map { row in
+            let projected = result.map { row in
                 let projected = columns.reduce(into: [String: DBValue]()) { r, c in r[c] = row.values[c] ?? .null }
                 return Row(values: projected)
             }
+            if let key = joinCacheKey { storeResultCache(key: key, rows: projected) }
+            return projected
         }
 
+        if let key = joinCacheKey { storeResultCache(key: key, rows: result) }
         return result
     }
 
@@ -1250,6 +1311,9 @@ public final class QueryExecutor: @unchecked Sendable {
             let colMap = updateSchema?.columnOrdinals
             let ridPages = storageEngine.getRIDPageMapping(matchingRIDs, tableName: table)
 
+            // Pre-compute patch templates for reuse across all records
+            let patchTemplates: [Row.PatchTemplate]? = updateSchema.flatMap { Row.buildPatchTemplates(updates: values, schema: $0) }
+
             var updatedCount = 0
             var modifiedPages = Set<Int>()
 
@@ -1270,9 +1334,9 @@ public final class QueryExecutor: @unchecked Sendable {
                         }
                     }
 
-                    // Fast path: patch raw bytes in-place (skips Row decode entirely)
-                    if let schema = updateSchema,
-                       let patchedData = Row.patchPositionalData(record.data, schema: schema, updates: values) {
+                    // Fast path: patch raw bytes in-place using pre-computed templates
+                    if let templates = patchTemplates,
+                       let patchedData = Row.patchPositionalDataPrecomputed(record.data, templates: templates) {
                         let newRecord = Record(id: record.id, data: patchedData)
                         if page.replaceRecordAndPatch(id: record.id, with: newRecord) {
                             pageModified = true
@@ -1322,8 +1386,8 @@ public final class QueryExecutor: @unchecked Sendable {
                             if !lazyResult { continue }
                         }
                     }
-                    if let schema = updateSchema,
-                       let patchedData = Row.patchPositionalData(record.data, schema: schema, updates: values) {
+                    if let templates = patchTemplates,
+                       let patchedData = Row.patchPositionalDataPrecomputed(record.data, templates: templates) {
                         let newRecord = Record(id: record.id, data: patchedData)
                         try await storageEngine.replaceRecordInPlace(id: record.id, newRecord: newRecord, tableName: table, transactionContext: transactionContext, knownPageID: recordPageID)
                     } else {
@@ -1355,6 +1419,9 @@ public final class QueryExecutor: @unchecked Sendable {
         let updateColMap = updateSchema?.columnOrdinals
         var modifiedPages = Set<Int>()
 
+        // Pre-compute patch templates for reuse across all records
+        let scanPatchTemplates: [Row.PatchTemplate]? = updateSchema.flatMap { Row.buildPatchTemplates(updates: values, schema: $0) }
+
         for pageID in pageIDs {
             var page = transactionContext == nil
                 ? try await storageEngine.getPageConcurrent(pageID: pageID)
@@ -1379,9 +1446,9 @@ public final class QueryExecutor: @unchecked Sendable {
                 if condition == nil || evaluateCondition(condition!, row: row) {
                     let newRecord: Record
                     let updatedRow: Row
-                    // Fast path: patch raw bytes in-place (skips Row copy + merge + serialize)
-                    if let schema = updateSchema,
-                       let patchedData = Row.patchPositionalData(data, schema: schema, updates: values) {
+                    // Fast path: patch raw bytes in-place using pre-computed templates
+                    if let templates = scanPatchTemplates,
+                       let patchedData = Row.patchPositionalDataPrecomputed(data, templates: templates) {
                         newRecord = Record(id: record.id, data: patchedData)
                         updatedRow = row // original row for overflow fallback
                     } else {
@@ -2304,11 +2371,19 @@ public final class QueryExecutor: @unchecked Sendable {
             rightRowsByRID[record.id] = row
         }
 
-        // Build combined rows using pre-computed prefixes
+        // Build combined rows using pre-computed prefixes, caching left row deserialization
+        var leftRowCache = [Data: Row]()
         for (key, recordData) in batch {
             if result.count >= totalNeeded { break }
             guard let rids = ridsByKey[key], !rids.isEmpty else { continue }
-            guard let leftRow = Row.fromBytesAuto(recordData, schema: leftSchema) else { continue }
+            let leftRow: Row
+            if let cached = leftRowCache[recordData] {
+                leftRow = cached
+            } else {
+                guard let decoded = Row.fromBytesAuto(recordData, schema: leftSchema) else { continue }
+                leftRowCache[recordData] = decoded
+                leftRow = decoded
+            }
             for rid in rids {
                 if result.count >= totalNeeded { break }
                 guard let rightRow = rightRowsByRID[rid] else { continue }

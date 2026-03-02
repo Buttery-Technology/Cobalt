@@ -65,12 +65,39 @@ public final class BTree: @unchecked Sendable {
 
     /// Synchronous search using only cached B-tree nodes. Returns nil on any cache miss.
     /// Eliminates all async overhead for warm-cache lookups.
+    /// Uses single-lock path traversal for minimal lock overhead.
     public func searchCached(key: DBValue) -> [Row]? {
-        guard let rootId = rootId,
-              let root = nodeStore.loadNodeCached(nodeId: rootId) else {
-            return nil
+        guard let rootId = rootId else { return nil }
+
+        // Fast path: single-lock root→leaf traversal
+        if let leaf = nodeStore.loadPathCached(rootId: rootId, searchKey: key) {
+            return searchLeafCached(leaf: leaf, key: key)
         }
+        // Fallback: per-node traversal (shouldn't normally happen if path is warm)
+        guard let root = nodeStore.loadNodeCached(nodeId: rootId) else { return nil }
         return searchNodeCached(node: root, key: key)
+    }
+
+    /// Search within a leaf node and follow sibling pointers for duplicates.
+    private func searchLeafCached(leaf: BTreeNode, key: DBValue) -> [Row]? {
+        var i = lowerBound(leaf.keys, key)
+        var results: [Row] = []
+        var currentLeaf: BTreeNode? = leaf
+        var j = i
+        while let leaf = currentLeaf {
+            while j < leaf.keys.count && leaf.keys[j] == key {
+                results.append(leaf.values[j])
+                j += 1
+            }
+            if j >= leaf.keys.count, let nextId = leaf.nextLeafId {
+                guard let next = nodeStore.loadNodeCached(nodeId: nextId) else { return nil }
+                currentLeaf = next
+                j = 0
+            } else {
+                break
+            }
+        }
+        return results
     }
 
     private func searchNodeCached(node: BTreeNode, key: DBValue) -> [Row]? {
@@ -377,6 +404,180 @@ public final class BTree: @unchecked Sendable {
             }
         }
         return count
+    }
+
+    // MARK: - Batch Sorted Search
+
+    /// Sorted batch search: given keys in ascending order, traverse the leaf chain once.
+    /// O(log N + K + L) where K=keys, L=leaves visited, vs O(K * log N) for individual searches.
+    public func searchBatchSorted(sortedKeys: [DBValue]) async throws -> [DBValue: [Row]] {
+        guard !sortedKeys.isEmpty, let rootId = rootId,
+              let root = try await nodeStore.loadNode(nodeId: rootId) else { return [:] }
+
+        let (leaf, startIndex) = try await findLeafAndIndex(from: root, key: sortedKeys[0])
+        var currentLeaf: BTreeNode? = leaf
+        var leafIdx = startIndex
+        var keyIdx = 0
+        var results = [DBValue: [Row]]()
+
+        while let leaf = currentLeaf, keyIdx < sortedKeys.count {
+            while leafIdx < leaf.keys.count && keyIdx < sortedKeys.count {
+                let leafKey = leaf.keys[leafIdx]
+                let searchKey = sortedKeys[keyIdx]
+                if leafKey < searchKey {
+                    leafIdx += 1
+                } else if leafKey == searchKey {
+                    results[searchKey, default: []].append(leaf.values[leafIdx])
+                    leafIdx += 1
+                } else {
+                    keyIdx += 1
+                }
+            }
+            if let nextId = leaf.nextLeafId {
+                currentLeaf = try await nodeStore.loadNode(nodeId: nextId)
+                leafIdx = 0
+            } else {
+                break
+            }
+        }
+        return results
+    }
+
+    /// Synchronous cache-only sorted batch search. Returns nil on any cache miss.
+    public func searchBatchSortedCached(sortedKeys: [DBValue]) -> [DBValue: [Row]]? {
+        guard !sortedKeys.isEmpty, let rootId = rootId,
+              let root = nodeStore.loadNodeCached(nodeId: rootId) else {
+            return sortedKeys.isEmpty ? [:] : nil
+        }
+
+        guard let (leaf, startIndex) = findLeafAndIndexCached(from: root, key: sortedKeys[0]) else { return nil }
+        var currentLeaf: BTreeNode? = leaf
+        var leafIdx = startIndex
+        var keyIdx = 0
+        var results = [DBValue: [Row]]()
+
+        while let leaf = currentLeaf, keyIdx < sortedKeys.count {
+            while leafIdx < leaf.keys.count && keyIdx < sortedKeys.count {
+                let leafKey = leaf.keys[leafIdx]
+                let searchKey = sortedKeys[keyIdx]
+                if leafKey < searchKey {
+                    leafIdx += 1
+                } else if leafKey == searchKey {
+                    results[searchKey, default: []].append(leaf.values[leafIdx])
+                    leafIdx += 1
+                } else {
+                    keyIdx += 1
+                }
+            }
+            if let nextId = leaf.nextLeafId {
+                guard let next = nodeStore.loadNodeCached(nodeId: nextId) else { return nil }
+                currentLeaf = next
+                leafIdx = 0
+            } else {
+                break
+            }
+        }
+        return results
+    }
+
+    // MARK: - RID-Only Range Scan
+
+    /// Range scan returning only RIDs in index order (no Row allocation).
+    public func searchRangeWithLimitRIDs(from startKey: DBValue?, to endKey: DBValue?, limit: Int, ascending: Bool = true) async throws -> [UInt64] {
+        guard let rootId = rootId,
+              let root = try await nodeStore.loadNode(nodeId: rootId) else { return [] }
+        var results = [UInt64]()
+        results.reserveCapacity(limit)
+        if ascending {
+            let (leaf, startIndex) = try await findLeafAndIndex(from: root, key: startKey)
+            var currentLeaf: BTreeNode? = leaf
+            var i = startIndex
+            while let leaf = currentLeaf, results.count < limit {
+                while i < leaf.keys.count && results.count < limit {
+                    if let end = endKey, leaf.keys[i] > end { return results }
+                    if case .integer(let ridSigned) = leaf.values[i].values["__rid"] {
+                        results.append(UInt64(bitPattern: ridSigned))
+                    }
+                    i += 1
+                }
+                if let nextId = leaf.nextLeafId {
+                    currentLeaf = try await nodeStore.loadNode(nodeId: nextId)
+                    i = 0
+                } else {
+                    currentLeaf = nil
+                }
+            }
+        } else {
+            let (leaf, endIndex) = try await findLeafAndIndexReverse(from: root, key: endKey)
+            var currentLeaf: BTreeNode? = leaf
+            var i = endIndex
+            while let leaf = currentLeaf, results.count < limit {
+                while i >= 0 && results.count < limit {
+                    if let start = startKey, leaf.keys[i] < start { return results }
+                    if case .integer(let ridSigned) = leaf.values[i].values["__rid"] {
+                        results.append(UInt64(bitPattern: ridSigned))
+                    }
+                    i -= 1
+                }
+                if let prevId = leaf.prevLeafId {
+                    currentLeaf = try await nodeStore.loadNode(nodeId: prevId)
+                    i = (currentLeaf?.keys.count ?? 0) - 1
+                } else {
+                    currentLeaf = nil
+                }
+            }
+        }
+        return results
+    }
+
+    /// Synchronous cache-only RID range scan. Returns nil on any cache miss.
+    public func searchRangeWithLimitRIDsCached(from startKey: DBValue?, to endKey: DBValue?, limit: Int, ascending: Bool = true) -> [UInt64]? {
+        guard let rootId = rootId,
+              let root = nodeStore.loadNodeCached(nodeId: rootId) else { return nil }
+        var results = [UInt64]()
+        results.reserveCapacity(limit)
+        if ascending {
+            guard let (leaf, startIndex) = findLeafAndIndexCached(from: root, key: startKey) else { return nil }
+            var currentLeaf: BTreeNode? = leaf
+            var i = startIndex
+            while let leaf = currentLeaf, results.count < limit {
+                while i < leaf.keys.count && results.count < limit {
+                    if let end = endKey, leaf.keys[i] > end { return results }
+                    if case .integer(let ridSigned) = leaf.values[i].values["__rid"] {
+                        results.append(UInt64(bitPattern: ridSigned))
+                    }
+                    i += 1
+                }
+                if let nextId = leaf.nextLeafId {
+                    guard let next = nodeStore.loadNodeCached(nodeId: nextId) else { return nil }
+                    currentLeaf = next
+                    i = 0
+                } else {
+                    currentLeaf = nil
+                }
+            }
+        } else {
+            guard let (leaf, endIndex) = findLeafAndIndexReverseCached(from: root, key: endKey) else { return nil }
+            var currentLeaf: BTreeNode? = leaf
+            var i = endIndex
+            while let leaf = currentLeaf, results.count < limit {
+                while i >= 0 && results.count < limit {
+                    if let start = startKey, leaf.keys[i] < start { return results }
+                    if case .integer(let ridSigned) = leaf.values[i].values["__rid"] {
+                        results.append(UInt64(bitPattern: ridSigned))
+                    }
+                    i -= 1
+                }
+                if let prevId = leaf.prevLeafId {
+                    guard let prev = nodeStore.loadNodeCached(nodeId: prevId) else { return nil }
+                    currentLeaf = prev
+                    i = (prev.keys.count) - 1
+                } else {
+                    currentLeaf = nil
+                }
+            }
+        }
+        return results
     }
 
     // MARK: - Delete

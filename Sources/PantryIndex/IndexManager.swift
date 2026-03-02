@@ -134,18 +134,21 @@ public final class ColumnIndex: @unchecked Sendable {
                 return s.bloomFilter.contains(key.indexKey)
             }
         }
+        guard !filteredKeys.isEmpty else { return [:] }
+
+        // Sort keys and use single leaf-chain traversal instead of N individual searches
+        let sortedKeys = filteredKeys.sorted()
+        guard let rawResults = btree.searchBatchSortedCached(sortedKeys: sortedKeys) else { return nil }
+
         var results = [DBValue: [Row]]()
-        for key in filteredKeys {
-            guard let rows = btree.searchCached(key: key) else { return nil }
-            if !rows.isEmpty {
-                results[key] = rows.map { reconstructRow($0, key: key) }
-            }
+        for (key, rows) in rawResults where !rows.isEmpty {
+            results[key] = rows.map { reconstructRow($0, key: key) }
         }
         return results
     }
 
     /// Batch search for multiple keys. Returns a dictionary of key -> [Row].
-    /// Much faster than individual search() calls for joins since it avoids per-key overhead.
+    /// Uses sorted leaf-chain traversal: O(log N + K + L) vs O(K * log N) for individual searches.
     public func searchBatch(keys: [DBValue]) async throws -> [DBValue: [Row]] {
         // Pre-filter keys through bloom filter + hash set under a single lock acquisition
         let filteredKeys: [DBValue] = _mutable.withLock { s in
@@ -156,12 +159,15 @@ public final class ColumnIndex: @unchecked Sendable {
                 return s.bloomFilter.contains(key.indexKey)
             }
         }
+        guard !filteredKeys.isEmpty else { return [:] }
+
+        // Sort keys and use single leaf-chain traversal
+        let sortedKeys = filteredKeys.sorted()
+        let rawResults = try await btree.searchBatchSorted(sortedKeys: sortedKeys)
+
         var results = [DBValue: [Row]]()
-        for key in filteredKeys {
-            let rows = try await btree.search(key: key)
-            if !rows.isEmpty {
-                results[key] = rows.map { reconstructRow($0, key: key) }
-            }
+        for (key, rows) in rawResults where !rows.isEmpty {
+            results[key] = rows.map { reconstructRow($0, key: key) }
         }
         return results
     }
@@ -180,6 +186,16 @@ public final class ColumnIndex: @unchecked Sendable {
     /// Synchronous cache-only range query with limit. Returns nil on cache miss.
     public func searchRangeWithLimitCached(from startKey: DBValue?, to endKey: DBValue?, limit: Int, ascending: Bool = true) -> [Row]? {
         btree.searchRangeWithLimitCached(from: startKey, to: endKey, limit: limit, ascending: ascending)
+    }
+
+    /// Range query returning only RIDs in index order (no Row allocation)
+    public func searchRangeWithLimitRIDs(from startKey: DBValue?, to endKey: DBValue?, limit: Int, ascending: Bool = true) async throws -> [UInt64] {
+        try await btree.searchRangeWithLimitRIDs(from: startKey, to: endKey, limit: limit, ascending: ascending)
+    }
+
+    /// Synchronous cache-only RID range query. Returns nil on cache miss.
+    public func searchRangeWithLimitRIDsCached(from startKey: DBValue?, to endKey: DBValue?, limit: Int, ascending: Bool = true) -> [UInt64]? {
+        btree.searchRangeWithLimitRIDsCached(from: startKey, to: endKey, limit: limit, ascending: ascending)
     }
 
     /// Range scan from a lower bound, collecting while predicate holds on keys
