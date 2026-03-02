@@ -65,12 +65,14 @@ public actor ColumnIndex: Sendable {
         if !bloomFilter.contains(key.indexKey) {
             return [] // Definitive miss from bloom filter
         }
-        return try await btree.search(key: key)
+        let results = try await btree.search(key: key)
+        return results.map { reconstructRow($0, key: key) }
     }
 
-    /// Range query on this index
+    /// Range query on this index (returns rows with column values reconstructed from keys)
     public func searchRange(from startKey: DBValue?, to endKey: DBValue?) async throws -> [Row] {
-        try await btree.searchRange(from: startKey, to: endKey)
+        let keyed = try await btree.searchRangeKeyed(from: startKey, to: endKey)
+        return keyed.map { reconstructRow($0.1, key: $0.0) }
     }
 
     /// Range query with early termination after `limit` rows, in ascending or descending order
@@ -81,6 +83,23 @@ public actor ColumnIndex: Sendable {
     /// Range scan from a lower bound, collecting while predicate holds on keys
     public func searchRangeWhile(from startKey: DBValue?, predicate: @Sendable (DBValue) -> Bool) async throws -> [Row] {
         try await btree.searchRangeWhile(from: startKey, predicate: predicate)
+    }
+
+    /// Reconstruct a slim row from a TID-only row by adding column values from the B-tree key
+    private nonisolated func reconstructRow(_ row: Row, key: DBValue) -> Row {
+        // If row already has column values (legacy data), return as-is
+        if row.values.count > 1 { return row }
+        var vals = row.values
+        if let cols = compoundColumns {
+            if case .compound(let parts) = key {
+                for (i, col) in cols.enumerated() where i < parts.count {
+                    vals[col] = parts[i]
+                }
+            }
+        } else {
+            vals[columnName] = key
+        }
+        return Row(values: vals)
     }
 
     /// Delete a specific (key, row) entry from this index
@@ -264,21 +283,16 @@ public actor IndexManager: IndexHook, Sendable {
                 if !evaluateConditionForIndex(condition, row: row) { continue }
             }
 
+            let tidRow = Row(values: ["__rid": rid])
             if let columns = await columnIndex.compoundColumns {
-                // Compound index: slim row with __rid + indexed columns only
-                var slimValues: [String: DBValue] = ["__rid": rid]
-                let keyValues = columns.map { col -> DBValue in
-                    let v = row.values[col] ?? .null
-                    slimValues[col] = v
-                    return v
-                }
+                // Compound index: key contains all indexed column values
+                let keyValues = columns.map { col -> DBValue in row.values[col] ?? .null }
                 let compoundKey = DBValue.compound(keyValues)
-                try await columnIndex.insert(key: compoundKey, row: Row(values: slimValues))
+                try await columnIndex.insert(key: compoundKey, row: tidRow)
             } else {
                 let columnName = await columnIndex.columnName
                 if let value = row.values[columnName] {
-                    let slimRow = Row(values: ["__rid": rid, columnName: value])
-                    try await columnIndex.insert(key: value, row: slimRow)
+                    try await columnIndex.insert(key: value, row: tidRow)
                 }
             }
         }
@@ -295,20 +309,15 @@ public actor IndexManager: IndexHook, Sendable {
                 if !evaluateConditionForIndex(condition, row: row) { continue }
             }
 
+            let tidRow = Row(values: ["__rid": rid])
             if let columns = await columnIndex.compoundColumns {
-                var slimValues: [String: DBValue] = ["__rid": rid]
-                let keyValues = columns.map { col -> DBValue in
-                    let v = row.values[col] ?? .null
-                    slimValues[col] = v
-                    return v
-                }
+                let keyValues = columns.map { col -> DBValue in row.values[col] ?? .null }
                 let compoundKey = DBValue.compound(keyValues)
-                try await columnIndex.delete(key: compoundKey, row: Row(values: slimValues))
+                try await columnIndex.delete(key: compoundKey, row: tidRow)
             } else {
                 let columnName = await columnIndex.columnName
                 if let value = row.values[columnName] {
-                    let slimRow = Row(values: ["__rid": rid, columnName: value])
-                    try await columnIndex.delete(key: value, row: slimRow)
+                    try await columnIndex.delete(key: value, row: tidRow)
                 }
             }
         }

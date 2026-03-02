@@ -397,84 +397,105 @@ public actor QueryExecutor: Sendable {
     // MARK: - GROUP BY
 
     public func executeGroupBy(from table: String, select expressions: [SelectExpression], where condition: WhereCondition? = nil, groupBy: GroupByClause, modifiers: QueryModifiers? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {
-        // Get filtered rows
-        let baseRows = try await executeSelect(from: table, where: condition, transactionContext: transactionContext)
+        // Streaming hash aggregate: scan pages directly, accumulate per-group state
+        let pageIDs = try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
+        let gbSchema = await storageEngine.getTableSchema(table)
 
-        // Group rows by the specified columns
-        var groups = [[DBValue]: [Row]]()
-        for row in baseRows {
-            let key = groupBy.columns.map { row.values[$0] ?? .null }
-            groups[key, default: []].append(row)
+        // Per-group accumulators: key → (count, per-expression state)
+        struct GroupAccum {
+            var rowCount: Int64 = 0
+            var firstRow: [String: DBValue]? = nil
+            var sums: [String: Double] = [:]
+            var sumHasValue: [String: Bool] = [:]
+            var avgSums: [String: Double] = [:]
+            var avgCounts: [String: Int] = [:]
+            var mins: [String: DBValue] = [:]
+            var maxs: [String: DBValue] = [:]
+            var countNonNull: [String: Int64] = [:]
+        }
+        var groups = [[DBValue]: GroupAccum]()
+
+        for pageID in pageIDs {
+            let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+            for var record in page.records {
+                if record.isOverflow {
+                    record = try await storageEngine.reassembleOverflowRecord(record)
+                }
+                guard let row = Row.fromBytesAuto(record.data, schema: gbSchema) else { continue }
+                if let cond = condition, !evaluateCondition(cond, row: row) { continue }
+
+                let key = groupBy.columns.map { row.values[$0] ?? .null }
+                var accum = groups[key] ?? GroupAccum()
+                accum.rowCount += 1
+                if accum.firstRow == nil { accum.firstRow = row.values }
+
+                for expr in expressions {
+                    switch expr {
+                    case .column: break
+                    case .count(let col):
+                        if let col = col {
+                            if let v = row.values[col], v != .null {
+                                accum.countNonNull[col, default: 0] += 1
+                            }
+                        }
+                    case .sum(let col):
+                        if let v = numericValue(row.values[col]) {
+                            accum.sums[col, default: 0] += v
+                            accum.sumHasValue[col] = true
+                        }
+                    case .avg(let col):
+                        if let v = numericValue(row.values[col]) {
+                            accum.avgSums[col, default: 0] += v
+                            accum.avgCounts[col, default: 0] += 1
+                        }
+                    case .min(let col):
+                        if let v = row.values[col], v != .null {
+                            if accum.mins[col] == nil || v < accum.mins[col]! { accum.mins[col] = v }
+                        }
+                    case .max(let col):
+                        if let v = row.values[col], v != .null {
+                            if accum.maxs[col] == nil || v > accum.maxs[col]! { accum.maxs[col] = v }
+                        }
+                    }
+                }
+                groups[key] = accum
+            }
         }
 
-        // Compute aggregates per group
+        // Finalize results from accumulators
         var resultRows = [Row]()
-        for (key, groupRows) in groups {
+        for (key, accum) in groups {
             var values = [String: DBValue]()
+            for (i, col) in groupBy.columns.enumerated() { values[col] = key[i] }
 
-            // Add group key columns
-            for (i, col) in groupBy.columns.enumerated() {
-                values[col] = key[i]
-            }
-
-            // Compute each select expression
             for expr in expressions {
                 switch expr {
                 case .column(let name):
-                    // Use value from first row in group (same for all grouped rows)
-                    values[name] = groupRows.first?.values[name] ?? .null
-
+                    values[name] = accum.firstRow?[name] ?? .null
                 case .count(let col):
                     let alias = col.map { "COUNT(\($0))" } ?? "COUNT(*)"
                     if let col = col {
-                        let count = groupRows.filter { $0.values[col] != nil && $0.values[col] != .null }.count
-                        values[alias] = .integer(Int64(count))
+                        values[alias] = .integer(accum.countNonNull[col] ?? 0)
                     } else {
-                        values[alias] = .integer(Int64(groupRows.count))
+                        values[alias] = .integer(accum.rowCount)
                     }
-
                 case .sum(let col):
                     let alias = "SUM(\(col))"
-                    var sum: Double = 0
-                    var hasValue = false
-                    for row in groupRows {
-                        if let v = numericValue(row.values[col]) { sum += v; hasValue = true }
-                    }
-                    values[alias] = hasValue ? .double(sum) : .null
-
+                    values[alias] = (accum.sumHasValue[col] ?? false) ? .double(accum.sums[col]!) : .null
                 case .avg(let col):
                     let alias = "AVG(\(col))"
-                    var sum: Double = 0; var count = 0
-                    for row in groupRows {
-                        if let v = numericValue(row.values[col]) { sum += v; count += 1 }
-                    }
-                    values[alias] = count > 0 ? .double(sum / Double(count)) : .null
-
+                    let count = accum.avgCounts[col] ?? 0
+                    values[alias] = count > 0 ? .double(accum.avgSums[col]! / Double(count)) : .null
                 case .min(let col):
-                    let alias = "MIN(\(col))"
-                    var result: DBValue = .null
-                    for row in groupRows {
-                        if let v = row.values[col], v != .null, result == .null || v < result { result = v }
-                    }
-                    values[alias] = result
-
+                    values["MIN(\(col))"] = accum.mins[col] ?? .null
                 case .max(let col):
-                    let alias = "MAX(\(col))"
-                    var result: DBValue = .null
-                    for row in groupRows {
-                        if let v = row.values[col], v != .null, result == .null || v > result { result = v }
-                    }
-                    values[alias] = result
+                    values["MAX(\(col))"] = accum.maxs[col] ?? .null
                 }
             }
 
             let groupRow = Row(values: values)
-
-            // Apply HAVING filter
             if let having = groupBy.having {
-                if evaluateCondition(having, row: groupRow) {
-                    resultRows.append(groupRow)
-                }
+                if evaluateCondition(having, row: groupRow) { resultRows.append(groupRow) }
             } else {
                 resultRows.append(groupRow)
             }
@@ -654,8 +675,11 @@ public actor QueryExecutor: Sendable {
 
                 let rowData = updateSchema != nil ? updatedRow.toBytesPositional(schema: updateSchema!) : updatedRow.toBytes()
                 let newRecord = Record(id: record.id, data: rowData)
-                try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
-                try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
+                let replaced = try await storageEngine.replaceRecordInPlace(id: record.id, newRecord: newRecord, tableName: table, transactionContext: transactionContext)
+                if !replaced {
+                    try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
+                    try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
+                }
                 updatedCount += 1
             }
             if updatedCount > 0 { invalidateResultCache(forTable: table) }
@@ -677,8 +701,11 @@ public actor QueryExecutor: Sendable {
 
                 let rowData = updateSchema != nil ? updatedRow.toBytesPositional(schema: updateSchema!) : updatedRow.toBytes()
                 let newRecord = Record(id: record.id, data: rowData)
-                try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
-                try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
+                let replaced = try await storageEngine.replaceRecordInPlace(id: record.id, newRecord: newRecord, tableName: table, transactionContext: transactionContext)
+                if !replaced {
+                    try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
+                    try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
+                }
                 updatedCount += 1
             }
         }
@@ -1450,32 +1477,39 @@ public actor QueryExecutor: Sendable {
                 return rows
             }
 
+            let cpuCount = max(1, ProcessInfo.processInfo.activeProcessorCount)
+            let chunkCount = max(1, min(pageIDs.count, cpuCount))
             return try await withThrowingTaskGroup(of: (Int, [Row]).self) { group in
-                for (index, pageID) in pageIDs.enumerated() {
+                for chunkIdx in 0..<chunkCount {
+                    let start = chunkIdx * pageIDs.count / chunkCount
+                    let end = (chunkIdx + 1) * pageIDs.count / chunkCount
+                    guard start < end else { continue }
+                    let chunkPageIDs = Array(pageIDs[start..<end])
                     group.addTask { [storageEngine] in
-                        let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
-                        var pageRows: [Row] = []
-                        for var record in page.records {
-                            // Lazy overflow: try partial decode from inline data
-                            if record.isOverflow {
-                                if let needed = neededColumns,
-                                   let partialRow = Row.fromBytesPartial(record.data, neededColumns: needed) {
-                                    if self.evaluateCondition(condition, row: partialRow) {
-                                        pageRows.append(partialRow)
+                        var chunkRows: [Row] = []
+                        for pageID in chunkPageIDs {
+                            let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+                            for var record in page.records {
+                                if record.isOverflow {
+                                    if let needed = neededColumns,
+                                       let partialRow = Row.fromBytesPartial(record.data, neededColumns: needed) {
+                                        if self.evaluateCondition(condition, row: partialRow) {
+                                            chunkRows.append(partialRow)
+                                        }
+                                        continue
                                     }
-                                    continue
+                                    record = try await storageEngine.reassembleOverflowRecord(record)
                                 }
-                                record = try await storageEngine.reassembleOverflowRecord(record)
-                            }
-                            if useLazy, let result = self.evaluateConditionLazy(condition, data: record.data, columnIndexMap: columnIndexMap) {
-                                if result, let row = Row.fromBytesAuto(record.data, schema: schema) {
-                                    pageRows.append(row)
+                                if useLazy, let result = self.evaluateConditionLazy(condition, data: record.data, columnIndexMap: columnIndexMap) {
+                                    if result, let row = Row.fromBytesAuto(record.data, schema: schema) {
+                                        chunkRows.append(row)
+                                    }
+                                } else if let row = Row.fromBytesAuto(record.data, schema: schema), self.evaluateCondition(condition, row: row) {
+                                    chunkRows.append(row)
                                 }
-                            } else if let row = Row.fromBytesAuto(record.data, schema: schema), self.evaluateCondition(condition, row: row) {
-                                pageRows.append(row)
                             }
                         }
-                        return (index, pageRows)
+                        return (chunkIdx, chunkRows)
                     }
                 }
                 var indexed: [(Int, [Row])] = []
@@ -1508,25 +1542,33 @@ public actor QueryExecutor: Sendable {
                 return rows
             }
 
+            let cpuCount = max(1, ProcessInfo.processInfo.activeProcessorCount)
+            let chunkCount = max(1, min(pageIDs.count, cpuCount))
             return try await withThrowingTaskGroup(of: (Int, [Row]).self) { group in
-                for (index, pageID) in pageIDs.enumerated() {
+                for chunkIdx in 0..<chunkCount {
+                    let start = chunkIdx * pageIDs.count / chunkCount
+                    let end = (chunkIdx + 1) * pageIDs.count / chunkCount
+                    guard start < end else { continue }
+                    let chunkPageIDs = Array(pageIDs[start..<end])
                     group.addTask { [storageEngine, schema] in
-                        let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
-                        var pageRows: [Row] = []
-                        for var record in page.records {
-                            if record.isOverflow {
-                                if let needed = neededColumns,
-                                   let partialRow = Row.fromBytesPartial(record.data, neededColumns: needed) {
-                                    pageRows.append(partialRow)
-                                    continue
+                        var chunkRows: [Row] = []
+                        for pageID in chunkPageIDs {
+                            let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+                            for var record in page.records {
+                                if record.isOverflow {
+                                    if let needed = neededColumns,
+                                       let partialRow = Row.fromBytesPartial(record.data, neededColumns: needed) {
+                                        chunkRows.append(partialRow)
+                                        continue
+                                    }
+                                    record = try await storageEngine.reassembleOverflowRecord(record)
                                 }
-                                record = try await storageEngine.reassembleOverflowRecord(record)
-                            }
-                            if let row = Row.fromBytesAuto(record.data, schema: schema) {
-                                pageRows.append(row)
+                                if let row = Row.fromBytesAuto(record.data, schema: schema) {
+                                    chunkRows.append(row)
+                                }
                             }
                         }
-                        return (index, pageRows)
+                        return (chunkIdx, chunkRows)
                     }
                 }
                 var indexed: [(Int, [Row])] = []

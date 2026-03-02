@@ -69,6 +69,12 @@ public struct TableInfo: Codable, Sendable {
     public var schema: PantryTableSchema
     /// Per-column statistics for query optimization (column name → stats)
     public var columnStats: [String: ColumnStats]
+    /// Cached list of all page IDs belonging to this table (nil = not yet populated)
+    public var pageList: [Int]?
+
+    enum CodingKeys: String, CodingKey {
+        case tableID, name, firstPageID, lastPageID, recordCount, schema, columnStats, pageList
+    }
 
     public init(tableID: Int, name: String, firstPageID: Int, lastPageID: Int, recordCount: Int, schema: PantryTableSchema, columnStats: [String: ColumnStats] = [:]) {
         self.tableID = tableID
@@ -78,6 +84,19 @@ public struct TableInfo: Codable, Sendable {
         self.recordCount = recordCount
         self.schema = schema
         self.columnStats = columnStats
+        self.pageList = firstPageID != 0 ? [firstPageID] : []
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        tableID = try container.decode(Int.self, forKey: .tableID)
+        name = try container.decode(String.self, forKey: .name)
+        firstPageID = try container.decode(Int.self, forKey: .firstPageID)
+        lastPageID = try container.decode(Int.self, forKey: .lastPageID)
+        recordCount = try container.decode(Int.self, forKey: .recordCount)
+        schema = try container.decode(PantryTableSchema.self, forKey: .schema)
+        columnStats = try container.decodeIfPresent([String: ColumnStats].self, forKey: .columnStats) ?? [:]
+        pageList = try container.decodeIfPresent([Int].self, forKey: .pageList)
     }
 }
 

@@ -40,9 +40,12 @@ public actor StorageManager: Sendable {
     }
 
     /// Write a page to disk, encrypting if configured (does NOT fsync — call sync() at durability points)
-    public func writePage(_ page: inout DatabasePage) throws {
+    /// Pass `alreadySerialized: true` to skip redundant saveRecords() when the caller has already serialized
+    public func writePage(_ page: inout DatabasePage, alreadySerialized: Bool = false) throws {
         let fh = try requireHandle()
-        try page.saveRecords()
+        if !alreadySerialized {
+            try page.saveRecords()
+        }
 
         let offset = UInt64(page.pageID) * UInt64(diskPageSize)
 
