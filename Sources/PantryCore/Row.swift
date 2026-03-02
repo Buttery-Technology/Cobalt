@@ -89,38 +89,38 @@ extension Row {
         let colCount = schema.columns.count
         let bitmapBytes = (colCount + 7) / 8
         let offsetTableSize = colCount * 2
-        var buf = Data(capacity: 4 + bitmapBytes + offsetTableSize + colCount * 10)
+        // Header: magic(1) + version(1) + colCount(2) + bitmap + offset table
+        let headerSize = 4 + bitmapBytes + offsetTableSize
+        var buf = Data(capacity: headerSize + colCount * 10)
+
+        // Write header + bitmap + offset table in a single contiguous block
         buf.append(0xFF) // magic
-        buf.append(0x03) // version 3: NULL bitmap + offset table
+        buf.append(0x03) // version 3
         buf.appendUInt16(UInt16(colCount))
 
-        // Build NULL bitmap
-        var bitmap = [UInt8](repeating: 0, count: bitmapBytes)
+        // Write bitmap directly into buf (no intermediate array)
+        let bitmapStart = buf.count
+        buf.append(contentsOf: repeatElement(UInt8(0), count: bitmapBytes))
         for (i, col) in schema.columns.enumerated() {
             let value = values[col.name] ?? .null
             if value == .null {
-                bitmap[i / 8] |= (1 << (i % 8))
+                buf[bitmapStart + i / 8] |= (1 << UInt8(i % 8))
             }
         }
-        buf.append(contentsOf: bitmap)
 
-        // Reserve space for offset table (fill with 0xFFFF initially)
+        // Write offset table placeholder directly (0xFF bytes = all 0xFFFF)
         let offsetTableStart = buf.count
-        for _ in 0..<colCount {
-            buf.appendUInt16(0xFFFF)
-        }
+        buf.append(contentsOf: repeatElement(UInt8(0xFF), count: offsetTableSize))
         let valuesStart = buf.count
 
-        // Encode non-NULL values and record offsets
+        // Encode non-NULL values and patch offsets via withUnsafeMutableBytes
         for (i, col) in schema.columns.enumerated() {
-            let isNull = (bitmap[i / 8] & (1 << (i % 8))) != 0
-            if !isNull {
+            if (buf[bitmapStart + i / 8] & (1 << UInt8(i % 8))) == 0 {
                 let relOffset = UInt16(buf.count - valuesStart)
-                // Write offset into the reserved table slot
-                var leOffset = relOffset.littleEndian
-                withUnsafeBytes(of: &leOffset) { ptr in
-                    let pos = offsetTableStart + i * 2
-                    buf.replaceSubrange(pos..<(pos + 2), with: ptr)
+                // Patch offset table in-place
+                let pos = offsetTableStart + i * 2
+                buf.withUnsafeMutableBytes { ptr in
+                    ptr.storeBytes(of: relOffset.littleEndian, toByteOffset: pos, as: UInt16.self)
                 }
                 let value = values[col.name] ?? .null
                 Row.encodeDBValue(value, into: &buf)

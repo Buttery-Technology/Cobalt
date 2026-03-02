@@ -342,6 +342,43 @@ public actor QueryExecutor: Sendable {
 
         // Process each join in optimized order, using planner's join strategy
         for (i, join) in optimizedJoins.enumerated() {
+            // Check if right table join column has an index for index nested loop join
+            let rightIndex = await indexManager.getIndex(tableName: join.table, columnName: join.rightColumn)
+            let rightTableInfo = planner.registry.getTableInfo(name: join.table)
+            let rightRowEstimate = rightTableInfo?.recordCount ?? 0
+
+            // Use index nested loop join when: index exists on right column AND left side is small relative to right
+            if let rightIndex = rightIndex, join.type == .inner, result.count < rightRowEstimate / 2 {
+                var newResult = [Row]()
+                // Collect unique left keys to avoid redundant index lookups
+                var keyToLeftRows = [DBValue: [Row]]()
+                for leftRow in result {
+                    let leftKey = leftRow.values[join.leftColumn] ?? .null
+                    if leftKey != .null {
+                        keyToLeftRows[leftKey, default: []].append(leftRow)
+                    }
+                }
+                let rightSchema = storageEngine.getTableSchema(join.table)
+                for (key, leftRows) in keyToLeftRows {
+                    guard let indexRows = try await rightIndex.search(key: key), !indexRows.isEmpty else { continue }
+                    // Retrieve full right rows from RIDs
+                    let rids = Set(indexRows.compactMap { row -> UInt64? in
+                        guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
+                        return UInt64(bitPattern: ridSigned)
+                    })
+                    let fullRightRecords = try await storageEngine.getRecordsByIDsWithPages(rids, tableName: join.table, transactionContext: transactionContext)
+                    for (_, rightRow, _) in fullRightRecords {
+                        for leftRow in leftRows {
+                            var combined = leftRow.values
+                            for (k, v) in rightRow.values { combined["\(join.table).\(k)"] = v; combined[k] = v }
+                            newResult.append(Row(values: combined))
+                        }
+                    }
+                }
+                result = newResult
+                continue
+            }
+
             let rightRows: [Row]
             if i == 0 {
                 rightRows = firstRightRows
@@ -645,10 +682,8 @@ public actor QueryExecutor: Sendable {
             insertedPairs.append((record, row))
         }
 
-        // Phase 2: Batch index updates
-        for (record, row) in insertedPairs {
-            try await indexManager.updateIndexes(record: record, row: row, tableName: table)
-        }
+        // Phase 2: Batch index updates — sorted keys for sequential B-tree traversal
+        try await indexManager.updateIndexesBatch(records: insertedPairs, tableName: table)
         invalidateResultCache(forTable: table)
     }
 
@@ -703,8 +738,15 @@ public actor QueryExecutor: Sendable {
         // Table scan path
         let rawRecords = try await storageEngine.scanTableRaw(table, transactionContext: transactionContext)
         var updatedCount = 0
+        let updateColMap = updateSchema?.columnOrdinals
 
         for (record, data) in rawRecords {
+            // Lazy filter: skip full row decode for non-matching records
+            if let condition = condition, let colMap = updateColMap {
+                if let lazyResult = evaluateConditionLazy(condition, data: data, columnIndexMap: colMap) {
+                    if !lazyResult { continue }
+                }
+            }
             guard let row = Row.fromBytesAuto(data, schema: updateSchema) else { continue }
             if condition == nil || evaluateCondition(condition!, row: row) {
                 var updatedValues = row.values
@@ -758,12 +800,20 @@ public actor QueryExecutor: Sendable {
         let deleteSchema = storageEngine.getTableSchema(table)
         let rawRecords = try await storageEngine.scanTableRaw(table, transactionContext: transactionContext)
         var deletedCount = 0
+        let deleteColMap = deleteSchema?.columnOrdinals
 
         for (record, data) in rawRecords {
             if condition == nil {
                 try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
                 deletedCount += 1
-            } else if let row = Row.fromBytesAuto(data, schema: deleteSchema), evaluateCondition(condition!, row: row) {
+            } else {
+                // Lazy filter: skip full row decode for non-matching records
+                if let colMap = deleteColMap {
+                    if let lazyResult = evaluateConditionLazy(condition!, data: data, columnIndexMap: colMap) {
+                        if !lazyResult { continue }
+                    }
+                }
+                guard let row = Row.fromBytesAuto(data, schema: deleteSchema), evaluateCondition(condition!, row: row) else { continue }
                 try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext)
                 deletedCount += 1
             }
@@ -811,6 +861,7 @@ public actor QueryExecutor: Sendable {
             ? try await storageEngine.getPageChainConcurrent(tableName: table)
             : try await storageEngine.getPageChain(tableName: table, transactionContext: transactionContext)
         let aggSchema = storageEngine.getTableSchema(table)
+        let aggColMap = aggSchema?.columnOrdinals
 
         var count: Int64 = 0
         var intSum: Int64 = 0; var doubleSum: Double = 0; var allIntegers = true; var hasValue = false
@@ -824,6 +875,12 @@ public actor QueryExecutor: Sendable {
             for var record in page.records {
                 if record.isOverflow {
                     record = try await storageEngine.reassembleOverflowRecord(record)
+                }
+                // Lazy filter: skip full row decode for non-matching records
+                if let cond = condition, let colMap = aggColMap {
+                    if let lazyResult = evaluateConditionLazy(cond, data: record.data, columnIndexMap: colMap) {
+                        if !lazyResult { continue }
+                    }
                 }
                 guard let row = Row.fromBytesAuto(record.data, schema: aggSchema) else { continue }
                 if let cond = condition, !evaluateCondition(cond, row: row) { continue }

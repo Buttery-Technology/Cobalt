@@ -56,6 +56,19 @@ public actor ColumnIndex: Sendable {
         try await btree.insert(key: key, row: row)
     }
 
+    /// Batch insert: sorts keys for sequential B-tree traversal, flushes dirty nodes once at end.
+    public func insertBatch(pairs: [(key: DBValue, row: Row)]) async throws {
+        let sorted = pairs.sorted { $0.key < $1.key }
+        for (key, row) in sorted {
+            bloomFilter.add(key.indexKey)
+            if keyHashSet.count < Self.maxHashSetSize {
+                keyHashSet.insert(key.indexKey.hashValue)
+            }
+            try await btree.insert(key: key, row: row)
+        }
+        try await nodeStore.flushDirtyNodes()
+    }
+
     /// Search for rows matching a key, using hash set + bloom filter for fast negatives
     public func search(key: DBValue) async throws -> [Row]? {
         // Hash set check first (O(1), no false positives within hash collision bounds)
@@ -300,6 +313,40 @@ public actor IndexManager: IndexHook, Sendable {
                 if let value = row.values[columnName] {
                     try await columnIndex.insert(key: value, row: tidRow)
                 }
+            }
+        }
+    }
+
+    /// Batch update all indexes for a set of inserted records.
+    /// Groups keys per index, sorts for sequential B-tree traversal, flushes once.
+    public func updateIndexesBatch(records: [(Record, Row)], tableName: String) async throws {
+        guard let tableIndexes = indexes[tableName] else { return }
+
+        for (_, columnIndex) in tableIndexes {
+            let condition = await columnIndex.partialCondition
+            let compoundCols = await columnIndex.compoundColumns
+            let colName = await columnIndex.columnName
+
+            var pairs: [(key: DBValue, row: Row)] = []
+            pairs.reserveCapacity(records.count)
+
+            for (record, row) in records {
+                if let condition = condition {
+                    if !evaluateConditionForIndex(condition, row: row) { continue }
+                }
+                let rid: DBValue = .integer(Int64(bitPattern: record.id))
+                let tidRow = Row(values: ["__rid": rid])
+
+                if let columns = compoundCols {
+                    let keyValues = columns.map { col -> DBValue in row.values[col] ?? .null }
+                    pairs.append((key: .compound(keyValues), row: tidRow))
+                } else if let value = row.values[colName] {
+                    pairs.append((key: value, row: tidRow))
+                }
+            }
+
+            if !pairs.isEmpty {
+                try await columnIndex.insertBatch(pairs: pairs)
             }
         }
     }
