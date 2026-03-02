@@ -73,33 +73,20 @@ public actor BTree: Sendable {
 
     /// In-order traversal from lowerBound(startKey), collecting while predicate holds on keys.
     private func collectRangeWhile(node: BTreeNode, startKey: DBValue?, predicate: @Sendable (DBValue) -> Bool, results: inout [Row]) async throws {
-        var i: Int
-        if let start = startKey {
-            i = lowerBound(node.keys, start)
-        } else {
-            i = 0
-        }
-
-        if node.isLeaf {
-            while i < node.keys.count {
-                guard predicate(node.keys[i]) else { return }
-                results.append(node.values[i])
+        let (leaf, startIndex) = try await findLeafAndIndex(from: node, key: startKey)
+        var currentLeaf: BTreeNode? = leaf
+        var i = startIndex
+        while let leaf = currentLeaf {
+            while i < leaf.keys.count {
+                guard predicate(leaf.keys[i]) else { return }
+                results.append(leaf.values[i])
                 i += 1
             }
-        } else {
-            while i <= node.keys.count {
-                if let childId = node.children?[i],
-                   let child = try await nodeStore.loadNode(nodeId: childId) {
-                    let before = results.count
-                    try await collectRangeWhile(node: child, startKey: startKey, predicate: predicate, results: &results)
-                    // If child traversal stopped early (predicate failed), propagate stop
-                    if results.count == before && i > 0 { return }
-                }
-                if i < node.keys.count {
-                    guard predicate(node.keys[i]) else { return }
-                    results.append(node.values[i])
-                }
-                i += 1
+            if let nextId = leaf.nextLeafId {
+                currentLeaf = try await nodeStore.loadNode(nodeId: nextId)
+                i = 0
+            } else {
+                currentLeaf = nil
             }
         }
     }
@@ -126,24 +113,20 @@ public actor BTree: Sendable {
     }
 
     private func collectRangeKeyed(node: BTreeNode, startKey: DBValue?, endKey: DBValue?, results: inout [(DBValue, Row)]) async throws {
-        var i = startKey != nil ? lowerBound(node.keys, startKey!) : 0
-        if node.isLeaf {
-            while i < node.keys.count {
-                if let end = endKey, node.keys[i] > end { break }
-                results.append((node.keys[i], node.values[i]))
+        let (leaf, startIndex) = try await findLeafAndIndex(from: node, key: startKey)
+        var currentLeaf: BTreeNode? = leaf
+        var i = startIndex
+        while let leaf = currentLeaf {
+            while i < leaf.keys.count {
+                if let end = endKey, leaf.keys[i] > end { return }
+                results.append((leaf.keys[i], leaf.values[i]))
                 i += 1
             }
-        } else {
-            while i <= node.keys.count {
-                if let childId = node.children?[i],
-                   let child = try await nodeStore.loadNode(nodeId: childId) {
-                    try await collectRangeKeyed(node: child, startKey: startKey, endKey: endKey, results: &results)
-                }
-                if i < node.keys.count {
-                    if let end = endKey, node.keys[i] > end { break }
-                    results.append((node.keys[i], node.values[i]))
-                }
-                i += 1
+            if let nextId = leaf.nextLeafId {
+                currentLeaf = try await nodeStore.loadNode(nodeId: nextId)
+                i = 0
+            } else {
+                currentLeaf = nil
             }
         }
     }
@@ -166,89 +149,71 @@ public actor BTree: Sendable {
 
     /// Collect rows in ascending order with early exit once limit is reached
     private func collectRangeLimited(node: BTreeNode, startKey: DBValue?, endKey: DBValue?, results: inout [Row], limit: Int) async throws {
-        guard results.count < limit else { return }
-        var i: Int
-        if let start = startKey {
-            i = lowerBound(node.keys, start)
-        } else {
-            i = 0
-        }
-
-        if node.isLeaf {
-            while i < node.keys.count && results.count < limit {
-                if let end = endKey, node.keys[i] > end { break }
-                results.append(node.values[i])
+        let (leaf, startIndex) = try await findLeafAndIndex(from: node, key: startKey)
+        var currentLeaf: BTreeNode? = leaf
+        var i = startIndex
+        while let leaf = currentLeaf, results.count < limit {
+            while i < leaf.keys.count && results.count < limit {
+                if let end = endKey, leaf.keys[i] > end { return }
+                results.append(leaf.values[i])
                 i += 1
             }
-        } else {
-            while i <= node.keys.count && results.count < limit {
-                if let childId = node.children?[i],
-                   let child = try await nodeStore.loadNode(nodeId: childId) {
-                    try await collectRangeLimited(node: child, startKey: startKey, endKey: endKey, results: &results, limit: limit)
-                }
-                guard results.count < limit else { return }
-                if i < node.keys.count {
-                    if let end = endKey, node.keys[i] > end { break }
-                    results.append(node.values[i])
-                }
-                i += 1
+            if let nextId = leaf.nextLeafId {
+                currentLeaf = try await nodeStore.loadNode(nodeId: nextId)
+                i = 0
+            } else {
+                currentLeaf = nil
             }
         }
     }
 
     /// Collect rows in descending order with early exit once limit is reached.
-    /// Traverses right-to-left: in non-leaf nodes iterates children from rightmost to leftmost,
-    /// in leaf nodes iterates keys from last to first.
+    /// Uses prevLeafId sibling pointers for efficient right-to-left leaf traversal.
     private func collectRangeReverseLimited(node: BTreeNode, startKey: DBValue?, endKey: DBValue?, results: inout [Row], limit: Int) async throws {
-        guard results.count < limit else { return }
+        // Find the rightmost leaf containing endKey (or the last leaf if no endKey)
+        let (leaf, endIndex) = try await findLeafAndIndexReverse(from: node, key: endKey)
 
-        // Find the rightmost position to start (using endKey as upper bound)
-        let hi: Int
-        if let end = endKey {
-            hi = upperBound(node.keys, end) - 1
-        } else {
-            hi = node.keys.count - 1
-        }
-
-        // Find the leftmost position to stop (using startKey as lower bound)
-        let lo: Int
-        if let start = startKey {
-            lo = lowerBound(node.keys, start)
-        } else {
-            lo = 0
-        }
-
-        if node.isLeaf {
-            var i = hi
-            while i >= lo && results.count < limit {
-                results.append(node.values[i])
+        var currentLeaf: BTreeNode? = leaf
+        var i = endIndex
+        let lo = startKey
+        while let leaf = currentLeaf, results.count < limit {
+            while i >= 0 && results.count < limit {
+                if let start = lo, leaf.keys[i] < start { return }
+                results.append(leaf.values[i])
                 i -= 1
             }
-        } else {
-            // Traverse from right to left: child[i+1], then key[i], child[i], key[i-1], ...
-            var i = hi
-            // First, traverse the rightmost child (child at index hi+1)
-            if hi + 1 <= node.keys.count, hi + 1 < (node.children?.count ?? 0) {
-                if let childId = node.children?[hi + 1],
-                   let child = try await nodeStore.loadNode(nodeId: childId) {
-                    try await collectRangeReverseLimited(node: child, startKey: startKey, endKey: endKey, results: &results, limit: limit)
-                }
-            }
-            guard results.count < limit else { return }
-
-            while i >= lo && results.count < limit {
-                // Add current key
-                results.append(node.values[i])
-                guard results.count < limit else { return }
-
-                // Traverse left child
-                if let childId = node.children?[i],
-                   let child = try await nodeStore.loadNode(nodeId: childId) {
-                    try await collectRangeReverseLimited(node: child, startKey: startKey, endKey: endKey, results: &results, limit: limit)
-                }
-                i -= 1
+            if let prevId = leaf.prevLeafId {
+                currentLeaf = try await nodeStore.loadNode(nodeId: prevId)
+                i = (currentLeaf?.keys.count ?? 0) - 1
+            } else {
+                currentLeaf = nil
             }
         }
+    }
+
+    /// Navigate from a node down to the leaf containing (or just before) the given key for reverse scan.
+    private func findLeafAndIndexReverse(from node: BTreeNode, key: DBValue?) async throws -> (BTreeNode, Int) {
+        var current = node
+        while !current.isLeaf {
+            let childIdx: Int
+            if let k = key {
+                childIdx = min(upperBound(current.keys, k), (current.children?.count ?? 1) - 1)
+            } else {
+                childIdx = (current.children?.count ?? 1) - 1
+            }
+            guard let childId = current.children?[childIdx],
+                  let child = try await nodeStore.loadNode(nodeId: childId) else {
+                throw PantryError.indexCorrupted(description: "Child node not found during reverse leaf search")
+            }
+            current = child
+        }
+        let endIdx: Int
+        if let k = key {
+            endIdx = upperBound(current.keys, k) - 1
+        } else {
+            endIdx = current.keys.count - 1
+        }
+        return (current, endIdx)
     }
 
     // MARK: - Delete
@@ -303,73 +268,85 @@ public actor BTree: Sendable {
         var i = lowerBound(node.keys, key)
 
         if node.isLeaf {
-            // Collect all matching keys at this leaf
+            // B+ tree: all data lives in leaves. Collect matching keys, follow sibling if needed.
             var results: [Row] = []
+            var currentLeaf: BTreeNode? = node
             var j = i
-            while j < node.keys.count && node.keys[j] == key {
-                results.append(node.values[j])
-                j += 1
+            while let leaf = currentLeaf {
+                while j < leaf.keys.count && leaf.keys[j] == key {
+                    results.append(leaf.values[j])
+                    j += 1
+                }
+                // Duplicates may span to next leaf
+                if j >= leaf.keys.count, let nextId = leaf.nextLeafId {
+                    currentLeaf = try await nodeStore.loadNode(nodeId: nextId)
+                    j = 0
+                } else {
+                    break
+                }
             }
             return results
         }
 
-        // Internal node: collect from left subtree, matching keys here, and right subtrees
-        var results: [Row] = []
-
-        // Search left child subtree
+        // Internal node: keys are routing copies. Descend to find leaf-level data.
+        // Search the leftmost child that could contain the key
         if let childId = node.children?[i],
            let child = try await nodeStore.loadNode(nodeId: childId) {
-            results.append(contentsOf: try await searchNode(node: child, key: key))
+            return try await searchNode(node: child, key: key)
         }
 
-        // Collect all matching keys at this internal node, plus right subtrees
-        while i < node.keys.count && node.keys[i] == key {
-            results.append(node.values[i])
-            i += 1
-            if let childId = node.children?[i],
-               let child = try await nodeStore.loadNode(nodeId: childId) {
-                results.append(contentsOf: try await searchNode(node: child, key: key))
-            }
-        }
-
-        return results
+        return []
     }
 
     private func collectRange(node: BTreeNode, startKey: DBValue?, endKey: DBValue?, results: inout [Row]) async throws {
-        var i: Int
-        if let start = startKey {
-            i = lowerBound(node.keys, start)
-        } else {
-            i = 0
-        }
+        // Find the starting leaf node
+        let (leaf, startIndex) = try await findLeafAndIndex(from: node, key: startKey)
 
-        if node.isLeaf {
-            while i < node.keys.count {
-                if let end = endKey, node.keys[i] > end {
-                    break
+        // Scan from the starting position, following sibling pointers
+        var currentLeaf: BTreeNode? = leaf
+        var i = startIndex
+        while let leaf = currentLeaf {
+            while i < leaf.keys.count {
+                if let end = endKey, leaf.keys[i] > end {
+                    return
                 }
-                results.append(node.values[i])
+                results.append(leaf.values[i])
                 i += 1
             }
-        } else {
-            while i <= node.keys.count {
-                // Traverse child subtree first (contains values < keys[i])
-                if let childId = node.children?[i],
-                   let child = try await nodeStore.loadNode(nodeId: childId) {
-                    try await collectRange(node: child, startKey: startKey, endKey: endKey, results: &results)
-                }
-
-                // Then check if current key is beyond range
-                if i < node.keys.count {
-                    if let end = endKey, node.keys[i] > end {
-                        break
-                    }
-                    results.append(node.values[i])
-                }
-
-                i += 1
+            // Follow sibling pointer to next leaf
+            if let nextId = leaf.nextLeafId {
+                currentLeaf = try await nodeStore.loadNode(nodeId: nextId)
+                i = 0
+            } else {
+                currentLeaf = nil
             }
         }
+    }
+
+    /// Navigate from a node down to the leaf containing (or just after) the given key.
+    /// Returns the leaf node and the starting index within it.
+    private func findLeafAndIndex(from node: BTreeNode, key: DBValue?) async throws -> (BTreeNode, Int) {
+        var current = node
+        while !current.isLeaf {
+            let childIdx: Int
+            if let k = key {
+                childIdx = lowerBound(current.keys, k)
+            } else {
+                childIdx = 0
+            }
+            guard let childId = current.children?[childIdx],
+                  let child = try await nodeStore.loadNode(nodeId: childId) else {
+                throw PantryError.indexCorrupted(description: "Child node not found during leaf search")
+            }
+            current = child
+        }
+        let startIdx: Int
+        if let k = key {
+            startIdx = lowerBound(current.keys, k)
+        } else {
+            startIdx = 0
+        }
+        return (current, startIdx)
     }
 
     // MARK: - Insert Helpers
@@ -416,25 +393,45 @@ public actor BTree: Sendable {
         let newNode = BTreeNode(isLeaf: child.isLeaf)
         let midIndex = order - 1
 
-        newNode.keys = Array(child.keys[(midIndex + 1)...])
-        newNode.values = Array(child.values[(midIndex + 1)...])
+        let midKey: DBValue
+        let midValue: Row
 
-        if !child.isLeaf {
+        if child.isLeaf {
+            // B+ tree leaf split: copy-up. All data stays in leaves.
+            // Right child gets keys[midIndex..end] (includes midKey)
+            newNode.keys = Array(child.keys[midIndex...])
+            newNode.values = Array(child.values[midIndex...])
+            midKey = child.keys[midIndex]
+            midValue = child.values[midIndex]
+            child.keys = Array(child.keys[..<midIndex])
+            child.values = Array(child.values[..<midIndex])
+        } else {
+            // Traditional B-tree internal split: push-up
+            newNode.keys = Array(child.keys[(midIndex + 1)...])
+            newNode.values = Array(child.values[(midIndex + 1)...])
             newNode.children = Array(child.children![(midIndex + 1)...])
-        }
-
-        let midKey = child.keys[midIndex]
-        let midValue = child.values[midIndex]
-        child.keys = Array(child.keys[..<midIndex])
-        child.values = Array(child.values[..<midIndex])
-
-        if !child.isLeaf {
+            midKey = child.keys[midIndex]
+            midValue = child.values[midIndex]
+            child.keys = Array(child.keys[..<midIndex])
+            child.values = Array(child.values[..<midIndex])
             child.children = Array(child.children![...(midIndex)])
         }
 
         parent.keys.insert(midKey, at: childIndex)
         parent.values.insert(midValue, at: childIndex)
         parent.children!.insert(newNode.nodeId, at: childIndex + 1)
+
+        // Maintain leaf sibling pointers
+        if child.isLeaf {
+            newNode.nextLeafId = child.nextLeafId
+            newNode.prevLeafId = child.nodeId
+            if let oldNextId = child.nextLeafId,
+               let oldNext = try await nodeStore.loadNode(nodeId: oldNextId) {
+                oldNext.prevLeafId = newNode.nodeId
+                try await nodeStore.saveNode(oldNext)
+            }
+            child.nextLeafId = newNode.nodeId
+        }
 
         try await nodeStore.saveNode(child)
         try await nodeStore.saveNode(newNode)
@@ -444,98 +441,38 @@ public actor BTree: Sendable {
     // MARK: - Delete Helpers
 
     private func deleteFromNode(node: BTreeNode, key: DBValue, row: Row? = nil) async throws {
-        var keyIndex = findKeyIndex(node: node, key: key)
-
-        // Row-matching only at leaf level — at internal nodes, advancing past matching keys
-        // with a different row value would cause descent into the wrong child subtree
-        if node.isLeaf, let row = row {
-            while keyIndex < node.keys.count && node.keys[keyIndex] == key && node.values[keyIndex] != row {
-                keyIndex += 1
+        if node.isLeaf {
+            // B+ tree: all data lives in leaves. Find and remove the matching entry.
+            var keyIndex = lowerBound(node.keys, key)
+            if let row = row {
+                while keyIndex < node.keys.count && node.keys[keyIndex] == key && node.values[keyIndex] != row {
+                    keyIndex += 1
+                }
             }
-        }
-
-        if keyIndex < node.keys.count && node.keys[keyIndex] == key {
-            if node.isLeaf {
+            if keyIndex < node.keys.count && node.keys[keyIndex] == key {
                 removeFromLeaf(node: node, index: keyIndex)
                 try await nodeStore.saveNode(node)
-            } else if row == nil || node.values[keyIndex] == row {
-                // Key and row both match (or no row filter) — standard internal node delete
-                try await deleteFromInternalNode(node: node, keyIndex: keyIndex, row: row)
-            } else {
-                // Key matches but row doesn't — check consecutive duplicate keys at this node
-                var scanIdx = keyIndex + 1
-                while scanIdx < node.keys.count && node.keys[scanIdx] == key {
-                    if node.values[scanIdx] == row {
-                        try await deleteFromInternalNode(node: node, keyIndex: scanIdx, row: row)
-                        return
-                    }
-                    scanIdx += 1
-                }
-                // Not found at this node — descend into subtree via re-search
-                guard let childId = node.children?[keyIndex],
-                      let child = try await nodeStore.loadNode(nodeId: childId) else {
-                    throw PantryError.indexCorrupted(description: "Child node not found during row-filtered delete")
-                }
-                if child.keys.count == order - 1 {
-                    try await fillChild(parent: node, childIndex: keyIndex)
-                    try await deleteFromNode(node: node, key: key, row: row)
-                } else {
-                    try await deleteFromNode(node: child, key: key, row: row)
-                }
-                return
             }
-        } else if !node.isLeaf {
-            guard let childId = node.children?[keyIndex],
-                  let child = try await nodeStore.loadNode(nodeId: childId) else {
-                throw PantryError.indexCorrupted(description: "Child node not found during deletion")
-            }
-
-            if child.keys.count == order - 1 {
-                try await fillChild(parent: node, childIndex: keyIndex)
-                // After fill/merge, structure may have changed — re-search from this node
-                try await deleteFromNode(node: node, key: key, row: row)
-            } else {
-                try await deleteFromNode(node: child, key: key, row: row)
-            }
-        }
-    }
-
-    private func deleteFromInternalNode(node: BTreeNode, keyIndex: Int, row: Row? = nil) async throws {
-        let key = node.keys[keyIndex]
-
-        guard let leftChildId = node.children?[keyIndex],
-              let leftChild = try await nodeStore.loadNode(nodeId: leftChildId) else {
-            throw PantryError.indexCorrupted(description: "Left child not found")
+            return
         }
 
-        if leftChild.keys.count >= order {
-            let (predKey, predValue) = try await getPredecessor(node: leftChild)
-            node.keys[keyIndex] = predKey
-            node.values[keyIndex] = predValue
-            try await nodeStore.saveNode(node)
-            // Delete the specific predecessor entry
-            try await deleteFromNode(node: leftChild, key: predKey, row: predValue)
+        // Internal node: routing copies only. Descend to the correct child.
+        let keyIndex = lowerBound(node.keys, key)
+        // If key matches separator, data is in right subtree (child[keyIndex+1])
+        let childIdx = (keyIndex < node.keys.count && node.keys[keyIndex] == key) ? keyIndex + 1 : keyIndex
+
+        guard childIdx < (node.children?.count ?? 0),
+              let childId = node.children?[childIdx],
+              let child = try await nodeStore.loadNode(nodeId: childId) else {
+            throw PantryError.indexCorrupted(description: "Child not found during B+ tree delete descent")
+        }
+
+        if child.keys.count == order - 1 {
+            try await fillChild(parent: node, childIndex: childIdx)
+            // After fill/merge, structure may have changed — re-search from this node
+            try await deleteFromNode(node: node, key: key, row: row)
         } else {
-            guard let rightChildId = node.children?[keyIndex + 1],
-                  let rightChild = try await nodeStore.loadNode(nodeId: rightChildId) else {
-                throw PantryError.indexCorrupted(description: "Right child not found")
-            }
-
-            if rightChild.keys.count >= order {
-                let (succKey, succValue) = try await getSuccessor(node: rightChild)
-                node.keys[keyIndex] = succKey
-                node.values[keyIndex] = succValue
-                try await nodeStore.saveNode(node)
-                // Delete the specific successor entry
-                try await deleteFromNode(node: rightChild, key: succKey, row: succValue)
-            } else {
-                try await mergeWithRightSibling(parent: node, leftIndex: keyIndex)
-                // Reload left child after merge — the original reference is stale
-                guard let mergedChild = try await nodeStore.loadNode(nodeId: leftChildId) else {
-                    throw PantryError.indexCorrupted(description: "Merged child not found")
-                }
-                try await deleteFromNode(node: mergedChild, key: key, row: row)
-            }
+            try await deleteFromNode(node: child, key: key, row: row)
         }
     }
 
@@ -582,35 +519,47 @@ public actor BTree: Sendable {
     }
 
     private func borrowFromRightSibling(parent: BTreeNode, leftChild: BTreeNode, rightChild: BTreeNode, parentKeyIndex: Int) {
-        leftChild.keys.append(parent.keys[parentKeyIndex])
-        leftChild.values.append(parent.values[parentKeyIndex])
-
-        parent.keys[parentKeyIndex] = rightChild.keys[0]
-        parent.values[parentKeyIndex] = rightChild.values[0]
-
-        if !leftChild.isLeaf {
+        if leftChild.isLeaf {
+            // B+ tree leaf: move right[0] to left, update separator to right's new first key
+            leftChild.keys.append(rightChild.keys[0])
+            leftChild.values.append(rightChild.values[0])
+            rightChild.keys.removeFirst()
+            rightChild.values.removeFirst()
+            parent.keys[parentKeyIndex] = rightChild.keys[0]
+            parent.values[parentKeyIndex] = rightChild.values[0]
+        } else {
+            // Internal node: standard B-tree borrow
+            leftChild.keys.append(parent.keys[parentKeyIndex])
+            leftChild.values.append(parent.values[parentKeyIndex])
+            parent.keys[parentKeyIndex] = rightChild.keys[0]
+            parent.values[parentKeyIndex] = rightChild.values[0]
             leftChild.children!.append(rightChild.children![0])
             rightChild.children!.removeFirst()
+            rightChild.keys.removeFirst()
+            rightChild.values.removeFirst()
         }
-
-        rightChild.keys.removeFirst()
-        rightChild.values.removeFirst()
     }
 
     private func borrowFromLeftSibling(parent: BTreeNode, leftChild: BTreeNode, rightChild: BTreeNode, parentKeyIndex: Int) {
-        rightChild.keys.insert(parent.keys[parentKeyIndex], at: 0)
-        rightChild.values.insert(parent.values[parentKeyIndex], at: 0)
-
-        parent.keys[parentKeyIndex] = leftChild.keys.last!
-        parent.values[parentKeyIndex] = leftChild.values.last!
-
-        if !rightChild.isLeaf {
+        if rightChild.isLeaf {
+            // B+ tree leaf: move left.last to right[0], update separator to new right[0]
+            rightChild.keys.insert(leftChild.keys.last!, at: 0)
+            rightChild.values.insert(leftChild.values.last!, at: 0)
+            leftChild.keys.removeLast()
+            leftChild.values.removeLast()
+            parent.keys[parentKeyIndex] = rightChild.keys[0]
+            parent.values[parentKeyIndex] = rightChild.values[0]
+        } else {
+            // Internal node: standard B-tree borrow
+            rightChild.keys.insert(parent.keys[parentKeyIndex], at: 0)
+            rightChild.values.insert(parent.values[parentKeyIndex], at: 0)
+            parent.keys[parentKeyIndex] = leftChild.keys.last!
+            parent.values[parentKeyIndex] = leftChild.values.last!
             rightChild.children!.insert(leftChild.children!.last!, at: 0)
             leftChild.children!.removeLast()
+            leftChild.keys.removeLast()
+            leftChild.values.removeLast()
         }
-
-        leftChild.keys.removeLast()
-        leftChild.values.removeLast()
     }
 
     private func mergeWithRightSibling(parent: BTreeNode, leftIndex: Int) async throws {
@@ -621,18 +570,32 @@ public actor BTree: Sendable {
             throw PantryError.indexCorrupted(description: "Children not found during merge")
         }
 
-        leftChild.keys.append(parent.keys[leftIndex])
-        leftChild.values.append(parent.values[leftIndex])
-        leftChild.keys.append(contentsOf: rightChild.keys)
-        leftChild.values.append(contentsOf: rightChild.values)
-
-        if !leftChild.isLeaf {
+        if leftChild.isLeaf {
+            // B+ tree leaf merge: separator is a copy, skip it
+            leftChild.keys.append(contentsOf: rightChild.keys)
+            leftChild.values.append(contentsOf: rightChild.values)
+        } else {
+            // Internal node merge: push separator down
+            leftChild.keys.append(parent.keys[leftIndex])
+            leftChild.values.append(parent.values[leftIndex])
+            leftChild.keys.append(contentsOf: rightChild.keys)
+            leftChild.values.append(contentsOf: rightChild.values)
             leftChild.children!.append(contentsOf: rightChild.children!)
         }
 
         parent.keys.remove(at: leftIndex)
         parent.values.remove(at: leftIndex)
         parent.children!.remove(at: leftIndex + 1)
+
+        // Maintain leaf sibling pointers after merge
+        if leftChild.isLeaf {
+            leftChild.nextLeafId = rightChild.nextLeafId
+            if let nextId = rightChild.nextLeafId,
+               let nextNode = try await nodeStore.loadNode(nodeId: nextId) {
+                nextNode.prevLeafId = leftChild.nodeId
+                try await nodeStore.saveNode(nextNode)
+            }
+        }
 
         try await nodeStore.saveNode(leftChild)
         try await nodeStore.saveNode(parent)
@@ -642,36 +605,6 @@ public actor BTree: Sendable {
     }
 
     // MARK: - Helpers
-
-    private func getPredecessor(node: BTreeNode) async throws -> (DBValue, Row) {
-        var current = node
-        while !current.isLeaf {
-            guard let lastChildId = current.children?.last,
-                  let lastChild = try await nodeStore.loadNode(nodeId: lastChildId) else {
-                throw PantryError.indexCorrupted(description: "Child not found while finding predecessor")
-            }
-            current = lastChild
-        }
-        guard let key = current.keys.last, let value = current.values.last else {
-            throw PantryError.indexCorrupted(description: "Predecessor leaf node is empty")
-        }
-        return (key, value)
-    }
-
-    private func getSuccessor(node: BTreeNode) async throws -> (DBValue, Row) {
-        var current = node
-        while !current.isLeaf {
-            guard let firstChildId = current.children?.first,
-                  let firstChild = try await nodeStore.loadNode(nodeId: firstChildId) else {
-                throw PantryError.indexCorrupted(description: "Child not found while finding successor")
-            }
-            current = firstChild
-        }
-        guard let key = current.keys.first, let value = current.values.first else {
-            throw PantryError.indexCorrupted(description: "Successor leaf node is empty")
-        }
-        return (key, value)
-    }
 
     private func removeFromLeaf(node: BTreeNode, index: Int) {
         node.keys.remove(at: index)

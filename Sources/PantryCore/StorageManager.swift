@@ -1,12 +1,14 @@
 import Foundation
+import Synchronization
 
-/// Manages page-level file I/O with optional encryption at the disk boundary
-public actor StorageManager: Sendable {
+/// Manages page-level file I/O with optional encryption at the disk boundary.
+/// Uses POSIX pread/pwrite for thread-safe concurrent I/O without seek serialization.
+public final class StorageManager: Sendable {
     private let fileURL: URL
-    private var fileHandle: FileHandle?
+    private let fd: Mutex<Int32?>
     private let encryptionProvider: EncryptionProvider?
     private let pageSize: Int
-    private let diskPageSize: Int
+    public let diskPageSize: Int
 
     /// Initialize the storage manager
     /// - Parameters:
@@ -29,25 +31,30 @@ public actor StorageManager: Sendable {
             FileManager.default.createFile(atPath: fileURL.path, contents: nil)
         }
 
-        fileHandle = try FileHandle(forUpdating: fileURL)
+        let fileFD = open(fileURL.path, O_RDWR)
+        guard fileFD >= 0 else {
+            throw PantryError.fileOpenError(description: "Failed to open database at \(databasePath)")
+        }
+        self.fd = Mutex(fileFD)
     }
 
-    private func requireHandle() throws -> FileHandle {
-        guard let fh = fileHandle else {
+    private func requireFD() throws -> Int32 {
+        let fileFD = fd.withLock { $0 }
+        guard let fileFD, fileFD >= 0 else {
             throw PantryError.databaseClosed
         }
-        return fh
+        return fileFD
     }
 
-    /// Write a page to disk, encrypting if configured (does NOT fsync — call sync() at durability points)
-    /// Pass `alreadySerialized: true` to skip redundant saveRecords() when the caller has already serialized
+    /// Write a page to disk using pwrite (thread-safe, no seek needed)
+    /// Pass `alreadySerialized: true` to skip redundant saveRecords()
     public func writePage(_ page: inout DatabasePage, alreadySerialized: Bool = false) throws {
-        let fh = try requireHandle()
+        let fileFD = try requireFD()
         if !alreadySerialized {
             try page.saveRecords()
         }
 
-        let offset = UInt64(page.pageID) * UInt64(diskPageSize)
+        let offset = off_t(page.pageID) * off_t(diskPageSize)
 
         let dataToWrite: Data
         if let provider = encryptionProvider {
@@ -56,18 +63,30 @@ public actor StorageManager: Sendable {
             dataToWrite = page.data
         }
 
-        try fh.seek(toOffset: offset)
-        try fh.write(contentsOf: dataToWrite)
+        try dataToWrite.withUnsafeBytes { rawBuf in
+            guard let baseAddr = rawBuf.baseAddress else { return }
+            var written = 0
+            while written < dataToWrite.count {
+                let result = pwrite(fileFD, baseAddr + written, dataToWrite.count - written, offset + off_t(written))
+                if result < 0 {
+                    throw PantryError.pageWriteError(description: "pwrite failed for page \(page.pageID): errno \(errno)")
+                }
+                written += result
+            }
+        }
     }
 
-    /// Read a page from disk, decrypting if configured
+    /// Read a page from disk using pread (thread-safe, no seek needed)
     public func readPage(pageID: Int) throws -> DatabasePage {
-        let fh = try requireHandle()
-        let offset = UInt64(pageID) * UInt64(diskPageSize)
+        let fileFD = try requireFD()
+        let offset = off_t(pageID) * off_t(diskPageSize)
 
-        try fh.seek(toOffset: offset)
-        guard let rawData = try fh.read(upToCount: diskPageSize),
-              rawData.count == diskPageSize else {
+        var rawData = Data(count: diskPageSize)
+        let bytesRead = rawData.withUnsafeMutableBytes { rawBuf -> Int in
+            guard let baseAddr = rawBuf.baseAddress else { return 0 }
+            return pread(fileFD, baseAddr, diskPageSize, offset)
+        }
+        guard bytesRead == diskPageSize else {
             throw PantryError.pageReadError(description: "Failed to read page \(pageID)")
         }
 
@@ -90,14 +109,19 @@ public actor StorageManager: Sendable {
         return page
     }
 
-    /// Create a new blank page and extend the database file
+    /// Create a new blank page and extend the database file.
+    /// NOTE: This method is NOT thread-safe for concurrent callers — must be called
+    /// from a serialized context (e.g., StorageEngine actor) to prevent duplicate page IDs.
     public func createNewPage() throws -> DatabasePage {
-        let fh = try requireHandle()
-        let currentSize = try fh.seekToEnd()
+        let fileFD = try requireFD()
+
+        // Get current file size to determine new page ID
+        let currentSize = lseek(fileFD, 0, SEEK_END)
+        guard currentSize >= 0 else {
+            throw PantryError.pageWriteError(description: "lseek failed: errno \(errno)")
+        }
         let newPageID = Int(currentSize) / diskPageSize
 
-        // Build the page struct and serialize its header into the data buffer
-        // so that if this page is evicted and re-read, loadRecords() sees the correct pageID
         var page = DatabasePage(
             pageID: newPageID,
             nextPageID: 0,
@@ -115,27 +139,46 @@ public actor StorageManager: Sendable {
             dataToWrite = page.data
         }
 
-        try fh.write(contentsOf: dataToWrite)
+        // Append at end of file
+        let offset = off_t(newPageID) * off_t(diskPageSize)
+        try dataToWrite.withUnsafeBytes { rawBuf in
+            guard let baseAddr = rawBuf.baseAddress else { return }
+            var written = 0
+            while written < dataToWrite.count {
+                let result = pwrite(fileFD, baseAddr + written, dataToWrite.count - written, offset + off_t(written))
+                if result < 0 {
+                    throw PantryError.pageWriteError(description: "pwrite failed for new page \(newPageID): errno \(errno)")
+                }
+                written += result
+            }
+        }
 
         return page
     }
 
-    /// Flush pending writes to disk. Call at durability points: WAL commit, checkpoint, close.
+    /// Flush pending writes to disk
     public func sync() throws {
-        try requireHandle().synchronize()
+        let fileFD = try requireFD()
+        fsync(fileFD)
     }
 
     /// Get total number of pages in the file
     public func totalPageCount() throws -> Int {
-        let fh = try requireHandle()
-        let size = try fh.seekToEnd()
+        let fileFD = try requireFD()
+        let size = lseek(fileFD, 0, SEEK_END)
+        guard size >= 0 else {
+            throw PantryError.pageReadError(description: "lseek failed: errno \(errno)")
+        }
         return Int(size) / diskPageSize
     }
 
     /// Close the database file
     public func close() throws {
-        try fileHandle?.synchronize()
-        try fileHandle?.close()
-        fileHandle = nil
+        fd.withLock { fileFD in
+            if let fileFD, fileFD >= 0 {
+                Darwin.close(fileFD)
+            }
+            fileFD = nil
+        }
     }
 }
