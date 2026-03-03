@@ -189,6 +189,31 @@ public final class StorageEngine: @unchecked Sendable {
         return page
     }
 
+    /// Non-actor read path with selective record loading: only deserializes records
+    /// matching the given IDs. Falls back to full page load if mmap unavailable.
+    public func getPageSelectiveConcurrent(pageID: Int, recordIDs: Set<UInt64>) async throws -> DatabasePage {
+        if storageManager.mmapAvailable {
+            if bufferPoolManager.isDirty(pageID: pageID),
+               let cachedPage = bufferPoolManager.getCachedPage(pageID: pageID) {
+                return cachedPage
+            }
+            if let page = storageManager.readPageMmapSelective(pageID: pageID, recordIDs: recordIDs) {
+                return page
+            }
+            storageManager.remapMmap()
+            if let page = storageManager.readPageMmapSelective(pageID: pageID, recordIDs: recordIDs) {
+                return page
+            }
+        }
+        // Fallback: buffer pool (full load) + pread
+        if let cachedPage = bufferPoolManager.getCachedPage(pageID: pageID) {
+            return cachedPage
+        }
+        let page = try storageManager.readPage(pageID: pageID)
+        await bufferPoolManager.cachePage(page)
+        return page
+    }
+
     /// Batch read pages: uses mmap when available, falls back to buffer pool + pread.
     /// Nonisolated for parallel scan use.
     public func getPagesConcurrent(pageIDs: [Int]) async throws -> [DatabasePage] {
@@ -516,6 +541,10 @@ public final class StorageEngine: @unchecked Sendable {
         let maxInlineSize = PantryConstants.MAX_INLINE_RECORD_SIZE
         var inserted = 0
 
+        // Collect RID-to-page mappings for batch cache update
+        var ridCacheEntries: [(UInt64, Int)] = []
+        ridCacheEntries.reserveCapacity(records.count)
+
         // Load the last page in the chain (likely has free space)
         var currentPage: DatabasePage
         let lastPageID = tableInfo.pageList?.last ?? tableInfo.firstPageID
@@ -550,15 +579,14 @@ public final class StorageEngine: @unchecked Sendable {
             if currentPage.addRecord(record, knownSerializedSize: serializedSize) {
                 pageDirty = true
                 inserted += 1
-                // Populate RID-to-page cache for fast lookups later
-                _state.withLock { $0.ridPageMap[tableName, default: [:]][record.id] = currentPage.pageID }
+                ridCacheEntries.append((record.id, currentPage.pageID))
             } else {
                 // Page full — write it with skipAfterImage (before-image only for undo)
                 if pageDirty {
                     if transactionContext != nil {
                         try await savePage(currentPage, transactionContext: transactionContext, skipAfterImage: true)
                     } else {
-                        try await savePage(currentPage, transactionContext: transactionContext)
+                        try await savePageDeferred(currentPage)
                     }
                     freeSpaceBitmap.setCategory(pageID: currentPage.pageID, category: currentPage.spaceCategory())
                 }
@@ -569,7 +597,7 @@ public final class StorageEngine: @unchecked Sendable {
                 }
                 pageDirty = true
                 inserted += 1
-                _state.withLock { $0.ridPageMap[tableName, default: [:]][record.id] = currentPage.pageID }
+                ridCacheEntries.append((record.id, currentPage.pageID))
             }
         }
 
@@ -578,9 +606,18 @@ public final class StorageEngine: @unchecked Sendable {
             if transactionContext != nil {
                 try await savePage(currentPage, transactionContext: transactionContext, skipAfterImage: true)
             } else {
-                try await savePage(currentPage, transactionContext: transactionContext)
+                try await savePageDeferred(currentPage)
             }
             freeSpaceBitmap.setCategory(pageID: currentPage.pageID, category: currentPage.spaceCategory())
+        }
+
+        // Batch populate RID-to-page cache (single lock instead of per-record)
+        if !ridCacheEntries.isEmpty {
+            _state.withLock { s in
+                var map = s.ridPageMap[tableName, default: [:]]
+                for (rid, pid) in ridCacheEntries { map[rid] = pid }
+                s.ridPageMap[tableName] = map
+            }
         }
 
         // Update record count once

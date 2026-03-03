@@ -304,6 +304,22 @@ public final class StorageManager: Sendable {
         }
     }
 
+    /// Read a page from mmap'd memory, but only deserialize records matching the given IDs.
+    /// Returns nil if mmap is not active or the page is beyond the mapped region.
+    public func readPageMmapSelective(pageID: Int, recordIDs: Set<UInt64>) -> DatabasePage? {
+        mmapState.withReadLock { state in
+            guard let base = state.baseAddress else { return nil }
+            let offset = pageID * pageSize
+            let end = offset + pageSize
+            guard end <= state.mappedLength else { return nil }
+
+            let pageData = Data(bytes: base + offset, count: pageSize)
+            var page = DatabasePage(pageID: pageID, data: pageData)
+            page.loadRecordsSelective(ids: recordIDs)
+            return page
+        }
+    }
+
     /// Read a single record by ID from mmap'd page data without deserializing all records.
     /// Parses only the page header + slot directory, then scans record headers for matching ID.
     /// Returns the record's raw data payload (excluding the 12-byte record header) on match.

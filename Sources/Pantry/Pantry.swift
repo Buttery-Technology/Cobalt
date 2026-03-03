@@ -441,9 +441,7 @@ public actor PantryDatabase: Sendable {
 
     public func insertAll(into table: String, rows: [[String: DBValue]]) async throws {
         let rowObjects = rows.map { Row(values: $0) }
-        try await transaction { _ in
-            try await self.queryExecutor.executeBulkInsert(into: table, rows: rowObjects, transactionContext: self.currentTransactionContext)
-        }
+        try await self.queryExecutor.executeBulkInsert(into: table, rows: rowObjects, transactionContext: nil)
     }
 
     /// Stream rows from a table, yielding one row at a time for memory-efficient processing.
