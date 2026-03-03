@@ -260,37 +260,39 @@ public final class QueryExecutor: @unchecked Sendable {
                 }
                 let isCovering = !neededCols.isEmpty && neededCols.isSubset(of: coveredCols)
 
-                // With WHERE, overfetch to account for filtered-out rows
-                let fetchLimit = condition != nil ? totalNeeded * 4 : totalNeeded
+                // Adaptive over-fetch: start at 2x, expand to 4x only if insufficient
+                var fetchLimit = condition != nil ? totalNeeded * 2 : totalNeeded
 
-                var orderedRows: [Row]
-                if isCovering {
-                    // Covering index: fetch Row-based results directly
-                    let indexRows: [Row]
-                    if let cached = index.searchRangeWithLimitCached(from: nil, to: nil, limit: fetchLimit, ascending: ascending) {
-                        indexRows = cached
+                var orderedRows: [Row] = []
+                for attempt in 0..<2 {
+                    if isCovering {
+                        let indexRows: [Row]
+                        if let cached = index.searchRangeWithLimitCached(from: nil, to: nil, limit: fetchLimit, ascending: ascending) {
+                            indexRows = cached
+                        } else {
+                            indexRows = try await index.searchRangeWithLimit(from: nil, to: nil, limit: fetchLimit, ascending: ascending)
+                        }
+                        orderedRows = indexRows
                     } else {
-                        indexRows = try await index.searchRangeWithLimit(from: nil, to: nil, limit: fetchLimit, ascending: ascending)
+                        let orderedRIDs: [UInt64]
+                        if let cached = index.searchRangeWithLimitRIDsCached(from: nil, to: nil, limit: fetchLimit, ascending: ascending) {
+                            orderedRIDs = cached
+                        } else {
+                            orderedRIDs = try await index.searchRangeWithLimitRIDs(from: nil, to: nil, limit: fetchLimit, ascending: ascending)
+                        }
+                        orderedRows = try await storageEngine.getRecordsByIDsOrdered(orderedRIDs, tableName: table, transactionContext: transactionContext)
                     }
-                    orderedRows = indexRows
-                } else {
-                    // Non-covering: RID-only scan avoids intermediate Row allocation
-                    let orderedRIDs: [UInt64]
-                    if let cached = index.searchRangeWithLimitRIDsCached(from: nil, to: nil, limit: fetchLimit, ascending: ascending) {
-                        orderedRIDs = cached
-                    } else {
-                        orderedRIDs = try await index.searchRangeWithLimitRIDs(from: nil, to: nil, limit: fetchLimit, ascending: ascending)
+
+                    if let condition = condition {
+                        orderedRows = orderedRows.filter { evaluateCondition(condition, row: $0) }
                     }
-                    // Fetch full rows preserving index order (no Set, no dictionary)
-                    orderedRows = try await storageEngine.getRecordsByIDsOrdered(orderedRIDs, tableName: table, transactionContext: transactionContext)
+
+                    // Enough results or no WHERE (exact fetch) → done
+                    if orderedRows.count >= totalNeeded || condition == nil { break }
+                    // First attempt with 2x wasn't enough — retry with 4x
+                    if attempt == 0 { fetchLimit = totalNeeded * 4 } else { break }
                 }
 
-                // Apply WHERE filter if present
-                if let condition = condition {
-                    orderedRows = orderedRows.filter { evaluateCondition(condition, row: $0) }
-                }
-
-                // If we got enough rows, return early (skip full table scan)
                 if orderedRows.count >= totalNeeded || condition == nil {
                     // Apply OFFSET then LIMIT (already sorted by index)
                     if let offset = mods.offset, offset > 0 {
@@ -1347,9 +1349,11 @@ public final class QueryExecutor: @unchecked Sendable {
 
                 for record in page.records where ridSet.contains(record.id) {
                     // Lazy filter: verify condition on raw bytes without full Row decode
+                    var lazyConfirmed = false
                     if let colMap = colMap {
                         if let lazyResult = evaluateConditionLazy(condition, data: record.data, columnIndexMap: colMap) {
                             if !lazyResult { continue }
+                            lazyConfirmed = true
                         }
                     }
 
@@ -1366,7 +1370,7 @@ public final class QueryExecutor: @unchecked Sendable {
                     } else {
                         // Slow path: full decode + merge + re-encode
                         guard let row = Row.fromBytesAuto(record.data, schema: updateSchema) else { continue }
-                        guard evaluateCondition(condition, row: row) else { continue }
+                        if !lazyConfirmed { guard evaluateCondition(condition, row: row) else { continue } }
                         var updatedValues = row.values
                         for (key, value) in values { updatedValues[key] = value }
                         let updatedRow = Row(values: updatedValues)
@@ -1400,9 +1404,11 @@ public final class QueryExecutor: @unchecked Sendable {
             if !ridPages.uncached.isEmpty {
                 let rawRecords = try await storageEngine.getRecordDataByIDs(Set(ridPages.uncached), tableName: table, transactionContext: transactionContext)
                 for (record, recordPageID) in rawRecords {
+                    var lazyConfirmed = false
                     if let colMap = colMap {
                         if let lazyResult = evaluateConditionLazy(condition, data: record.data, columnIndexMap: colMap) {
                             if !lazyResult { continue }
+                            lazyConfirmed = true
                         }
                     }
                     if let templates = patchTemplates,
@@ -1411,7 +1417,7 @@ public final class QueryExecutor: @unchecked Sendable {
                         try await storageEngine.replaceRecordInPlace(id: record.id, newRecord: newRecord, tableName: table, transactionContext: transactionContext, knownPageID: recordPageID)
                     } else {
                         guard let row = Row.fromBytesAuto(record.data, schema: updateSchema) else { continue }
-                        guard evaluateCondition(condition, row: row) else { continue }
+                        if !lazyConfirmed { guard evaluateCondition(condition, row: row) else { continue } }
                         var updatedValues = row.values
                         for (key, value) in values { updatedValues[key] = value }
                         let updatedRow = Row(values: updatedValues)
@@ -1453,13 +1459,15 @@ public final class QueryExecutor: @unchecked Sendable {
                 let data = record.data
 
                 // Lazy filter: skip full row decode for non-matching records
+                var lazyConfirmed = false
                 if let condition = condition, let colMap = updateColMap {
                     if let lazyResult = evaluateConditionLazy(condition, data: data, columnIndexMap: colMap) {
                         if !lazyResult { continue }
+                        lazyConfirmed = true
                     }
                 }
                 guard let row = Row.fromBytesAuto(data, schema: updateSchema) else { continue }
-                if condition == nil || evaluateCondition(condition!, row: row) {
+                if condition == nil || lazyConfirmed || evaluateCondition(condition!, row: row) {
                     let newRecord: Record
                     let updatedRow: Row
                     // Fast path: patch raw bytes in-place using pre-computed templates
