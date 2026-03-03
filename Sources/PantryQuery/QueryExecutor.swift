@@ -280,7 +280,27 @@ public final class QueryExecutor: @unchecked Sendable {
                         } else {
                             orderedRIDs = try await index.searchRangeWithLimitRIDs(from: nil, to: nil, limit: fetchLimit, ascending: ascending)
                         }
-                        orderedRows = try await storageEngine.getRecordsByIDsOrdered(orderedRIDs, tableName: table, transactionContext: transactionContext)
+                        // Sync mmap fast path: resolve RIDs without async overhead
+                        if transactionContext == nil && orderedRIDs.count <= 64 {
+                            var syncRows = [Row]()
+                            syncRows.reserveCapacity(orderedRIDs.count)
+                            var allSync = true
+                            for rid in orderedRIDs {
+                                if let row = storageEngine.getRecordByIDSync(rid, tableName: table) {
+                                    syncRows.append(row)
+                                } else {
+                                    allSync = false
+                                    break
+                                }
+                            }
+                            if allSync {
+                                orderedRows = syncRows
+                            } else {
+                                orderedRows = try await storageEngine.getRecordsByIDsOrdered(orderedRIDs, tableName: table, transactionContext: transactionContext)
+                            }
+                        } else {
+                            orderedRows = try await storageEngine.getRecordsByIDsOrdered(orderedRIDs, tableName: table, transactionContext: transactionContext)
+                        }
                     }
 
                     if let condition = condition {
@@ -1316,17 +1336,29 @@ public final class QueryExecutor: @unchecked Sendable {
         let plan = planner.chooseAccessPlan(table: table, condition: condition, pageCount: pageIDs.count)
 
         if case .indexScan = plan, let condition = condition {
-            let indexedRows: [Row]?
-            if let cached = indexManager.attemptIndexLookupCached(tableName: table, condition: condition) {
-                indexedRows = cached
-            } else {
-                indexedRows = try await indexManager.attemptIndexLookup(tableName: table, condition: condition)
+            // RID-only path: skip Row allocation for .equals conditions
+            var matchingRIDs: Set<UInt64>?
+            if let cachedRIDs = indexManager.attemptIndexLookupCachedRIDs(tableName: table, condition: condition) {
+                matchingRIDs = cachedRIDs
+            } else if let asyncRIDs = try await indexManager.attemptIndexLookupRIDs(tableName: table, condition: condition) {
+                matchingRIDs = asyncRIDs
             }
-            if let indexedRows {
-            let matchingRIDs = Set(indexedRows.compactMap { row -> UInt64? in
-                guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
-                return UInt64(bitPattern: ridSigned)
-            })
+            // Fallback to Row-based path for non-.equals conditions
+            if matchingRIDs == nil {
+                let indexedRows: [Row]?
+                if let cached = indexManager.attemptIndexLookupCached(tableName: table, condition: condition) {
+                    indexedRows = cached
+                } else {
+                    indexedRows = try await indexManager.attemptIndexLookup(tableName: table, condition: condition)
+                }
+                if let indexedRows {
+                    matchingRIDs = Set(indexedRows.compactMap { row -> UInt64? in
+                        guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
+                        return UInt64(bitPattern: ridSigned)
+                    })
+                }
+            }
+            if let matchingRIDs {
 
             // Single-pass: group RIDs by page, load each page once, patch + replace in place
             let colMap = updateSchema?.columnOrdinals
@@ -1528,17 +1560,29 @@ public final class QueryExecutor: @unchecked Sendable {
         let plan = planner.chooseAccessPlan(table: table, condition: condition, pageCount: pageIDs.count)
 
         if case .indexScan = plan, let condition = condition {
-            let indexedRows: [Row]?
-            if let cached = indexManager.attemptIndexLookupCached(tableName: table, condition: condition) {
-                indexedRows = cached
-            } else {
-                indexedRows = try await indexManager.attemptIndexLookup(tableName: table, condition: condition)
+            // RID-only path: skip Row allocation for .equals conditions
+            var matchingRIDs: Set<UInt64>?
+            if let cachedRIDs = indexManager.attemptIndexLookupCachedRIDs(tableName: table, condition: condition) {
+                matchingRIDs = cachedRIDs
+            } else if let asyncRIDs = try await indexManager.attemptIndexLookupRIDs(tableName: table, condition: condition) {
+                matchingRIDs = asyncRIDs
             }
-            if let indexedRows {
-            let matchingRIDs = Set(indexedRows.compactMap { row -> UInt64? in
-                guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
-                return UInt64(bitPattern: ridSigned)
-            })
+            // Fallback to Row-based path for non-.equals conditions
+            if matchingRIDs == nil {
+                let indexedRows: [Row]?
+                if let cached = indexManager.attemptIndexLookupCached(tableName: table, condition: condition) {
+                    indexedRows = cached
+                } else {
+                    indexedRows = try await indexManager.attemptIndexLookup(tableName: table, condition: condition)
+                }
+                if let indexedRows {
+                    matchingRIDs = Set(indexedRows.compactMap { row -> UInt64? in
+                        guard case .integer(let ridSigned) = row.values["__rid"] else { return nil }
+                        return UInt64(bitPattern: ridSigned)
+                    })
+                }
+            }
+            if let matchingRIDs {
 
             let idxSchema = storageEngine.getTableSchema(table)
             if idxSchema != nil {
