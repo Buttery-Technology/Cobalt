@@ -302,10 +302,16 @@ public final class StorageEngine: @unchecked Sendable {
 
         // Serialize before caching so the data buffer is current
         var serializedPage = page
-        try serializedPage.saveRecords()
+        if !serializedPage.allPatched {
+            if !serializedPage.saveRecordPatch() {
+                try serializedPage.saveRecords()
+            }
+        }
+        serializedPage.allPatched = false
+        serializedPage.patchInvalidated = false
+        serializedPage.lastPatchIndex = nil
 
-        bufferPoolManager.updatePage(serializedPage)
-        bufferPoolManager.markDirty(pageID: page.pageID)
+        bufferPoolManager.updatePageAndMarkDirty(serializedPage)
 
         if let txContext = transactionContext, !skipAfterImage {
             // Log after-image: use delta if we have the before-image data
@@ -347,8 +353,7 @@ public final class StorageEngine: @unchecked Sendable {
         serializedPage.allPatched = false
         serializedPage.patchInvalidated = false
         serializedPage.lastPatchIndex = nil
-        bufferPoolManager.updatePage(serializedPage)
-        bufferPoolManager.markDirty(pageID: page.pageID)
+        bufferPoolManager.updatePageAndMarkDirty(serializedPage)
         if !_state.withLock({ $0.systemPageIDs.contains(page.pageID) }) {
             freeSpaceBitmap.setCategory(pageID: page.pageID, category: serializedPage.spaceCategory())
         }
@@ -373,8 +378,7 @@ public final class StorageEngine: @unchecked Sendable {
         }
         // Batch update + mark dirty in buffer pool (groups by stripe internally)
         for page in serializedPages {
-            bufferPoolManager.updatePage(page)
-            bufferPoolManager.markDirty(pageID: page.pageID)
+            bufferPoolManager.updatePageAndMarkDirty(page)
             if !_state.withLock({ $0.systemPageIDs.contains(page.pageID) }) {
                 freeSpaceBitmap.setCategory(pageID: page.pageID, category: page.spaceCategory())
             }
@@ -560,8 +564,9 @@ public final class StorageEngine: @unchecked Sendable {
 
             // Handle overflow records individually
             if serializedSize > maxInlineSize {
-                // Flush current page first
+                // Flush current page first — data buffer already up-to-date from addRecordDirect
                 if pageDirty {
+                    currentPage.allPatched = true
                     try await savePage(currentPage, transactionContext: transactionContext)
                     freeSpaceBitmap.setCategory(pageID: currentPage.pageID, category: currentPage.spaceCategory())
                     pageDirty = false
@@ -575,14 +580,15 @@ public final class StorageEngine: @unchecked Sendable {
                 continue
             }
 
-            // Try to add to current page (pass pre-computed size to avoid double serialization)
-            if currentPage.addRecord(record, knownSerializedSize: serializedSize) {
+            // Try to add to current page with direct serialization into buffer
+            if currentPage.addRecordDirect(record, knownSerializedSize: serializedSize) {
                 pageDirty = true
                 inserted += 1
                 ridCacheEntries.append((record.id, currentPage.pageID))
             } else {
-                // Page full — write it with skipAfterImage (before-image only for undo)
+                // Page full — data buffer already up-to-date from addRecordDirect
                 if pageDirty {
+                    currentPage.allPatched = true
                     if transactionContext != nil {
                         try await savePage(currentPage, transactionContext: transactionContext, skipAfterImage: true)
                     } else {
@@ -592,7 +598,7 @@ public final class StorageEngine: @unchecked Sendable {
                 }
 
                 currentPage = try await createNewPageForTable(tableInfo: &tableInfo)
-                if !currentPage.addRecord(record, knownSerializedSize: serializedSize) {
+                if !currentPage.addRecordDirect(record, knownSerializedSize: serializedSize) {
                     throw PantryError.recordTooLarge(size: serializedSize)
                 }
                 pageDirty = true
@@ -601,8 +607,9 @@ public final class StorageEngine: @unchecked Sendable {
             }
         }
 
-        // Flush the last page
+        // Flush the last page — data buffer already up-to-date from addRecordDirect
         if pageDirty {
+            currentPage.allPatched = true
             if transactionContext != nil {
                 try await savePage(currentPage, transactionContext: transactionContext, skipAfterImage: true)
             } else {
@@ -914,8 +921,9 @@ public final class StorageEngine: @unchecked Sendable {
                 ? try await getPageConcurrent(pageID: pageID)
                 : try await getPage(pageID: pageID, transactionContext: transactionContext)
             let idSet = Set(pageIds)
-            var deletedFromPage = 0
+            var idsToDelete = Set<UInt64>()
 
+            // First pass: collect WAL data + index removal info (before mutation)
             for record in page.records where idSet.contains(record.id) {
                 var data = record.data
                 if record.isOverflow {
@@ -927,17 +935,18 @@ public final class StorageEngine: @unchecked Sendable {
                     try await logManager.logRecordDelete(txID: txContext.transactionID, pageID: pageID, recordID: record.id, data: data)
                 }
 
-                if page.deleteRecord(id: record.id) {
-                    deletedFromPage += 1
-                    if record.isOverflow, let overflowStart = record.overflowPageID {
-                        try await freeOverflowPages(startingAt: overflowStart)
-                    }
-                    rawIndexRemovals.append((id: record.id, data: data))
-                    deletedRIDs.append(record.id)
-                    remaining.remove(record.id)
+                rawIndexRemovals.append((id: record.id, data: data))
+                deletedRIDs.append(record.id)
+                remaining.remove(record.id)
+                idsToDelete.insert(record.id)
+
+                if record.isOverflow, let overflowStart = record.overflowPageID {
+                    try await freeOverflowPages(startingAt: overflowStart)
                 }
             }
 
+            // Second pass: batch delete + patch in one call
+            let deletedFromPage = page.deleteRecordsAndPatch(ids: idsToDelete)
             if deletedFromPage > 0 {
                 if transactionContext != nil {
                     try await savePage(page, transactionContext: transactionContext, skipAfterImage: true)
@@ -957,8 +966,9 @@ public final class StorageEngine: @unchecked Sendable {
                 var page = transactionContext == nil
                     ? try await getPageConcurrent(pageID: currentPageID)
                     : try await getPage(pageID: currentPageID, transactionContext: transactionContext)
-                var deletedFromPage = 0
+                var idsToDelete = Set<UInt64>()
 
+                // First pass: collect WAL data + index removal info (before mutation)
                 for record in page.records where remaining.contains(record.id) {
                     var data = record.data
                     if record.isOverflow {
@@ -970,17 +980,18 @@ public final class StorageEngine: @unchecked Sendable {
                         try await logManager.logRecordDelete(txID: txContext.transactionID, pageID: currentPageID, recordID: record.id, data: data)
                     }
 
-                    if page.deleteRecord(id: record.id) {
-                        deletedFromPage += 1
-                        if record.isOverflow, let overflowStart = record.overflowPageID {
-                            try await freeOverflowPages(startingAt: overflowStart)
-                        }
-                        rawIndexRemovals.append((id: record.id, data: data))
-                        deletedRIDs.append(record.id)
-                        remaining.remove(record.id)
+                    rawIndexRemovals.append((id: record.id, data: data))
+                    deletedRIDs.append(record.id)
+                    remaining.remove(record.id)
+                    idsToDelete.insert(record.id)
+
+                    if record.isOverflow, let overflowStart = record.overflowPageID {
+                        try await freeOverflowPages(startingAt: overflowStart)
                     }
                 }
 
+                // Second pass: batch delete + patch in one call
+                let deletedFromPage = page.deleteRecordsAndPatch(ids: idsToDelete)
                 if deletedFromPage > 0 {
                     if transactionContext != nil {
                         try await savePage(page, transactionContext: transactionContext, skipAfterImage: true)

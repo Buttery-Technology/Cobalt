@@ -253,6 +253,41 @@ public struct DatabasePage: Sendable {
         return true
     }
 
+    /// Add a record and immediately serialize it into the page's data buffer.
+    /// When all records are added via this method, saveRecords() can be skipped
+    /// (caller should set allPatched = true before saving).
+    public mutating func addRecordDirect(_ record: Record, knownSerializedSize: Int) -> Bool {
+        let slotSize = PantryConstants.SLOT_SIZE
+        let headerSize = PantryConstants.PAGE_HEADER_SIZE
+        let newSlotEnd = headerSize + ((recordCount + 1) * slotSize)
+        let newFreeOffset = freeSpaceOffset - knownSerializedSize
+        if newSlotEnd >= newFreeOffset { return false }
+
+        // Snapshot header fields to avoid self-access conflicts inside closure
+        let pid = pageID
+        let nextPid = nextPageID
+        let flgs = flags
+
+        data.withUnsafeMutableBytes { buf in
+            record.serializeInto(buf, at: newFreeOffset)
+            let slotPos = headerSize + (recordCount * slotSize)
+            buf.storeBytes(of: UInt16(newFreeOffset), toByteOffset: slotPos, as: UInt16.self)
+            buf.storeBytes(of: UInt32(knownSerializedSize), toByteOffset: slotPos + 2, as: UInt32.self)
+            buf.storeBytes(of: Int32(recordCount + 1), toByteOffset: 16, as: Int32.self)
+            buf.storeBytes(of: Int32(newFreeOffset), toByteOffset: 20, as: Int32.self)
+            // Write remaining header fields so buffer is fully correct when saveRecords() is skipped
+            buf.storeBytes(of: pid, toByteOffset: 0, as: Int.self)
+            buf.storeBytes(of: nextPid, toByteOffset: 8, as: Int.self)
+            buf.storeBytes(of: flgs, toByteOffset: 24, as: UInt32.self)
+        }
+
+        records.append(record)
+        recordSlots.append((offset: newFreeOffset, length: knownSerializedSize))
+        recordCount += 1
+        freeSpaceOffset = newFreeOffset
+        return true
+    }
+
     /// Replace a record in-place if the new record fits. Returns true on success.
     /// Sets `lastPatchIndex` for fast single-record serialization via `saveRecordPatch()`.
     public mutating func replaceRecord(id: UInt64, with newRecord: Record) -> Bool {
@@ -288,11 +323,11 @@ public struct DatabasePage: Sendable {
         guard let index = records.firstIndex(where: { $0.id == id }),
               index < recordSlots.count else { return false }
         let slot = recordSlots[index]
-        let newData = newRecord.serialize()
-        guard newData.count == slot.length else { return false }
-        // Update records array and patch data buffer in-place
+        guard newRecord.serializedSize == slot.length else { return false }
         records[index] = newRecord
-        data.replaceSubrange(slot.offset..<(slot.offset + slot.length), with: newData)
+        data.withUnsafeMutableBytes { buf in
+            newRecord.serializeInto(buf, at: slot.offset)
+        }
         allPatched = true
         return true
     }
@@ -319,17 +354,69 @@ public struct DatabasePage: Sendable {
             return false
         }
         let slot = recordSlots[patch.index]
-        let newData = records[patch.index].serialize()
-        guard newData.count == slot.length else {
+        let record = records[patch.index]
+        guard record.serializedSize == slot.length else {
             lastPatchIndex = nil
             patchInvalidated = false
             return false
         }
-        // Patch the record data directly in the buffer
-        data.replaceSubrange(slot.offset..<(slot.offset + slot.length), with: newData)
+        data.withUnsafeMutableBytes { buf in
+            record.serializeInto(buf, at: slot.offset)
+        }
         lastPatchIndex = nil
         patchInvalidated = false
         return true
+    }
+
+    /// Delete records by IDs and immediately patch the data buffer's header + slot directory.
+    /// Record data is left in place (dead space). Avoids full saveRecords() re-serialization.
+    /// freeSpaceOffset is NOT reclaimed — next saveRecords() will compact.
+    public mutating func deleteRecordsAndPatch(ids: Set<UInt64>) -> Int {
+        var indicesToRemove = IndexSet()
+        for (i, record) in records.enumerated() {
+            if ids.contains(record.id) { indicesToRemove.insert(i) }
+        }
+        guard !indicesToRemove.isEmpty else { return 0 }
+        let deletedCount = indicesToRemove.count
+
+        for i in indicesToRemove.reversed() {
+            records.remove(at: i)
+            if i < recordSlots.count { recordSlots.remove(at: i) }
+        }
+        recordCount -= deletedCount
+
+        // Snapshot header fields to avoid self-access conflicts inside closure
+        let pid = pageID
+        let nextPid = nextPageID
+        let flgs = flags
+        let currentRecordCount = recordCount
+        let currentSlots = recordSlots
+
+        data.withUnsafeMutableBytes { buf in
+            // Write full header
+            buf.storeBytes(of: pid, toByteOffset: 0, as: Int.self)
+            buf.storeBytes(of: nextPid, toByteOffset: 8, as: Int.self)
+            buf.storeBytes(of: Int32(currentRecordCount), toByteOffset: 16, as: Int32.self)
+            // Note: freeSpaceOffset not reclaimed — leave as-is for correctness
+            buf.storeBytes(of: flgs, toByteOffset: 24, as: UInt32.self)
+
+            // Rewrite slot directory
+            var pos = PantryConstants.PAGE_HEADER_SIZE
+            for slot in currentSlots {
+                buf.storeBytes(of: UInt16(slot.offset), toByteOffset: pos, as: UInt16.self)
+                pos += 2
+                buf.storeBytes(of: UInt32(slot.length), toByteOffset: pos, as: UInt32.self)
+                pos += 4
+            }
+            // Zero out old trailing slots
+            let oldSlotsEnd = PantryConstants.PAGE_HEADER_SIZE +
+                (currentRecordCount + deletedCount) * PantryConstants.SLOT_SIZE
+            if pos < oldSlotsEnd {
+                memset(buf.baseAddress!.advanced(by: pos), 0, oldSlotsEnd - pos)
+            }
+        }
+        allPatched = true
+        return deletedCount
     }
 
     /// Delete a record by ID. Returns false if not found.
