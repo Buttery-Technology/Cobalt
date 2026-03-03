@@ -910,7 +910,9 @@ public final class StorageEngine: @unchecked Sendable {
         // Process cached pages — single load for both data extraction and deletion
         for pageID in idsByPage.keys.sorted() {
             let pageIds = idsByPage[pageID]!
-            var page = try await getPage(pageID: pageID, transactionContext: transactionContext)
+            var page = transactionContext == nil
+                ? try await getPageConcurrent(pageID: pageID)
+                : try await getPage(pageID: pageID, transactionContext: transactionContext)
             let idSet = Set(pageIds)
             var deletedFromPage = 0
 
@@ -952,7 +954,9 @@ public final class StorageEngine: @unchecked Sendable {
             let pageList = tableRegistry.getTableInfo(name: tableName)?.pageList ?? []
             for currentPageID in pageList {
                 guard !remaining.isEmpty else { break }
-                var page = try await getPage(pageID: currentPageID, transactionContext: transactionContext)
+                var page = transactionContext == nil
+                    ? try await getPageConcurrent(pageID: currentPageID)
+                    : try await getPage(pageID: currentPageID, transactionContext: transactionContext)
                 var deletedFromPage = 0
 
                 for record in page.records where remaining.contains(record.id) {
@@ -1960,19 +1964,20 @@ public final class StorageEngine: @unchecked Sendable {
                 }
             }
         } else {
-            // Allocate a contiguous extent of pages, use the first, reserve the rest
-            newPage = try await storageManager.createNewPage()
-            var reserved: [DatabasePage] = []
-            for _ in 1..<extentSize {
-                let extraPage = try await storageManager.createNewPage()
-                await bufferPoolManager.cachePage(extraPage)
-                reserved.append(extraPage)
-            }
-            if !reserved.isEmpty {
+            // Allocate a contiguous extent of pages via single ftruncate
+            let allPages = try storageManager.createNewPages(count: extentSize)
+            newPage = allPages[0]
+            if allPages.count > 1 {
+                let reserved = Array(allPages[1...])
+                for page in reserved {
+                    await bufferPoolManager.cachePage(page)
+                    bufferPoolManager.markDirty(pageID: page.pageID)
+                }
                 _state.withLock { $0.extentReserve[tableInfo.name] = reserved }
             }
         }
         await bufferPoolManager.cachePage(newPage)
+        bufferPoolManager.markDirty(pageID: newPage.pageID)
 
         if tableInfo.firstPageID == 0 {
             tableInfo.firstPageID = newPage.pageID

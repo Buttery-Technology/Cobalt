@@ -209,16 +209,19 @@ public final class StorageManager: Sendable {
         var pages = [DatabasePage]()
         pages.reserveCapacity(count)
         for i in 0..<count {
-            var page = DatabasePage(
+            var pageData = Data(count: pageSize)
+            pageData.withUnsafeMutableBytes { buf in
+                buf.storeBytes(of: firstPageID + i, toByteOffset: 0, as: Int.self)
+                buf.storeBytes(of: Int32(pageSize), toByteOffset: 20, as: Int32.self)
+            }
+            pages.append(DatabasePage(
                 pageID: firstPageID + i,
                 nextPageID: 0,
                 recordCount: 0,
                 freeSpaceOffset: pageSize,
                 flags: 0,
-                data: Data(count: pageSize)
-            )
-            try page.saveRecords()
-            pages.append(page)
+                data: pageData
+            ))
         }
 
         remapMmap()

@@ -170,77 +170,63 @@ public struct DatabasePage: Sendable {
     }
 
     /// Serialize all records back into the raw page data buffer.
-    /// Reuses existing data buffer to avoid 8KB allocation per page write.
+    /// Uses direct buffer writes to avoid intermediate Data allocations and unnecessary zero-fills.
     public mutating func saveRecords() throws {
         let headerSize = PantryConstants.PAGE_HEADER_SIZE
         let slotSize = PantryConstants.SLOT_SIZE
 
         var dataPosition = PantryConstants.PAGE_SIZE
         var newSlots: [(offset: Int, length: Int)] = []
+        var overflowed = false
 
-        // Zero the existing buffer in-place
-        data.resetBytes(in: 0..<data.count)
+        // Snapshot values needed inside the closure to avoid self-access conflicts
+        let currentRecords = records
+        let currentPageID = pageID
+        let currentNextPageID = nextPageID
+        let currentFlags = flags
 
-        for record in records {
-            let recordData = record.serialize()
-            let recordLength = recordData.count
-
-            let nextSlotEnd = headerSize + (newSlots.count + 1) * slotSize
-            if nextSlotEnd >= (dataPosition - recordLength) {
-                throw PantryError.pageOverflow
+        data.withUnsafeMutableBytes { buf in
+            // Write records directly into page buffer (growing from end backward)
+            for record in currentRecords {
+                let recordLength = record.serializedSize
+                let nextSlotEnd = headerSize + (newSlots.count + 1) * slotSize
+                guard nextSlotEnd < (dataPosition - recordLength) else {
+                    overflowed = true; break
+                }
+                dataPosition -= recordLength
+                newSlots.append((offset: dataPosition, length: recordLength))
+                record.serializeInto(buf, at: dataPosition)
             }
 
-            dataPosition -= recordLength
-            newSlots.append((offset: dataPosition, length: recordLength))
-            data.replaceSubrange(dataPosition..<(dataPosition + recordLength), with: recordData)
+            guard !overflowed else { return }
+
+            // Zero only the free-space gap between slot directory end and first record
+            let slotsEnd = headerSize + newSlots.count * slotSize
+            if slotsEnd < dataPosition {
+                memset(buf.baseAddress!.advanced(by: slotsEnd), 0, dataPosition - slotsEnd)
+            }
+
+            // Write header
+            buf.storeBytes(of: currentPageID, toByteOffset: 0, as: Int.self)
+            buf.storeBytes(of: currentNextPageID, toByteOffset: 8, as: Int.self)
+            buf.storeBytes(of: Int32(currentRecords.count), toByteOffset: 16, as: Int32.self)
+            buf.storeBytes(of: Int32(dataPosition), toByteOffset: 20, as: Int32.self)
+            buf.storeBytes(of: currentFlags, toByteOffset: 24, as: UInt32.self)
+
+            // Write slot directory
+            var pos = headerSize
+            for slot in newSlots {
+                buf.storeBytes(of: UInt16(slot.offset), toByteOffset: pos, as: UInt16.self)
+                pos += 2
+                buf.storeBytes(of: UInt32(slot.length), toByteOffset: pos, as: UInt32.self)
+                pos += 4
+            }
         }
+
+        if overflowed { throw PantryError.pageOverflow }
 
         freeSpaceOffset = dataPosition
         recordCount = records.count
-
-        var position = 0
-
-        withUnsafeBytes(of: pageID) { buffer in
-            data.replaceSubrange(position..<(position + 8), with: buffer)
-        }
-        position += 8
-
-        withUnsafeBytes(of: nextPageID) { buffer in
-            data.replaceSubrange(position..<(position + 8), with: buffer)
-        }
-        position += 8
-
-        var rc = Int32(recordCount)
-        withUnsafeBytes(of: &rc) { buffer in
-            data.replaceSubrange(position..<(position + 4), with: buffer)
-        }
-        position += 4
-
-        var fso = Int32(freeSpaceOffset)
-        withUnsafeBytes(of: &fso) { buffer in
-            data.replaceSubrange(position..<(position + 4), with: buffer)
-        }
-        position += 4
-
-        withUnsafeBytes(of: flags) { buffer in
-            data.replaceSubrange(position..<(position + 4), with: buffer)
-        }
-        position += 4
-
-        for slot in newSlots {
-            let slotOffset = UInt16(slot.offset)
-            withUnsafeBytes(of: slotOffset) { buffer in
-                data.replaceSubrange(position..<(position + 2), with: buffer)
-            }
-            position += 2
-
-            let slotLength = UInt32(slot.length)
-            withUnsafeBytes(of: slotLength) { buffer in
-                data.replaceSubrange(position..<(position + 4), with: buffer)
-            }
-            position += 4
-        }
-
         recordSlots = newSlots
     }
 
