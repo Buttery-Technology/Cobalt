@@ -255,14 +255,22 @@ public final class StorageEngine: @unchecked Sendable {
         return try await bufferPoolManager.getPages(pageIDs: pageIDs)
     }
 
-    /// Iterate over records on a page via mmap without building DatabasePage or [Record].
-    /// Returns false if the page has dirty data or mmap is unavailable (caller should fall back).
+    /// Iterate over records on a page via mmap (clean pages) or buffer pool cache (dirty pages).
+    /// Returns false only on cache miss (caller should fall back to async).
     /// The visitor receives (recordID, payloadData) and returns true to continue or false to stop.
     public func forEachRecordOnPageMmap(pageID: Int, _ visitor: (UInt64, Data) -> Bool) -> Bool {
-        guard storageManager.mmapAvailable, !bufferPoolManager.isDirty(pageID: pageID) else {
-            return false
+        // Fast path: mmap for clean pages
+        if storageManager.mmapAvailable && !bufferPoolManager.isDirty(pageID: pageID) {
+            return storageManager.forEachRecordMmap(pageID: pageID, visitor)
         }
-        return storageManager.forEachRecordMmap(pageID: pageID, visitor)
+        // Fallback: read from buffer pool cache for dirty pages
+        if let cachedPage = bufferPoolManager.getCachedPage(pageID: pageID) {
+            for record in cachedPage.records {
+                if !visitor(record.id, record.data) { return true }  // stopped early
+            }
+            return true  // all records visited
+        }
+        return false  // cache miss — caller falls back to async
     }
 
     /// Zero-copy variant: iterate records passing UnsafeRawBufferPointer directly from mmap.
@@ -1353,18 +1361,29 @@ public final class StorageEngine: @unchecked Sendable {
         return result.compactMap { $0 }
     }
 
-    /// Synchronous single-record fetch via mmap: no async overhead, no full page deserialization.
-    /// Combines ridPageMap lookup + isDirty check + mmap record read in one fast path.
-    /// Returns nil if mmap unavailable, page is dirty, record not in ridPageMap, or overflow record.
+    /// Synchronous single-record fetch via mmap (clean pages) or buffer pool cache (dirty pages).
+    /// Combines ridPageMap lookup + mmap/cache read in one fast path — no async overhead.
+    /// Returns nil if record not in ridPageMap, or both mmap and cache miss.
     public func getRecordByIDSync(_ id: UInt64, tableName: String) -> Row? {
-        guard storageManager.mmapAvailable else { return nil }
         let pageID: Int? = _state.withLock { $0.ridPageMap[tableName]?[id] }
         guard let pageID else { return nil }
-        // Dirty pages haven't been flushed — mmap would show stale data
-        if bufferPoolManager.isDirty(pageID: pageID) { return nil }
         let resolvedSchema = getTableSchema(tableName)
-        guard let recordData = storageManager.readRecordMmap(pageID: pageID, recordID: id) else { return nil }
-        return Row.fromBytesAuto(recordData, schema: resolvedSchema)
+
+        // Fast path: mmap for clean pages
+        if storageManager.mmapAvailable && !bufferPoolManager.isDirty(pageID: pageID) {
+            if let recordData = storageManager.readRecordMmap(pageID: pageID, recordID: id) {
+                return Row.fromBytesAuto(recordData, schema: resolvedSchema)
+            }
+        }
+
+        // Fallback: read dirty page from buffer pool cache (sync, no disk I/O)
+        if let cachedPage = bufferPoolManager.getCachedPage(pageID: pageID) {
+            for record in cachedPage.records where record.id == id {
+                return Row.fromBytesAuto(record.data, schema: resolvedSchema)
+            }
+        }
+
+        return nil  // cache miss — caller falls back to async path
     }
 
     /// Single-record fetch by RID: avoids Set overhead of getRecordsByIDs.
@@ -2008,10 +2027,8 @@ public final class StorageEngine: @unchecked Sendable {
                     buf.storeBytes(of: newPage.pageID, toByteOffset: 8, as: Int.self)
                 }
                 tailPage.allPatched = true
-                // Write patched buffer to disk and update buffer pool (clears dirty flag)
-                try await storageManager.writePage(&tailPage, alreadySerialized: true)
-                bufferPoolManager.updatePage(tailPage)
-                bufferPoolManager.clearDirtyFlag(pageID: tailPage.pageID)
+                // Defer write: dirty page readable via buffer pool cache fallback
+                bufferPoolManager.updatePageAndMarkDirty(tailPage)
             } else {
                 // Fallback: walk chain to find true tail (recovery after crash)
                 var currentPageID = tailPage.nextPageID
