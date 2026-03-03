@@ -103,6 +103,72 @@ public struct DatabasePage: Sendable {
         }
     }
 
+    /// Parse records from the raw page data buffer, but only deserialize records
+    /// whose IDs are in the given set. Reads the 8-byte record ID from each slot header
+    /// and skips full deserialization for non-matching records.
+    /// Both `records` and `recordSlots` are filtered to only contain matching entries,
+    /// keeping their indices aligned for correct use with `replaceRecordAndPatch`.
+    /// NOTE: Pages loaded this way must NOT use `saveRecords()` — only in-place
+    /// patching via `replaceRecordAndPatch` is safe (the data buffer is intact).
+    public mutating func loadRecordsSelective(ids: Set<UInt64>) {
+        records = []
+        recordSlots = []
+        var position = 0
+
+        pageID = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: position, as: Int.self) }
+        position += 8
+
+        nextPageID = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: position, as: Int.self) }
+        position += 8
+
+        recordCount = Int(data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: position, as: Int32.self) })
+        position += 4
+
+        freeSpaceOffset = Int(data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: position, as: Int32.self) })
+        position += 4
+
+        flags = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: position, as: UInt32.self) }
+        position += 4
+
+        let maxSlots = (PantryConstants.PAGE_SIZE - PantryConstants.PAGE_HEADER_SIZE) / PantryConstants.SLOT_SIZE
+        if recordCount < 0 || recordCount > maxSlots {
+            recordCount = 0
+        }
+
+        if freeSpaceOffset < PantryConstants.PAGE_HEADER_SIZE || freeSpaceOffset > PantryConstants.PAGE_SIZE {
+            freeSpaceOffset = PantryConstants.PAGE_SIZE
+            recordCount = 0
+        }
+
+        // Parse all slots from the header, then filter by matching IDs
+        var allSlots: [(offset: Int, length: Int)] = []
+        for _ in 0..<recordCount {
+            guard position + PantryConstants.SLOT_SIZE <= data.count else { break }
+
+            let offset = data.withUnsafeBytes { Int($0.loadUnaligned(fromByteOffset: position, as: UInt16.self)) }
+            position += 2
+
+            let length = data.withUnsafeBytes { Int($0.loadUnaligned(fromByteOffset: position, as: UInt32.self)) }
+            position += 4
+
+            allSlots.append((offset: offset, length: length))
+        }
+
+        for slot in allSlots {
+            guard slot.offset + slot.length <= data.count else { continue }
+            guard slot.offset + 8 <= data.count else { continue }
+            let recordID = data.withUnsafeBytes {
+                $0.loadUnaligned(fromByteOffset: slot.offset, as: UInt64.self)
+            }
+            guard ids.contains(recordID) else { continue }
+            let recordData = data.subdata(in: slot.offset..<(slot.offset + slot.length))
+            if let record = Record.deserialize(from: recordData) {
+                recordSlots.append(slot)
+                records.append(record)
+            }
+        }
+    }
+
     /// Serialize all records back into the raw page data buffer.
     /// Reuses existing data buffer to avoid 8KB allocation per page write.
     public mutating func saveRecords() throws {

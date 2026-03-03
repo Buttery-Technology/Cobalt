@@ -1369,15 +1369,20 @@ public final class QueryExecutor: @unchecked Sendable {
 
             var updatedCount = 0
             var modifiedPages = Set<Int>()
+            var deferredPages: [DatabasePage] = []
 
             // Process pages with cached RID-to-page mapping
             for (pageID, pageRIDs) in ridPages.cached {
-                var page = transactionContext == nil
-                    ? try await storageEngine.getPageConcurrent(pageID: pageID)
-                    : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
                 let ridSet = Set(pageRIDs)
+                // Use selective loading for non-transactional path (only deserializes matching records)
+                let useSelectiveLoad = transactionContext == nil
+                var page = useSelectiveLoad
+                    ? try await storageEngine.getPageSelectiveConcurrent(pageID: pageID, recordIDs: ridSet)
+                    : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
                 var pageModified = false
                 var allPatchable = true
+                var needsFullReprocess = false
+                var pageUpdatedCount = 0
 
                 for record in page.records where ridSet.contains(record.id) {
                     // Lazy filter: verify condition on raw bytes without full Row decode
@@ -1395,6 +1400,10 @@ public final class QueryExecutor: @unchecked Sendable {
                         let newRecord = Record(id: record.id, data: patchedData)
                         if page.replaceRecordAndPatch(id: record.id, with: newRecord) {
                             pageModified = true
+                        } else if useSelectiveLoad {
+                            // Selective load can't handle non-patchable — reload full page
+                            needsFullReprocess = true
+                            break
                         } else if page.replaceRecord(id: record.id, with: newRecord) {
                             pageModified = true
                             allPatchable = false
@@ -1410,6 +1419,9 @@ public final class QueryExecutor: @unchecked Sendable {
                         let newRecord = Record(id: record.id, data: rowData)
                         if page.replaceRecordAndPatch(id: record.id, with: newRecord) {
                             pageModified = true
+                        } else if useSelectiveLoad {
+                            needsFullReprocess = true
+                            break
                         } else if page.replaceRecord(id: record.id, with: newRecord) {
                             pageModified = true
                             allPatchable = false
@@ -1419,17 +1431,71 @@ public final class QueryExecutor: @unchecked Sendable {
                             allPatchable = false
                         }
                     }
-                    updatedCount += 1
+                    pageUpdatedCount += 1
                 }
+
+                // Fallback: selective load hit a non-patchable update — reload full page and redo
+                if needsFullReprocess {
+                    page = try await storageEngine.getPageConcurrent(pageID: pageID)
+                    pageModified = false
+                    allPatchable = true
+                    pageUpdatedCount = 0
+
+                    for record in page.records where ridSet.contains(record.id) {
+                        var lazyConfirmed = false
+                        if let colMap = colMap {
+                            if let lazyResult = evaluateConditionLazy(condition, data: record.data, columnIndexMap: colMap) {
+                                if !lazyResult { continue }
+                                lazyConfirmed = true
+                            }
+                        }
+                        if let templates = patchTemplates,
+                           let patchedData = Row.patchPositionalDataPrecomputed(record.data, templates: templates) {
+                            let newRecord = Record(id: record.id, data: patchedData)
+                            if page.replaceRecordAndPatch(id: record.id, with: newRecord) {
+                                pageModified = true
+                            } else if page.replaceRecord(id: record.id, with: newRecord) {
+                                pageModified = true
+                                allPatchable = false
+                            }
+                        } else {
+                            guard let row = Row.fromBytesAuto(record.data, schema: updateSchema) else { continue }
+                            if !lazyConfirmed { guard evaluateCondition(condition, row: row) else { continue } }
+                            var updatedValues = row.values
+                            for (key, value) in values { updatedValues[key] = value }
+                            let updatedRow = Row(values: updatedValues)
+                            let rowData = updateSchema != nil ? updatedRow.toBytesPositional(schema: updateSchema!) : updatedRow.toBytes()
+                            let newRecord = Record(id: record.id, data: rowData)
+                            if page.replaceRecordAndPatch(id: record.id, with: newRecord) {
+                                pageModified = true
+                            } else if page.replaceRecord(id: record.id, with: newRecord) {
+                                pageModified = true
+                                allPatchable = false
+                            } else {
+                                try await storageEngine.deleteRecord(id: record.id, tableName: table, transactionContext: transactionContext, knownPageID: pageID)
+                                try await storageEngine.insertRecord(newRecord, tableName: table, row: updatedRow, transactionContext: transactionContext)
+                                allPatchable = false
+                            }
+                        }
+                        pageUpdatedCount += 1
+                    }
+                }
+
+                updatedCount += pageUpdatedCount
                 if pageModified {
                     if !allPatchable { page.allPatched = false }
                     if transactionContext == nil {
-                        try await storageEngine.savePageDeferred(page)
+                        deferredPages.append(page)
                     } else {
                         try await storageEngine.savePage(page, transactionContext: transactionContext)
                     }
                     modifiedPages.insert(pageID)
                 }
+            }
+
+            // Batch save all deferred pages at once
+            if !deferredPages.isEmpty {
+                try storageEngine.savePagesDeferred(deferredPages)
             }
 
             // Fallback: scan for uncached RIDs
