@@ -172,6 +172,33 @@ public final class QueryExecutor: @unchecked Sendable {
     // MARK: - SELECT
 
     public func executeSelect(from table: String, columns: [String]? = nil, where condition: WhereCondition? = nil, modifiers: QueryModifiers? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {
+        // Ultra-fast path: equality lookup on indexed column with LIMIT 1 (e.g., WHERE pk = ? LIMIT 1)
+        // Runs BEFORE cache key computation to avoid cache overhead when sync mmap succeeds.
+        if transactionContext == nil,
+           let cond = condition, let mods = modifiers, mods.limit == 1, !mods.distinct,
+           (mods.orderBy == nil || mods.orderBy!.isEmpty) {
+            if case .equals(let column, let value) = cond, value != .null {
+                if let index = indexManager.getIndex(tableName: table, columnName: column) {
+                    if let ridResult = index.searchCachedFirstRID(key: value) {
+                        guard let rid = ridResult else {
+                            // Definitive bloom/B-tree miss — no such key
+                            return []
+                        }
+                        // Try fully synchronous mmap path (no async, no cache overhead)
+                        if let syncRow = storageEngine.getRecordByIDSync(rid, tableName: table) {
+                            if let columns = columns, !columns.isEmpty {
+                                let projected = columns.reduce(into: [String: DBValue]()) { r, c in r[c] = syncRow.values[c] ?? .null }
+                                return [Row(values: projected)]
+                            }
+                            return [syncRow]
+                        }
+                        // Sync mmap unavailable (dirty page, encrypted, etc.) — fall through to cached path
+                    }
+                    // Fall through on index cache miss — normal path will handle it
+                }
+            }
+        }
+
         // Query result cache: skip for transactional queries (they need fresh data)
         let cacheKey: QueryResultCacheKey?
         if transactionContext == nil {
@@ -190,46 +217,6 @@ public final class QueryExecutor: @unchecked Sendable {
         }
 
         var rows: [Row]
-
-        // Ultra-fast path: equality lookup on indexed column with LIMIT 1 (e.g., WHERE pk = ? LIMIT 1)
-        // Fuses index lookup + single record fetch, bypassing query planner entirely.
-        if let cond = condition, let mods = modifiers, mods.limit == 1, !mods.distinct,
-           (mods.orderBy == nil || mods.orderBy!.isEmpty) {
-            if case .equals(let column, let value) = cond, value != .null {
-                if let index = indexManager.getIndex(tableName: table, columnName: column) {
-                    // Fused path: bloom check + B-tree → RID → sync mmap record read
-                    // searchCachedFirstRID returns UInt64??: .some(rid) = hit, .some(nil) = miss, nil = cache miss
-                    if let ridResult = index.searchCachedFirstRID(key: value) {
-                        guard let rid = ridResult else {
-                            // Definitive bloom/B-tree miss — no such key
-                            let empty: [Row] = []
-                            if let key = cacheKey { storeResultCache(key: key, rows: empty) }
-                            return empty
-                        }
-                        // Try fully synchronous mmap path first (no async overhead)
-                        var finalRow: Row? = nil
-                        if transactionContext == nil {
-                            finalRow = storageEngine.getRecordByIDSync(rid, tableName: table)
-                        }
-                        if finalRow == nil {
-                            finalRow = try await storageEngine.getRecordByID(rid, tableName: table, transactionContext: transactionContext)
-                        }
-                        if let finalRow {
-                            var resultRows: [Row]
-                            if let columns = columns, !columns.isEmpty {
-                                let projected = columns.reduce(into: [String: DBValue]()) { r, c in r[c] = finalRow.values[c] ?? .null }
-                                resultRows = [Row(values: projected)]
-                            } else {
-                                resultRows = [finalRow]
-                            }
-                            if let key = cacheKey { storeResultCache(key: key, rows: resultRows) }
-                            return resultRows
-                        }
-                    }
-                    // Fall through on cache miss — normal path will handle it
-                }
-            }
-        }
 
         // Fast path: ORDER BY + LIMIT on a single indexed column → index-ordered scan with early exit
         // Works with or without WHERE condition. For WHERE, overfetches and filters.
@@ -1418,10 +1405,7 @@ public final class QueryExecutor: @unchecked Sendable {
                 }
             }
 
-            // Flush all modified pages at once
-            if transactionContext == nil && !modifiedPages.isEmpty {
-                try await storageEngine.flushDirtyPages(modifiedPages)
-            }
+            // Dirty pages deferred to background writer / eviction / close
             if updatedCount > 0 { invalidateResultCache(forTable: table, modifiedPages: modifiedPages) }
             return updatedCount
         }
@@ -1502,11 +1486,7 @@ public final class QueryExecutor: @unchecked Sendable {
             }
         }
 
-        // Flush all modified pages to disk at once (deferred writes)
-        if transactionContext == nil && !modifiedPages.isEmpty {
-            try await storageEngine.flushDirtyPages(modifiedPages)
-        }
-
+        // Dirty pages deferred to background writer / eviction / close
         if updatedCount > 0 { invalidateResultCache(forTable: table, modifiedPages: modifiedPages) }
         return updatedCount
     }
@@ -1759,17 +1739,48 @@ public final class QueryExecutor: @unchecked Sendable {
             }
         }
 
+        // Zero-copy inline closure: processes a record via UnsafeRawBufferPointer (no Data allocation)
+        func processRecordUnsafe(_ ptr: UnsafeRawBufferPointer) {
+            if let colIdx = aggColumnIndex {
+                if condition == nil {
+                    // Fast path: no condition, just extract + aggregate
+                    if let rawValue = Row.extractColumnValueUnsafe(from: ptr, columnIndex: colIdx) {
+                        switch function {
+                        case .count:
+                            if rawValue != .null { count += 1 }
+                        case .sum:
+                            switch rawValue {
+                            case .integer(let v): hasValue = true; let (r, o) = intSum.addingReportingOverflow(v); if o { allIntegers = false }; intSum = r; doubleSum += Double(v)
+                            case .double(let v): hasValue = true; allIntegers = false; doubleSum += v
+                            default: break
+                            }
+                        case .avg:
+                            if let v = numericValue(rawValue) { avgSum += v; avgCount += 1 }
+                        case .min:
+                            if rawValue != .null { if minVal == .null || rawValue < minVal { minVal = rawValue } }
+                        case .max:
+                            if rawValue != .null { if maxVal == .null || rawValue > maxVal { maxVal = rawValue } }
+                        }
+                        return
+                    }
+                }
+            }
+            // Condition present or column extraction failed — fall back to Data-based path
+            let recordData = Data(bytes: ptr.baseAddress!, count: ptr.count)
+            processRecordData(recordData)
+        }
+
         for pageID in pageIDs {
-            // mmap fast path: iterate records without building DatabasePage/[Record]
+            // Zero-copy mmap fast path: iterate records via UnsafeRawBufferPointer
             if transactionContext == nil {
-                let handled = storageEngine.forEachRecordOnPageMmap(pageID: pageID) { _, recordData in
-                    processRecordData(recordData)
+                let handled = storageEngine.forEachRecordOnPageMmapUnsafe(pageID: pageID) { _, ptr in
+                    processRecordUnsafe(ptr)
                     return true // continue
                 }
                 if handled { continue }
             }
 
-            // Fallback: full page load
+            // Fallback: full page load (dirty pages, encrypted, overflow)
             let page = transactionContext == nil
                 ? try await storageEngine.getPageConcurrent(pageID: pageID)
                 : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
