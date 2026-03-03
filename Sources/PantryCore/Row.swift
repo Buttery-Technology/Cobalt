@@ -403,6 +403,105 @@ extension Row {
         return decodeDBValue(from: data, at: &decodeOff)
     }
 
+    /// Zero-copy variant: extract a single column value from positional v3 data via UnsafeRawBufferPointer.
+    /// Avoids Data allocation — reads directly from mmap'd memory.
+    public static func extractColumnValueUnsafe(from ptr: UnsafeRawBufferPointer, columnIndex: Int) -> DBValue? {
+        guard ptr.count >= 4 else { return nil }
+        let base = ptr.baseAddress!
+        guard base.load(as: UInt8.self) == 0xFF,
+              (base + 1).load(as: UInt8.self) == 0x03 else { return nil }
+
+        let colCount = Int(UInt16(littleEndian: base.loadUnaligned(fromByteOffset: 2, as: UInt16.self)))
+        guard columnIndex < colCount else { return .null }
+
+        let bitmapBytes = (colCount + 7) / 8
+        let bitmapStart = 4
+        guard bitmapStart + bitmapBytes <= ptr.count else { return nil }
+
+        let isNull = ((base + bitmapStart + columnIndex / 8).load(as: UInt8.self) & (1 << (columnIndex % 8))) != 0
+        if isNull { return .null }
+
+        let offsetTableStart = bitmapStart + bitmapBytes
+        let offsetPos = offsetTableStart + columnIndex * 2
+        guard offsetPos + 2 <= ptr.count else { return nil }
+
+        let relOffset = UInt16(littleEndian: base.loadUnaligned(fromByteOffset: offsetPos, as: UInt16.self))
+        guard relOffset != 0xFFFF else { return .null }
+
+        let offsetTableEnd = offsetTableStart + colCount * 2
+        var decodeOff = offsetTableEnd + Int(relOffset)
+        return decodeDBValueUnsafe(from: ptr, at: &decodeOff)
+    }
+
+    /// Zero-copy DBValue decoder from UnsafeRawBufferPointer.
+    public static func decodeDBValueUnsafe(from ptr: UnsafeRawBufferPointer, at offset: inout Int) -> DBValue? {
+        guard offset < ptr.count else { return nil }
+        let base = ptr.baseAddress!
+        let tag = (base + offset).load(as: UInt8.self)
+        offset += 1
+        switch tag {
+        case 0: return .null
+        case 1: // integer (legacy 8-byte)
+            guard offset + 8 <= ptr.count else { return nil }
+            let v = Int64(littleEndian: base.loadUnaligned(fromByteOffset: offset, as: Int64.self))
+            offset += 8
+            return .integer(v)
+        case 7: // integer (varint zigzag)
+            var zigzag: UInt64 = 0
+            var shift: UInt64 = 0
+            while offset < ptr.count {
+                let b = UInt64((base + offset).load(as: UInt8.self))
+                offset += 1
+                zigzag |= (b & 0x7F) << shift
+                if b & 0x80 == 0 { break }
+                shift += 7
+                if shift >= 70 { return nil }
+            }
+            let v = Int64(bitPattern: (zigzag >> 1) ^ (0 &- (zigzag & 1)))
+            return .integer(v)
+        case 2: // double
+            guard offset + 8 <= ptr.count else { return nil }
+            let bits = UInt64(littleEndian: base.loadUnaligned(fromByteOffset: offset, as: UInt64.self))
+            offset += 8
+            return .double(Double(bitPattern: bits))
+        case 3: // string
+            guard offset + 4 <= ptr.count else { return nil }
+            let len = Int(UInt32(littleEndian: base.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
+            offset += 4
+            let end = offset + len
+            guard end <= ptr.count else { return nil }
+            guard let s = String(bytes: UnsafeRawBufferPointer(start: base + offset, count: len), encoding: .utf8) else { return nil }
+            offset = end
+            return .string(s)
+        case 4: // blob
+            guard offset + 4 <= ptr.count else { return nil }
+            let len = Int(UInt32(littleEndian: base.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
+            offset += 4
+            let end = offset + len
+            guard end <= ptr.count else { return nil }
+            let blob = Data(bytes: base + offset, count: len)
+            offset = end
+            return .blob(blob)
+        case 5: // boolean
+            guard offset < ptr.count else { return nil }
+            let v = (base + offset).load(as: UInt8.self)
+            offset += 1
+            return .boolean(v != 0)
+        case 6: // compound
+            guard offset + 2 <= ptr.count else { return nil }
+            let count = Int(UInt16(littleEndian: base.loadUnaligned(fromByteOffset: offset, as: UInt16.self)))
+            offset += 2
+            var items = [DBValue]()
+            items.reserveCapacity(count)
+            for _ in 0..<count {
+                guard let item = decodeDBValueUnsafe(from: ptr, at: &offset) else { return nil }
+                items.append(item)
+            }
+            return .compound(items)
+        default: return nil
+        }
+    }
+
     /// Check if a column is NULL in positional v3 data without decoding the value.
     /// Returns nil if data is not v3 format.
     public static func isColumnNull(in data: Data, columnIndex: Int) -> Bool? {

@@ -240,6 +240,15 @@ public final class StorageEngine: @unchecked Sendable {
         return storageManager.forEachRecordMmap(pageID: pageID, visitor)
     }
 
+    /// Zero-copy variant: iterate records passing UnsafeRawBufferPointer directly from mmap.
+    /// Returns false if page is dirty or mmap unavailable (caller should fall back).
+    public func forEachRecordOnPageMmapUnsafe(pageID: Int, _ visitor: (UInt64, UnsafeRawBufferPointer) -> Bool) -> Bool {
+        guard storageManager.mmapAvailable, !bufferPoolManager.isDirty(pageID: pageID) else {
+            return false
+        }
+        return storageManager.forEachRecordMmapUnsafe(pageID: pageID, visitor)
+    }
+
     public func savePage(_ page: DatabasePage, transactionContext: TransactionContext? = nil, skipAfterImage: Bool = false) async throws {
         var beforePageData: Data? = nil
 
@@ -744,10 +753,7 @@ public final class StorageEngine: @unchecked Sendable {
             try await hook?.removeFromIndexesBatch(records: indexRemovals, tableName: tableName)
         }
 
-        // Flush all dirty pages at once for non-transactional deletes
-        if transactionContext == nil && totalDeleted > 0 {
-            try await flushDirtyPages(Set(byPage.keys))
-        }
+        // Dirty pages deferred to background writer / eviction / close
 
         // Update registry once
         if totalDeleted > 0 {
@@ -814,9 +820,7 @@ public final class StorageEngine: @unchecked Sendable {
             try await hook?.removeFromIndexesBatchRaw(records: rawIndexRemovals, tableName: tableName, schema: schema)
         }
 
-        if transactionContext == nil && totalDeleted > 0 {
-            try await flushDirtyPages(Set(byPage.keys))
-        }
+        // Dirty pages deferred to background writer / eviction / close
 
         if totalDeleted > 0 {
             guard var freshInfo = tableRegistry.getTableInfo(name: tableName) else { return }
@@ -935,10 +939,9 @@ public final class StorageEngine: @unchecked Sendable {
             }
         }
 
-        // Batch save all deferred pages at once, then flush to disk
+        // Batch save deferred pages — disk write deferred to background writer / eviction / close
         if transactionContext == nil && !deferredPages.isEmpty {
             try savePagesDeferred(deferredPages)
-            try await flushDirtyPages(Set(modifiedPageIDs))
         }
 
         if totalDeleted > 0 {
@@ -981,17 +984,16 @@ public final class StorageEngine: @unchecked Sendable {
             if let txContext = transactionContext {
                 try await logManager.logRecordDelete(txID: txContext.transactionID, pageID: pageID, recordID: id, data: newRecord.data)
                 try await logManager.logRecordInsert(txID: txContext.transactionID, pageID: pageID, recordID: id, data: newRecord.data)
-            } else {
-                var writablePage = page
-                try storageManager.writePage(&writablePage, alreadySerialized: true)
             }
+            // Non-transactional: page is updated + marked dirty in buffer pool.
+            // Disk write deferred to background writer / batch flush / close.
         } else {
             if let txContext = transactionContext {
                 try await logManager.logRecordDelete(txID: txContext.transactionID, pageID: pageID, recordID: id, data: newRecord.data)
                 try await logManager.logRecordInsert(txID: txContext.transactionID, pageID: pageID, recordID: id, data: newRecord.data)
                 try await savePage(page, transactionContext: transactionContext, skipAfterImage: true)
             } else {
-                try await savePage(page, transactionContext: transactionContext)
+                try await savePageDeferred(page)
             }
         }
 

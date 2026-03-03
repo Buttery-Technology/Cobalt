@@ -397,6 +397,47 @@ public final class StorageManager: Sendable {
         }
     }
 
+    /// Zero-copy variant: iterate over records passing UnsafeRawBufferPointer to avoid Data allocation.
+    /// The pointer is only valid during the visitor callback — do NOT escape it.
+    @discardableResult
+    public func forEachRecordMmapUnsafe(pageID: Int, _ visitor: (UInt64, UnsafeRawBufferPointer) -> Bool) -> Bool {
+        mmapState.withReadLock { state in
+            guard let base = state.baseAddress else { return false }
+            let pageOffset = pageID * pageSize
+            let pageEnd = pageOffset + pageSize
+            guard pageEnd <= state.mappedLength else { return false }
+
+            let ptr = base + pageOffset
+
+            let recordCount = Int(ptr.loadUnaligned(fromByteOffset: 16, as: Int32.self))
+            guard recordCount > 0, recordCount <= (pageSize - 28) / 6 else { return true }
+
+            var slotPos = 28
+            for _ in 0..<recordCount {
+                let slotOffset = Int(ptr.loadUnaligned(fromByteOffset: slotPos, as: UInt16.self))
+                let slotLength = Int(ptr.loadUnaligned(fromByteOffset: slotPos + 2, as: UInt32.self))
+                slotPos += 6
+
+                guard slotOffset + slotLength <= pageSize, slotLength >= 12 else { continue }
+
+                let rid = ptr.loadUnaligned(fromByteOffset: slotOffset, as: UInt64.self)
+                let payloadLen = Int(ptr.loadUnaligned(fromByteOffset: slotOffset + 8, as: UInt32.self))
+                let payloadStart = slotOffset + 12
+                guard payloadStart + payloadLen <= pageSize else { continue }
+
+                // Check for overflow — skip (caller must handle via full page load)
+                if payloadLen > 0 {
+                    let firstByte = (ptr + payloadStart).load(fromByteOffset: 0, as: UInt8.self)
+                    if firstByte == 0x01 && payloadLen >= 9 { continue }
+                }
+
+                let bufferPtr = UnsafeRawBufferPointer(start: ptr + payloadStart, count: payloadLen)
+                if !visitor(rid, bufferPtr) { return true } // early exit
+            }
+            return true
+        }
+    }
+
     /// Re-map the file after growth (new pages created).
     /// Uses munmap + mmap since macOS has no mremap.
     public func remapMmap() {
