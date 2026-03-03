@@ -86,6 +86,25 @@ public struct Record: Sendable {
         return Record(id: id, data: payload)
     }
 
+    /// Serialize directly into a mutable buffer at the given offset, avoiding intermediate Data allocation.
+    public func serializeInto(_ buf: UnsafeMutableRawBufferPointer, at offset: Int) {
+        buf.storeBytes(of: id, toByteOffset: offset, as: UInt64.self)
+        if let overflowPage = overflowPageID {
+            let payloadLen = UInt32(9 + data.count)
+            buf.storeBytes(of: payloadLen, toByteOffset: offset + 8, as: UInt32.self)
+            var pos = offset + 12
+            buf[pos] = 0x01; pos += 1
+            buf.storeBytes(of: UInt32(data.count), toByteOffset: pos, as: UInt32.self); pos += 4
+            buf.storeBytes(of: Int32(overflowPage), toByteOffset: pos, as: Int32.self); pos += 4
+            data.copyBytes(to: buf.baseAddress!.advanced(by: pos).assumingMemoryBound(to: UInt8.self),
+                           count: data.count)
+        } else {
+            buf.storeBytes(of: UInt32(data.count), toByteOffset: offset + 8, as: UInt32.self)
+            data.copyBytes(to: buf.baseAddress!.advanced(by: offset + 12).assumingMemoryBound(to: UInt8.self),
+                           count: data.count)
+        }
+    }
+
     /// Whether this record has overflow pages that need to be followed
     public var isOverflow: Bool {
         overflowPageID != nil
