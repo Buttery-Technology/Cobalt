@@ -1362,6 +1362,7 @@ public final class QueryExecutor: @unchecked Sendable {
 
             // Single-pass: group RIDs by page, load each page once, patch + replace in place
             let colMap = updateSchema?.columnOrdinals
+            let skipCondition = true  // Index already filtered RIDs — skip redundant WHERE re-eval
             let ridPages = storageEngine.getRIDPageMapping(matchingRIDs, tableName: table)
 
             // Pre-compute patch templates for reuse across all records
@@ -1386,8 +1387,8 @@ public final class QueryExecutor: @unchecked Sendable {
 
                 for record in page.records where ridSet.contains(record.id) {
                     // Lazy filter: verify condition on raw bytes without full Row decode
-                    var lazyConfirmed = false
-                    if let colMap = colMap {
+                    var lazyConfirmed = skipCondition
+                    if !skipCondition, let colMap = colMap {
                         if let lazyResult = evaluateConditionLazy(condition, data: record.data, columnIndexMap: colMap) {
                             if !lazyResult { continue }
                             lazyConfirmed = true
@@ -1411,7 +1412,7 @@ public final class QueryExecutor: @unchecked Sendable {
                     } else {
                         // Slow path: full decode + merge + re-encode
                         guard let row = Row.fromBytesAuto(record.data, schema: updateSchema) else { continue }
-                        if !lazyConfirmed { guard evaluateCondition(condition, row: row) else { continue } }
+                        if !skipCondition && !lazyConfirmed { guard evaluateCondition(condition, row: row) else { continue } }
                         var updatedValues = row.values
                         for (key, value) in values { updatedValues[key] = value }
                         let updatedRow = Row(values: updatedValues)
@@ -1442,8 +1443,8 @@ public final class QueryExecutor: @unchecked Sendable {
                     pageUpdatedCount = 0
 
                     for record in page.records where ridSet.contains(record.id) {
-                        var lazyConfirmed = false
-                        if let colMap = colMap {
+                        var lazyConfirmed = skipCondition
+                        if !skipCondition, let colMap = colMap {
                             if let lazyResult = evaluateConditionLazy(condition, data: record.data, columnIndexMap: colMap) {
                                 if !lazyResult { continue }
                                 lazyConfirmed = true
@@ -1460,7 +1461,7 @@ public final class QueryExecutor: @unchecked Sendable {
                             }
                         } else {
                             guard let row = Row.fromBytesAuto(record.data, schema: updateSchema) else { continue }
-                            if !lazyConfirmed { guard evaluateCondition(condition, row: row) else { continue } }
+                            if !skipCondition && !lazyConfirmed { guard evaluateCondition(condition, row: row) else { continue } }
                             var updatedValues = row.values
                             for (key, value) in values { updatedValues[key] = value }
                             let updatedRow = Row(values: updatedValues)
@@ -1502,8 +1503,8 @@ public final class QueryExecutor: @unchecked Sendable {
             if !ridPages.uncached.isEmpty {
                 let rawRecords = try await storageEngine.getRecordDataByIDs(Set(ridPages.uncached), tableName: table, transactionContext: transactionContext)
                 for (record, recordPageID) in rawRecords {
-                    var lazyConfirmed = false
-                    if let colMap = colMap {
+                    var lazyConfirmed = skipCondition
+                    if !skipCondition, let colMap = colMap {
                         if let lazyResult = evaluateConditionLazy(condition, data: record.data, columnIndexMap: colMap) {
                             if !lazyResult { continue }
                             lazyConfirmed = true
@@ -1515,7 +1516,7 @@ public final class QueryExecutor: @unchecked Sendable {
                         try await storageEngine.replaceRecordInPlace(id: record.id, newRecord: newRecord, tableName: table, transactionContext: transactionContext, knownPageID: recordPageID)
                     } else {
                         guard let row = Row.fromBytesAuto(record.data, schema: updateSchema) else { continue }
-                        if !lazyConfirmed { guard evaluateCondition(condition, row: row) else { continue } }
+                        if !skipCondition && !lazyConfirmed { guard evaluateCondition(condition, row: row) else { continue } }
                         var updatedValues = row.values
                         for (key, value) in values { updatedValues[key] = value }
                         let updatedRow = Row(values: updatedValues)
@@ -1663,10 +1664,10 @@ public final class QueryExecutor: @unchecked Sendable {
                 return deleted
             }
 
-            // Fallback: original Row-based path
+            // Fallback: original Row-based path (index already filtered — skip condition re-eval)
             let fullRecords = try await storageEngine.getRecordsByIDsWithPages(matchingRIDs, tableName: table, transactionContext: transactionContext)
             var matchingForDelete: [(id: UInt64, pageID: Int, row: Row?)] = []
-            for (record, row, recordPageID) in fullRecords where evaluateCondition(condition, row: row) {
+            for (record, row, recordPageID) in fullRecords {
                 matchingForDelete.append((id: record.id, pageID: recordPageID, row: row))
             }
             if !matchingForDelete.isEmpty {
