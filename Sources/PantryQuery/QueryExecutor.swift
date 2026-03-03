@@ -169,6 +169,25 @@ public final class QueryExecutor: @unchecked Sendable {
         }
     }
 
+    // MARK: - Synchronous Point Lookup
+
+    /// Fully synchronous point lookup: index bloom check → B-tree → mmap record read.
+    /// Returns nil if the fast path cannot handle this query (caller should fall back to async).
+    /// No actor hops, no async overhead, no result cache.
+    public func executeSelectSync(from table: String, columns: [String]? = nil, where condition: WhereCondition, limit: Int = 1) -> [Row]? {
+        guard limit == 1 else { return nil }
+        guard case .equals(let column, let value) = condition, value != .null else { return nil }
+        guard let index = indexManager.getIndex(tableName: table, columnName: column) else { return nil }
+        guard let ridResult = index.searchCachedFirstRID(key: value) else { return nil } // cache miss
+        guard let rid = ridResult else { return [] } // definitive miss
+        guard let syncRow = storageEngine.getRecordByIDSync(rid, tableName: table) else { return nil }
+        if let columns = columns, !columns.isEmpty {
+            let projected = columns.reduce(into: [String: DBValue]()) { r, c in r[c] = syncRow.values[c] ?? .null }
+            return [Row(values: projected)]
+        }
+        return [syncRow]
+    }
+
     // MARK: - SELECT
 
     public func executeSelect(from table: String, columns: [String]? = nil, where condition: WhereCondition? = nil, modifiers: QueryModifiers? = nil, transactionContext: TransactionContext? = nil) async throws -> [Row] {

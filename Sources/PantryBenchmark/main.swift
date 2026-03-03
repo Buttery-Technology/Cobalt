@@ -216,9 +216,9 @@ func runBenchmarks() async throws {
         // 2. PK POINT LOOKUP
         // ═══════════════════════════════════════════════════════════
         let lookupID = "user_\(count / 2)"
-        let pantryLookup = try await measurePantry(100) {
-            let r = try await pantry.select(from: "users", where: .equals(column: "id", value: .string(lookupID)), limit: 1)
-            precondition(r.count == 1)
+        let pantryLookup = measureSync(100) {
+            let r = pantry.selectSync(from: "users", where: .equals(column: "id", value: .string(lookupID)))
+            precondition(r != nil && r!.count == 1)
         }
         let sqliteLookupStmt = sqlite.prepare("SELECT * FROM users WHERE id = ? LIMIT 1")
         let sqliteLookup = measureSync(100) {

@@ -19,7 +19,7 @@ public final class ColumnIndex: @unchecked Sendable {
         var bloomFilter: BloomFilter
         var keyHashSet: Set<Int> = []
     }
-    private let _mutable: PantryLock<MutableState>
+    private let _mutable: PantryRWLock<MutableState>
     /// Maximum size for hash set before it stops growing (memory bound)
     private static let maxHashSetSize = 1_000_000
 
@@ -31,7 +31,7 @@ public final class ColumnIndex: @unchecked Sendable {
         self.partialCondition = partialCondition
         self.btree = btree
         self.nodeStore = nodeStore
-        self._mutable = PantryLock(MutableState(bloomFilter: BloomFilter(expectedElements: expectedElements, falsePositiveRate: 0.001)))
+        self._mutable = PantryRWLock(MutableState(bloomFilter: BloomFilter(expectedElements: expectedElements, falsePositiveRate: 0.001)))
     }
 
     /// Whether this index has no entries (B-tree root is nil)
@@ -56,7 +56,7 @@ public final class ColumnIndex: @unchecked Sendable {
 
     /// Insert a key-row pair into this index
     public func insert(key: DBValue, row: Row) async throws {
-        _mutable.withLock { s in
+        _mutable.withWriteLock { s in
             s.bloomFilter.add(key.indexKey)
             if s.keyHashSet.count < Self.maxHashSetSize {
                 s.keyHashSet.insert(key.hashValue)
@@ -68,7 +68,7 @@ public final class ColumnIndex: @unchecked Sendable {
     /// Batch insert: sorts keys for sequential B-tree traversal, flushes dirty nodes once at end.
     public func insertBatch(pairs: [(key: DBValue, row: Row)]) async throws {
         let sorted = pairs.sorted { $0.key < $1.key }
-        _mutable.withLock { s in
+        _mutable.withWriteLock { s in
             for (key, _) in sorted {
                 s.bloomFilter.add(key.indexKey)
                 if s.keyHashSet.count < Self.maxHashSetSize {
@@ -86,7 +86,7 @@ public final class ColumnIndex: @unchecked Sendable {
     /// Only valid for initial population of an empty index.
     public func bulkLoad(pairs: [(key: DBValue, row: Row)]) async throws {
         let sorted = pairs.sorted { $0.key < $1.key }
-        _mutable.withLock { s in
+        _mutable.withWriteLock { s in
             for (key, _) in sorted {
                 s.bloomFilter.add(key.indexKey)
                 if s.keyHashSet.count < Self.maxHashSetSize {
@@ -122,7 +122,7 @@ public final class ColumnIndex: @unchecked Sendable {
     /// Uses DBValue.hashValue for the hash set (no String allocation) and only falls through
     /// to the bloom filter (String-based) when the hash set is full.
     private func bloomCheckCached(key: DBValue) -> Bool {
-        _mutable.withLock { s -> Bool in
+        _mutable.withReadLock { s -> Bool in
             if s.keyHashSet.count < Self.maxHashSetSize {
                 // Hash set is populated — use DBValue.hashValue directly (no String alloc)
                 return s.keyHashSet.contains(key.hashValue)
@@ -141,7 +141,7 @@ public final class ColumnIndex: @unchecked Sendable {
 
     /// Synchronous batch search using only cached B-tree nodes. Returns nil on any cache miss.
     public func searchBatchCached(keys: [DBValue]) -> [DBValue: [Row]]? {
-        let filteredKeys: [DBValue] = _mutable.withLock { s in
+        let filteredKeys: [DBValue] = _mutable.withReadLock { s in
             keys.filter { key in
                 if s.keyHashSet.count < Self.maxHashSetSize {
                     return s.keyHashSet.contains(key.hashValue)
@@ -166,7 +166,7 @@ public final class ColumnIndex: @unchecked Sendable {
     /// Uses sorted leaf-chain traversal: O(log N + K + L) vs O(K * log N) for individual searches.
     public func searchBatch(keys: [DBValue]) async throws -> [DBValue: [Row]] {
         // Pre-filter keys through bloom filter + hash set under a single lock acquisition
-        let filteredKeys: [DBValue] = _mutable.withLock { s in
+        let filteredKeys: [DBValue] = _mutable.withReadLock { s in
             keys.filter { key in
                 if s.keyHashSet.count < Self.maxHashSetSize {
                     return s.keyHashSet.contains(key.hashValue)
@@ -252,7 +252,7 @@ public final class ColumnIndex: @unchecked Sendable {
 
     /// Add a value to the bloom filter and hash set (used during index rebuild on load)
     public func addToBloomFilter(_ value: DBValue) {
-        _mutable.withLock { s in
+        _mutable.withWriteLock { s in
             s.bloomFilter.add(value.indexKey)
             if s.keyHashSet.count < Self.maxHashSetSize {
                 s.keyHashSet.insert(value.hashValue)
@@ -262,12 +262,12 @@ public final class ColumnIndex: @unchecked Sendable {
 
     /// Get the current bloom filter snapshot for persistence
     public var bloomFilterSnapshot: BloomFilterSnapshot {
-        _mutable.withLock { $0.bloomFilter.snapshot }
+        _mutable.withReadLock { $0.bloomFilter.snapshot }
     }
 
     /// Restore bloom filter from a persisted snapshot
     public func restoreBloomFilter(_ snap: BloomFilterSnapshot) {
-        _mutable.withLock { s in
+        _mutable.withWriteLock { s in
             if let restored = BloomFilter.fromSnapshot(snap) {
                 s.bloomFilter = restored
             }

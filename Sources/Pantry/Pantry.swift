@@ -335,6 +335,20 @@ public actor PantryDatabase: Sendable {
         try await storageEngine.analyzeTable(table)
     }
 
+    // MARK: - Synchronous Point Lookup
+
+    /// Non-transactional synchronous point lookup — bypasses actor serializer entirely.
+    /// Returns nil if the query cannot be served synchronously (caller should fall back to async select).
+    /// Only handles equality lookups with LIMIT 1 on indexed columns via mmap.
+    public nonisolated func selectSync(
+        from table: String,
+        columns: [String]? = nil,
+        where condition: WhereCondition,
+        limit: Int = 1
+    ) -> [Row]? {
+        queryExecutor.executeSelectSync(from: table, columns: columns, where: condition, limit: limit)
+    }
+
     // MARK: - Queries
 
     public func select(
