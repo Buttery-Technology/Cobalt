@@ -377,11 +377,16 @@ public final class StorageEngine: @unchecked Sendable {
             serializedPages.append(page)
         }
         // Batch update + mark dirty in buffer pool (groups by stripe internally)
+        let systemPageIDs = _state.withLock { $0.systemPageIDs }
+        var bitmapUpdates: [(pageID: Int, category: SpaceCategory)] = []
         for page in serializedPages {
             bufferPoolManager.updatePageAndMarkDirty(page)
-            if !_state.withLock({ $0.systemPageIDs.contains(page.pageID) }) {
-                freeSpaceBitmap.setCategory(pageID: page.pageID, category: page.spaceCategory())
+            if !systemPageIDs.contains(page.pageID) {
+                bitmapUpdates.append((pageID: page.pageID, category: page.spaceCategory()))
             }
+        }
+        if !bitmapUpdates.isEmpty {
+            freeSpaceBitmap.setCategoriesBatch(bitmapUpdates)
         }
     }
 
@@ -568,7 +573,6 @@ public final class StorageEngine: @unchecked Sendable {
                 if pageDirty {
                     currentPage.allPatched = true
                     try await savePage(currentPage, transactionContext: transactionContext)
-                    freeSpaceBitmap.setCategory(pageID: currentPage.pageID, category: currentPage.spaceCategory())
                     pageDirty = false
                 }
                 _ = try await insertOverflowRecord(record, tableName: tableName, transactionContext: transactionContext)
@@ -594,7 +598,6 @@ public final class StorageEngine: @unchecked Sendable {
                     } else {
                         try await savePageDeferred(currentPage)
                     }
-                    freeSpaceBitmap.setCategory(pageID: currentPage.pageID, category: currentPage.spaceCategory())
                 }
 
                 currentPage = try await createNewPageForTable(tableInfo: &tableInfo)
@@ -615,7 +618,6 @@ public final class StorageEngine: @unchecked Sendable {
             } else {
                 try await savePageDeferred(currentPage)
             }
-            freeSpaceBitmap.setCategory(pageID: currentPage.pageID, category: currentPage.spaceCategory())
         }
 
         // Batch populate RID-to-page cache (single lock instead of per-record)
@@ -2000,7 +2002,16 @@ public final class StorageEngine: @unchecked Sendable {
             var tailPage = try await getPage(pageID: tailPageID)
             if tailPage.nextPageID == 0 {
                 tailPage.nextPageID = newPage.pageID
-                try await savePage(tailPage)
+                // Patch the 8-byte nextPageID directly in the data buffer (offset 8)
+                // instead of full savePage which re-serializes all records
+                tailPage.data.withUnsafeMutableBytes { buf in
+                    buf.storeBytes(of: newPage.pageID, toByteOffset: 8, as: Int.self)
+                }
+                tailPage.allPatched = true
+                // Write patched buffer to disk and update buffer pool (clears dirty flag)
+                try await storageManager.writePage(&tailPage, alreadySerialized: true)
+                bufferPoolManager.updatePage(tailPage)
+                bufferPoolManager.clearDirtyFlag(pageID: tailPage.pageID)
             } else {
                 // Fallback: walk chain to find true tail (recovery after crash)
                 var currentPageID = tailPage.nextPageID
