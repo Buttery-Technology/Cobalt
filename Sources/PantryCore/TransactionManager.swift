@@ -83,11 +83,8 @@ public actor TransactionManager: Sendable {
         globalVersion += 1
         recomputeMinSnapshotVersion()
 
-        // Now safe to flush modified pages to disk
-        let modifiedPages = txContext.modifiedPages
-        if let flusher = pageFlusher {
-            try await flusher(modifiedPages)
-        }
+        // Modified pages remain dirty in buffer pool — WAL provides durability.
+        // Background writer flushes them asynchronously (like SQLite WAL mode).
     }
 
     /// Register a record write for conflict tracking.
