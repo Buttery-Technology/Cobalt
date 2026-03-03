@@ -137,6 +137,20 @@ public final class PageBackedNodeStore: @unchecked Sendable {
         return node
     }
 
+    /// Synchronous save for nodes that already have a page. Returns false if the node
+    /// needs a new page (caller should fall back to async saveNode).
+    public func saveNodeCached(_ node: BTreeNode) -> Bool {
+        state.withLock { s in
+            guard s.nodePageMap[node.nodeId] != nil else { return false }
+            s.nodeCache[node.nodeId] = node
+            s.dirtyNodes.insert(node.nodeId)
+            s.nodeCacheCounter += 1
+            s.nodeCacheOrder[node.nodeId] = s.nodeCacheCounter
+            Self.evictIfNeeded(&s)
+            return true
+        }
+    }
+
     /// Synchronous cache-only node load. Returns nil on cache miss.
     public func loadNodeCached(nodeId: UUID) -> BTreeNode? {
         state.withLock { s in

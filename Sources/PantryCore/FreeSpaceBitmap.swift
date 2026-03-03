@@ -64,6 +64,25 @@ public final class FreeSpaceBitmap: Sendable {
         }
     }
 
+    /// Batch set categories for multiple pages under a single write lock acquisition.
+    public func setCategoriesBatch(_ updates: [(pageID: Int, category: SpaceCategory)]) {
+        guard !updates.isEmpty else { return }
+        state.withWriteLock { s in
+            for (pageID, category) in updates {
+                let byteIndex = pageID / 4
+                let bitOffset = (pageID % 4) * 2
+                if byteIndex >= s.bitmap.count {
+                    let needed = byteIndex + 1
+                    s.bitmap.append(Data(count: needed - s.bitmap.count))
+                }
+                let mask: UInt8 = ~(0x03 << bitOffset)
+                s.bitmap[byteIndex] = (s.bitmap[byteIndex] & mask) | (category.rawValue << bitOffset)
+                s.dirty = true
+                Self.updateSuperBitmap(&s, regionOfByte: byteIndex)
+            }
+        }
+    }
+
     /// Update one super-bitmap entry for the region containing the given byte
     private static func updateSuperBitmap(_ s: inout State, regionOfByte byteIndex: Int) {
         let regionIndex = byteIndex / 64
