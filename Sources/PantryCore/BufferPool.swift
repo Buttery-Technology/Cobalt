@@ -410,6 +410,19 @@ public final class BufferPoolManager: Sendable {
         }
     }
 
+    /// Synchronous cache — skips eviction check. Safe when buffer pool capacity
+    /// far exceeds the number of pages being inserted (e.g. bulk insert hot path).
+    public func cachePageSync(_ page: DatabasePage) {
+        let s = stripe(for: page.pageID)
+        s.withLock { st in
+            if st.pageCache[page.pageID] == nil {
+                st.pageOrder.append(page.pageID)
+            }
+            st.pageCache[page.pageID] = page
+            st.referenced.insert(page.pageID)
+        }
+    }
+
     // MARK: - Batch Page Read
 
     /// Read multiple pages, returning cached pages and batch-reading cache misses.

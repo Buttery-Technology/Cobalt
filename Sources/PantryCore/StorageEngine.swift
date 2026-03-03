@@ -561,6 +561,7 @@ public final class StorageEngine: @unchecked Sendable {
         // Collect RID-to-page mappings for batch cache update
         var ridCacheEntries: [(UInt64, Int)] = []
         ridCacheEntries.reserveCapacity(records.count)
+        var bitmapUpdates: [(pageID: Int, category: SpaceCategory)] = []
 
         // Load the last page in the chain (likely has free space)
         var currentPage: DatabasePage
@@ -604,7 +605,10 @@ public final class StorageEngine: @unchecked Sendable {
                     if transactionContext != nil {
                         try await savePage(currentPage, transactionContext: transactionContext, skipAfterImage: true)
                     } else {
-                        try await savePageDeferred(currentPage)
+                        currentPage.patchInvalidated = false
+                        currentPage.lastPatchIndex = nil
+                        bufferPoolManager.updatePageAndMarkDirty(currentPage)
+                        bitmapUpdates.append((pageID: currentPage.pageID, category: currentPage.spaceCategory()))
                     }
                 }
 
@@ -624,8 +628,16 @@ public final class StorageEngine: @unchecked Sendable {
             if transactionContext != nil {
                 try await savePage(currentPage, transactionContext: transactionContext, skipAfterImage: true)
             } else {
-                try await savePageDeferred(currentPage)
+                currentPage.patchInvalidated = false
+                currentPage.lastPatchIndex = nil
+                bufferPoolManager.updatePageAndMarkDirty(currentPage)
+                bitmapUpdates.append((pageID: currentPage.pageID, category: currentPage.spaceCategory()))
             }
+        }
+
+        // Batch bitmap update for all deferred pages
+        if !bitmapUpdates.isEmpty {
+            freeSpaceBitmap.setCategoriesBatch(bitmapUpdates)
         }
 
         // Batch populate RID-to-page cache (single lock instead of per-record)
@@ -927,9 +939,20 @@ public final class StorageEngine: @unchecked Sendable {
         // Process cached pages — single load for both data extraction and deletion
         for pageID in idsByPage.keys.sorted() {
             let pageIds = idsByPage[pageID]!
-            var page = transactionContext == nil
-                ? try await getPageConcurrent(pageID: pageID)
-                : try await getPage(pageID: pageID, transactionContext: transactionContext)
+            var page: DatabasePage
+            if transactionContext == nil,
+               let cached = bufferPoolManager.getCachedPage(pageID: pageID) {
+                page = cached
+            } else if transactionContext == nil,
+                      storageManager.mmapAvailable,
+                      !bufferPoolManager.isDirty(pageID: pageID),
+                      let mmapPage = storageManager.readPageMmap(pageID: pageID) {
+                page = mmapPage
+            } else {
+                page = transactionContext == nil
+                    ? try await getPageConcurrent(pageID: pageID)
+                    : try await getPage(pageID: pageID, transactionContext: transactionContext)
+            }
             let idSet = Set(pageIds)
             var idsToDelete = Set<UInt64>()
 
@@ -973,9 +996,20 @@ public final class StorageEngine: @unchecked Sendable {
             let pageList = tableRegistry.getTableInfo(name: tableName)?.pageList ?? []
             for currentPageID in pageList {
                 guard !remaining.isEmpty else { break }
-                var page = transactionContext == nil
-                    ? try await getPageConcurrent(pageID: currentPageID)
-                    : try await getPage(pageID: currentPageID, transactionContext: transactionContext)
+                var page: DatabasePage
+                if transactionContext == nil,
+                   let cached = bufferPoolManager.getCachedPage(pageID: currentPageID) {
+                    page = cached
+                } else if transactionContext == nil,
+                          storageManager.mmapAvailable,
+                          !bufferPoolManager.isDirty(pageID: currentPageID),
+                          let mmapPage = storageManager.readPageMmap(pageID: currentPageID) {
+                    page = mmapPage
+                } else {
+                    page = transactionContext == nil
+                        ? try await getPageConcurrent(pageID: currentPageID)
+                        : try await getPage(pageID: currentPageID, transactionContext: transactionContext)
+                }
                 var idsToDelete = Set<UInt64>()
 
                 // First pass: collect WAL data + index removal info (before mutation)
@@ -2002,13 +2036,13 @@ public final class StorageEngine: @unchecked Sendable {
             if allPages.count > 1 {
                 let reserved = Array(allPages[1...])
                 for page in reserved {
-                    await bufferPoolManager.cachePage(page)
+                    bufferPoolManager.cachePageSync(page)
                     bufferPoolManager.markDirty(pageID: page.pageID)
                 }
                 _state.withLock { $0.extentReserve[tableInfo.name] = reserved }
             }
         }
-        await bufferPoolManager.cachePage(newPage)
+        bufferPoolManager.cachePageSync(newPage)
         bufferPoolManager.markDirty(pageID: newPage.pageID)
 
         if tableInfo.firstPageID == 0 {
@@ -2018,7 +2052,12 @@ public final class StorageEngine: @unchecked Sendable {
         } else {
             // Link to the current tail page
             let tailPageID = tableInfo.pageList?.last ?? tableInfo.lastPageID
-            var tailPage = try await getPage(pageID: tailPageID)
+            var tailPage: DatabasePage
+            if let cached = bufferPoolManager.getCachedPage(pageID: tailPageID) {
+                tailPage = cached
+            } else {
+                tailPage = try await getPage(pageID: tailPageID)
+            }
             if tailPage.nextPageID == 0 {
                 tailPage.nextPageID = newPage.pageID
                 // Patch the 8-byte nextPageID directly in the data buffer (offset 8)

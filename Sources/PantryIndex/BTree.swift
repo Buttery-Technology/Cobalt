@@ -583,8 +583,8 @@ public final class BTree: @unchecked Sendable {
     // MARK: - Delete
 
     public func delete(key: DBValue, rid: DBValue? = nil) async throws {
-        guard let rootId = rootId,
-              let root = try await nodeStore.loadNode(nodeId: rootId) else {
+        guard let rootId = rootId else { return }
+        guard let root = try await loadNodeFast(nodeId: rootId) else {
             return
         }
 
@@ -600,7 +600,7 @@ public final class BTree: @unchecked Sendable {
                 nodeStore.removeNode(nodeId: rootId)
             }
         } else {
-            try await nodeStore.saveNode(root)
+            if !nodeStore.saveNodeCached(root) { try await nodeStore.saveNode(root) }
         }
     }
 
@@ -611,7 +611,7 @@ public final class BTree: @unchecked Sendable {
 
         for (key, rid) in sorted {
             guard let currentRootId = rootId,
-                  let root = try await nodeStore.loadNode(nodeId: currentRootId) else { return }
+                  let root = try await loadNodeFast(nodeId: currentRootId) else { return }
             try await deleteFromNode(node: root, key: key, rid: rid)
             if root.keys.isEmpty {
                 if root.isLeaf {
@@ -626,8 +626,8 @@ public final class BTree: @unchecked Sendable {
         }
         // Save root once at end
         if let currentRootId = rootId,
-           let root = try await nodeStore.loadNode(nodeId: currentRootId) {
-            try await nodeStore.saveNode(root)
+           let root = try await loadNodeFast(nodeId: currentRootId) {
+            if !nodeStore.saveNodeCached(root) { try await nodeStore.saveNode(root) }
         }
     }
 
@@ -921,7 +921,7 @@ public final class BTree: @unchecked Sendable {
             }
             if keyIndex < node.keys.count && node.keys[keyIndex] == key {
                 removeFromLeaf(node: node, index: keyIndex)
-                try await nodeStore.saveNode(node)
+                if !nodeStore.saveNodeCached(node) { try await nodeStore.saveNode(node) }
             }
             return
         }
@@ -933,7 +933,7 @@ public final class BTree: @unchecked Sendable {
 
         guard childIdx < (node.children?.count ?? 0),
               let childId = node.children?[childIdx],
-              let child = try await nodeStore.loadNode(nodeId: childId) else {
+              let child = try await loadNodeFast(nodeId: childId) else {
             throw PantryError.indexCorrupted(description: "Child not found during B+ tree delete descent")
         }
 
@@ -949,34 +949,34 @@ public final class BTree: @unchecked Sendable {
     private func fillChild(parent: BTreeNode, childIndex: Int) async throws {
         if childIndex != parent.keys.count {
             guard let leftChildId = parent.children?[childIndex],
-                  let leftChild = try await nodeStore.loadNode(nodeId: leftChildId),
+                  let leftChild = try await loadNodeFast(nodeId: leftChildId),
                   let rightChildId = parent.children?[childIndex + 1],
-                  let rightChild = try await nodeStore.loadNode(nodeId: rightChildId) else {
+                  let rightChild = try await loadNodeFast(nodeId: rightChildId) else {
                 throw PantryError.indexCorrupted(description: "Children not found during fill")
             }
 
             if rightChild.keys.count >= order {
                 borrowFromRightSibling(parent: parent, leftChild: leftChild, rightChild: rightChild, parentKeyIndex: childIndex)
-                try await nodeStore.saveNode(parent)
-                try await nodeStore.saveNode(leftChild)
-                try await nodeStore.saveNode(rightChild)
+                if !nodeStore.saveNodeCached(parent) { try await nodeStore.saveNode(parent) }
+                if !nodeStore.saveNodeCached(leftChild) { try await nodeStore.saveNode(leftChild) }
+                if !nodeStore.saveNodeCached(rightChild) { try await nodeStore.saveNode(rightChild) }
                 return
             }
         }
 
         if childIndex != 0 {
             guard let leftChildId = parent.children?[childIndex - 1],
-                  let leftChild = try await nodeStore.loadNode(nodeId: leftChildId),
+                  let leftChild = try await loadNodeFast(nodeId: leftChildId),
                   let rightChildId = parent.children?[childIndex],
-                  let rightChild = try await nodeStore.loadNode(nodeId: rightChildId) else {
+                  let rightChild = try await loadNodeFast(nodeId: rightChildId) else {
                 throw PantryError.indexCorrupted(description: "Children not found during fill")
             }
 
             if leftChild.keys.count >= order {
                 borrowFromLeftSibling(parent: parent, leftChild: leftChild, rightChild: rightChild, parentKeyIndex: childIndex - 1)
-                try await nodeStore.saveNode(parent)
-                try await nodeStore.saveNode(leftChild)
-                try await nodeStore.saveNode(rightChild)
+                if !nodeStore.saveNodeCached(parent) { try await nodeStore.saveNode(parent) }
+                if !nodeStore.saveNodeCached(leftChild) { try await nodeStore.saveNode(leftChild) }
+                if !nodeStore.saveNodeCached(rightChild) { try await nodeStore.saveNode(rightChild) }
                 return
             }
         }
@@ -1034,9 +1034,9 @@ public final class BTree: @unchecked Sendable {
 
     private func mergeWithRightSibling(parent: BTreeNode, leftIndex: Int) async throws {
         guard let leftChildId = parent.children?[leftIndex],
-              let leftChild = try await nodeStore.loadNode(nodeId: leftChildId),
+              let leftChild = try await loadNodeFast(nodeId: leftChildId),
               let rightChildId = parent.children?[leftIndex + 1],
-              let rightChild = try await nodeStore.loadNode(nodeId: rightChildId) else {
+              let rightChild = try await loadNodeFast(nodeId: rightChildId) else {
             throw PantryError.indexCorrupted(description: "Children not found during merge")
         }
 
@@ -1061,17 +1061,23 @@ public final class BTree: @unchecked Sendable {
         if leftChild.isLeaf {
             leftChild.nextLeafId = rightChild.nextLeafId
             if let nextId = rightChild.nextLeafId,
-               let nextNode = try await nodeStore.loadNode(nodeId: nextId) {
+               let nextNode = try await loadNodeFast(nodeId: nextId) {
                 nextNode.prevLeafId = leftChild.nodeId
-                try await nodeStore.saveNode(nextNode)
+                if !nodeStore.saveNodeCached(nextNode) { try await nodeStore.saveNode(nextNode) }
             }
         }
 
-        try await nodeStore.saveNode(leftChild)
-        try await nodeStore.saveNode(parent)
+        if !nodeStore.saveNodeCached(leftChild) { try await nodeStore.saveNode(leftChild) }
+        if !nodeStore.saveNodeCached(parent) { try await nodeStore.saveNode(parent) }
 
         // Clean up the absorbed right child from cache/page map
         nodeStore.removeNode(nodeId: rightChildId)
+    }
+
+    /// Sync cache lookup with async fallback — avoids async suspension when node is cached.
+    private func loadNodeFast(nodeId: UUID) async throws -> BTreeNode? {
+        if let cached = nodeStore.loadNodeCached(nodeId: nodeId) { return cached }
+        return try await nodeStore.loadNode(nodeId: nodeId)
     }
 
     // MARK: - Helpers
