@@ -192,6 +192,15 @@ public final class BufferPoolManager: Sendable {
         _ = stripe(for: pageID).withLock { $0.dirtyPages.insert(pageID) }
     }
 
+    /// Combined update + mark dirty in a single lock acquisition.
+    public func updatePageAndMarkDirty(_ page: DatabasePage) {
+        stripe(for: page.pageID).withLock { st in
+            st.pageCache[page.pageID] = page
+            st.referenced.insert(page.pageID)
+            st.dirtyPages.insert(page.pageID)
+        }
+    }
+
     public func isDirty(pageID: Int) -> Bool {
         stripe(for: pageID).withLock { $0.dirtyPages.contains(pageID) }
     }
