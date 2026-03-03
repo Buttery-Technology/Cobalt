@@ -66,7 +66,7 @@ public final class ColumnIndex: @unchecked Sendable {
     }
 
     /// Batch insert: sorts keys for sequential B-tree traversal, flushes dirty nodes once at end.
-    public func insertBatch(pairs: [(key: DBValue, row: Row)]) async throws {
+    public func insertBatch(pairs: [(key: DBValue, row: Row)], deferFlush: Bool = false) async throws {
         let sorted = pairs.sorted { $0.key < $1.key }
         _mutable.withWriteLock { s in
             for (key, _) in sorted {
@@ -79,7 +79,9 @@ public final class ColumnIndex: @unchecked Sendable {
         for (key, row) in sorted {
             try await btree.insert(key: key, row: row)
         }
-        try await nodeStore.flushDirtyNodes()
+        if !deferFlush {
+            try await nodeStore.flushDirtyNodes()
+        }
     }
 
     /// Bulk load: builds B-tree bottom-up from sorted pairs. O(n) vs O(n log n) for insertBatch.
@@ -103,6 +105,33 @@ public final class ColumnIndex: @unchecked Sendable {
         if !bloomCheckCached(key: key) { return [] }
         guard let results = btree.searchCached(key: key) else { return nil }
         return results.map { reconstructRow($0, key: key) }
+    }
+
+    /// Synchronous search returning only RIDs. Avoids Row/dictionary allocation entirely.
+    /// Returns .some(Set) on hit/miss, nil on cache miss.
+    public func searchCachedRIDs(key: DBValue) -> Set<UInt64>? {
+        if !bloomCheckCached(key: key) { return Set() }
+        guard let results = btree.searchCached(key: key) else { return nil }
+        var rids = Set<UInt64>(minimumCapacity: results.count)
+        for row in results {
+            if case .integer(let ridSigned) = row.values["__rid"] {
+                rids.insert(UInt64(bitPattern: ridSigned))
+            }
+        }
+        return rids
+    }
+
+    /// Async search returning only RIDs. Avoids Row/dictionary allocation.
+    public func searchRIDs(key: DBValue) async throws -> Set<UInt64> {
+        if !bloomCheckCached(key: key) { return Set() }
+        let results = try await btree.search(key: key)
+        var rids = Set<UInt64>(minimumCapacity: results.count)
+        for row in results {
+            if case .integer(let ridSigned) = row.values["__rid"] {
+                rids.insert(UInt64(bitPattern: ridSigned))
+            }
+        }
+        return rids
     }
 
     /// Fused synchronous lookup returning just the first RID. Avoids Row allocation entirely.
@@ -473,10 +502,13 @@ public final class IndexManager: IndexHook, @unchecked Sendable {
     }
 
     /// Batch update all indexes for a set of inserted records.
-    /// Groups keys per index, sorts for sequential B-tree traversal, flushes once.
+    /// Groups keys per index, sorts for sequential B-tree traversal, flushes once at end.
     public func updateIndexesBatch(records: [(Record, Row)], tableName: String) async throws {
         let tableIndexes: [String: ColumnIndex]? = _indexes.withLock { $0[tableName] }
         guard let tableIndexes else { return }
+
+        let multipleIndexes = tableIndexes.count > 1
+        var indexesToFlush: [ColumnIndex] = multipleIndexes ? [] : []
 
         for (_, columnIndex) in tableIndexes {
             let condition = columnIndex.partialCondition
@@ -510,8 +542,17 @@ public final class IndexManager: IndexHook, @unchecked Sendable {
                 if columnIndex.isEmpty {
                     try await columnIndex.bulkLoad(pairs: pairs)
                 } else {
-                    try await columnIndex.insertBatch(pairs: pairs)
+                    // Defer flush when multiple indexes — single batch flush at end
+                    try await columnIndex.insertBatch(pairs: pairs, deferFlush: multipleIndexes)
+                    if multipleIndexes { indexesToFlush.append(columnIndex) }
                 }
+            }
+        }
+
+        // Single batch flush for all deferred indexes
+        if multipleIndexes {
+            for ci in indexesToFlush {
+                try await ci.nodeStore.flushDirtyNodes()
             }
         }
     }
@@ -642,6 +683,24 @@ public final class IndexManager: IndexHook, @unchecked Sendable {
             }
             try await group.waitForAll()
         }
+    }
+
+    /// Synchronous cache-only RID lookup for .equals conditions. Skips Row allocation entirely.
+    public func attemptIndexLookupCachedRIDs(tableName: String, condition: WhereCondition) -> Set<UInt64>? {
+        guard case .equals(let column, let value) = condition else { return nil }
+        if value == .null { return Set() }
+        let index: ColumnIndex? = _indexes.withLock { $0[tableName]?[column] }
+        guard let index else { return nil }
+        return index.searchCachedRIDs(key: value)
+    }
+
+    /// Async RID-only lookup for .equals conditions. Skips Row allocation entirely.
+    public func attemptIndexLookupRIDs(tableName: String, condition: WhereCondition) async throws -> Set<UInt64>? {
+        guard case .equals(let column, let value) = condition else { return nil }
+        if value == .null { return Set() }
+        let index: ColumnIndex? = _indexes.withLock { $0[tableName]?[column] }
+        guard let index else { return nil }
+        return try await index.searchRIDs(key: value)
     }
 
     /// Synchronous cache-only index lookup for .equals conditions. Returns nil on cache miss.
