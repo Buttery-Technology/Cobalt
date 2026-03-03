@@ -700,6 +700,7 @@ public final class StorageEngine: @unchecked Sendable {
         let deleteSchema = tableRegistry.getTableInfo(name: tableName)?.schema
         var totalDeleted = 0
         var indexRemovals: [(id: UInt64, row: Row)] = []
+        var deletedRIDs: [UInt64] = []  // batch RID cache removal
 
         // Process pages in sorted order for sequential I/O
         for pageID in byPage.keys.sorted() {
@@ -727,13 +728,11 @@ public final class StorageEngine: @unchecked Sendable {
                         try await freeOverflowPages(startingAt: overflowStart)
                     }
 
-                    // Collect for batch index removal
                     if let row = row {
                         indexRemovals.append((id: recordID, row: row))
                     }
 
-                    // Remove from RID cache
-                    _state.withLock { $0.ridPageMap[tableName]?.removeValue(forKey: recordID) }
+                    deletedRIDs.append(recordID)
                 }
             }
 
@@ -744,6 +743,13 @@ public final class StorageEngine: @unchecked Sendable {
                     try await savePageDeferred(page)
                 }
                 totalDeleted += deletedFromPage
+            }
+        }
+
+        // Batch RID cache removal — single lock acquisition
+        if !deletedRIDs.isEmpty {
+            _state.withLock { s in
+                for rid in deletedRIDs { s.ridPageMap[tableName]?.removeValue(forKey: rid) }
             }
         }
 
@@ -776,6 +782,7 @@ public final class StorageEngine: @unchecked Sendable {
         let schema = tableRegistry.getTableInfo(name: tableName)?.schema
         var totalDeleted = 0
         var rawIndexRemovals: [(id: UInt64, data: Data)] = []
+        var deletedRIDs: [UInt64] = []  // batch RID cache removal
 
         for pageID in byPage.keys.sorted() {
             let group = byPage[pageID]!
@@ -801,7 +808,7 @@ public final class StorageEngine: @unchecked Sendable {
                     if let data = rawData {
                         rawIndexRemovals.append((id: recordID, data: data))
                     }
-                    _state.withLock { $0.ridPageMap[tableName]?.removeValue(forKey: recordID) }
+                    deletedRIDs.append(recordID)
                 }
             }
 
@@ -812,6 +819,13 @@ public final class StorageEngine: @unchecked Sendable {
                     try await savePageDeferred(page)
                 }
                 totalDeleted += deletedFromPage
+            }
+        }
+
+        // Batch RID cache removal — single lock acquisition
+        if !deletedRIDs.isEmpty {
+            _state.withLock { s in
+                for rid in deletedRIDs { s.ridPageMap[tableName]?.removeValue(forKey: rid) }
             }
         }
 
@@ -840,8 +854,8 @@ public final class StorageEngine: @unchecked Sendable {
         var rawIndexRemovals: [(id: UInt64, data: Data)] = []
         rawIndexRemovals.reserveCapacity(ids.count)
         var modifiedPageIDs: [Int] = []
-        // Collect modified pages for batch save (non-transactional)
         var deferredPages: [DatabasePage] = []
+        var deletedRIDs: [UInt64] = []  // batch RID cache removal
 
         // Group RIDs by page using the cache
         var idsByPage = [Int: [UInt64]]()
@@ -880,7 +894,7 @@ public final class StorageEngine: @unchecked Sendable {
                         try await freeOverflowPages(startingAt: overflowStart)
                     }
                     rawIndexRemovals.append((id: record.id, data: data))
-                    _state.withLock { $0.ridPageMap[tableName]?.removeValue(forKey: record.id) }
+                    deletedRIDs.append(record.id)
                     remaining.remove(record.id)
                 }
             }
@@ -910,7 +924,6 @@ public final class StorageEngine: @unchecked Sendable {
                         let reassembled = try await reassembleOverflowRecord(record)
                         data = reassembled.data
                     }
-                    _state.withLock { $0.ridPageMap[tableName, default: [:]][record.id] = currentPageID }
 
                     if let txContext = transactionContext {
                         try await logManager.logRecordDelete(txID: txContext.transactionID, pageID: currentPageID, recordID: record.id, data: data)
@@ -922,7 +935,7 @@ public final class StorageEngine: @unchecked Sendable {
                             try await freeOverflowPages(startingAt: overflowStart)
                         }
                         rawIndexRemovals.append((id: record.id, data: data))
-                        _state.withLock { $0.ridPageMap[tableName]?.removeValue(forKey: record.id) }
+                        deletedRIDs.append(record.id)
                         remaining.remove(record.id)
                     }
                 }
@@ -936,6 +949,13 @@ public final class StorageEngine: @unchecked Sendable {
                     totalDeleted += deletedFromPage
                     modifiedPageIDs.append(currentPageID)
                 }
+            }
+        }
+
+        // Batch RID cache removal — single lock acquisition for all deleted records
+        if !deletedRIDs.isEmpty {
+            _state.withLock { s in
+                for rid in deletedRIDs { s.ridPageMap[tableName]?.removeValue(forKey: rid) }
             }
         }
 
