@@ -39,7 +39,7 @@ psql -h 127.0.0.1 -p 5433
 
 ## Performance
 
-Benchmarked on March 16, 2026. Cobalt v0.1.0, release build, macOS (Apple Silicon), single-threaded workload, 10,000 rows per table. SQLite configured with WAL mode, `synchronous=NORMAL`, 64MB cache, mmap enabled. PostgreSQL estimates from published pgbench/sysbench data for local single-connection workloads with `synchronous_commit=on`.
+Benchmarked on March 16, 2026. Release build, macOS (Apple Silicon), single-threaded workload, 10,000 rows per table. SQLite configured with WAL mode, `synchronous=NORMAL`, 64MB cache, mmap enabled. PostgreSQL estimates from published pgbench/sysbench data for local single-connection workloads with `synchronous_commit=on`.
 
 ### Cobalt vs SQLite vs PostgreSQL (10K rows)
 
@@ -75,11 +75,11 @@ Add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/anthropics/cobalt.git", from: "0.1.0"),
+    .package(url: "https://github.com/Buttery-Technology/Cobalt.git", from: "0.1.0"),
 ],
 targets: [
     .target(name: "MyApp", dependencies: [
-        .product(name: "Cobalt", package: "cobalt"),
+        .product(name: "Cobalt", package: "Cobalt"),
     ]),
 ]
 ```
