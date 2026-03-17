@@ -49,13 +49,13 @@ import Foundation
 
     let db = try await CobaltDatabase(configuration: CobaltConfiguration(path: path))
 
-    // Simple KV
-    try await db.set("theme", value: .string("dark"))
+    // Simple KV — type-safe API infers String
+    try await db.set("theme", value: "dark")
     let theme = try await db.get("theme")
     #expect(theme == .string("dark"))
 
     // Overwrite
-    try await db.set("theme", value: .string("light"))
+    try await db.set("theme", value: "light")
     let updated = try await db.get("theme")
     #expect(updated == .string("light"))
 
@@ -70,8 +70,8 @@ import Foundation
         var darkMode: Bool
     }
 
-    try await db.set("settings", codableValue: Settings(fontSize: 14, darkMode: true))
-    let settings: Settings? = try await db.get("settings", as: Settings.self)
+    try await db.setCodable("settings", value: Settings(fontSize: 14, darkMode: true))
+    let settings: Settings? = try await db.getCodable("settings", as: Settings.self)
     #expect(settings == Settings(fontSize: 14, darkMode: true))
 
     try await db.close()
@@ -564,8 +564,8 @@ import Foundation
     #expect(rNegInf?.value == -.infinity)
 
     // KV store with NaN/Infinity Codable values
-    try await db.set("special", codableValue: Measurement(value: .nan, label: "kv_nan"))
-    let kvNan: Measurement? = try await db.get("special", as: Measurement.self)
+    try await db.setCodable("special", value: Measurement(value: .nan, label: "kv_nan"))
+    let kvNan: Measurement? = try await db.getCodable("special", as: Measurement.self)
     #expect(kvNan != nil)
     #expect(kvNan!.value.isNaN)
 
@@ -906,11 +906,11 @@ import Foundation
 
     let db = try await CobaltDatabase(configuration: CobaltConfiguration(path: path))
 
-    try await db.set("int_key", value: .integer(42))
-    try await db.set("double_key", value: .double(3.14))
-    try await db.set("string_key", value: .string("hello"))
-    try await db.set("bool_key", value: .boolean(true))
-    try await db.set("null_key", value: .null)
+    try await db.set("int_key", value: 42)
+    try await db.set("double_key", value: 3.14)
+    try await db.set("string_key", value: "hello")
+    try await db.set("bool_key", value: true)
+    try await db.set("null_key", value: DBValue.null)
 
     #expect(try await db.get("int_key") == .integer(42))
     #expect(try await db.get("double_key") == .double(3.14))

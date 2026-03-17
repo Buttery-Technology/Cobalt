@@ -16,8 +16,16 @@ extension CobaltDatabase {
         return dec
     }()
 
-    /// Set a key-value pair
-    public func set(_ key: String, value: DBValue) async throws {
+    /// Set a key-value pair. Accepts any DBValueConvertible type: String, Int, Double, Bool, Data, or DBValue directly.
+    ///
+    /// ```swift
+    /// try await db.set("theme", value: "dark")
+    /// try await db.set("count", value: 42)
+    /// try await db.set("score", value: 3.14)
+    /// try await db.set("active", value: true)
+    /// ```
+    public func set<V: DBValueConvertible>(_ key: String, value: V) async throws {
+        let dbValue = value.toDBValue()
         try await ensureKVTable()
 
         // Atomic upsert: delete + insert in a transaction
@@ -25,13 +33,13 @@ extension CobaltDatabase {
             _ = try await tx.delete(from: Self.kvTableName, where: .equals(column: "_key", value: .string(key)))
             try await tx.insert(into: Self.kvTableName, values: [
                 "_key": .string(key),
-                "_value": value,
+                "_value": dbValue,
                 "_timestamp": .double(Date().timeIntervalSince1970)
             ])
         }
     }
 
-    /// Get a value by key
+    /// Get a raw DBValue by key
     public func get(_ key: String) async throws -> DBValue? {
         guard await tableExists(Self.kvTableName) else { return nil }
 
@@ -49,17 +57,28 @@ extension CobaltDatabase {
         return rows.first?.values["_value"]
     }
 
-    /// Set a Codable value for a key
-    public func set<T: Codable & Sendable>(_ key: String, codableValue: T) async throws {
-        let data = try Self.kvEncoder.encode(codableValue)
+    /// Get a typed value by key. Returns nil if the key doesn't exist or the type doesn't match.
+    ///
+    /// ```swift
+    /// let theme: String? = try await db.get("theme", as: String.self)
+    /// let count: Int? = try await db.get("count", as: Int.self)
+    /// ```
+    public func get<V: DBValueConvertible>(_ key: String, as type: V.Type) async throws -> V? {
+        guard let dbValue = try await get(key) else { return nil }
+        return V.fromDBValue(dbValue)
+    }
+
+    /// Set a Codable value for a key (serialized as JSON)
+    public func setCodable<T: Codable & Sendable>(_ key: String, value: T) async throws {
+        let data = try Self.kvEncoder.encode(value)
         guard let jsonString = String(data: data, encoding: .utf8) else {
             throw CobaltError.schemaSerializationError
         }
-        try await set(key, value: .string(jsonString))
+        try await set(key, value: DBValue.string(jsonString))
     }
 
-    /// Get a Codable value for a key
-    public func get<T: Codable & Sendable>(_ key: String, as type: T.Type) async throws -> T? {
+    /// Get a Codable value for a key (deserialized from JSON)
+    public func getCodable<T: Codable & Sendable>(_ key: String, as type: T.Type) async throws -> T? {
         guard let value = try await get(key),
               case .string(let jsonString) = value,
               let data = jsonString.data(using: .utf8) else {

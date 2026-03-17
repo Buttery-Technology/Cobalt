@@ -197,3 +197,11 @@ extension Optional: DBValueConvertible where Wrapped: DBValueConvertible {
         return .some(.some(unwrapped))
     }
 }
+
+// MARK: - DBValue Self-Conformance
+
+extension DBValue: DBValueConvertible {
+    public static var columnType: CobaltColumnType { .string }
+    public func toDBValue() -> DBValue { self }
+    public static func fromDBValue(_ value: DBValue) -> DBValue? { value }
+}
