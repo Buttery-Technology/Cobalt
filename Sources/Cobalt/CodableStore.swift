@@ -1,0 +1,124 @@
+import Foundation
+import CobaltCore
+import CobaltQuery
+
+/// Codable convenience methods for CobaltDatabase
+extension CobaltDatabase {
+    private static let codableEncoder: JSONEncoder = {
+        let enc = JSONEncoder()
+        enc.nonConformingFloatEncodingStrategy = .convertToString(positiveInfinity: "+inf", negativeInfinity: "-inf", nan: "nan")
+        return enc
+    }()
+    private static let codableDecoder: JSONDecoder = {
+        let dec = JSONDecoder()
+        dec.nonConformingFloatDecodingStrategy = .convertFromString(positiveInfinity: "+inf", negativeInfinity: "-inf", nan: "nan")
+        return dec
+    }()
+
+    /// Store a Codable value in a collection with an optional ID
+    public func store<T: Codable & Sendable>(_ value: T, id: String? = nil, in collection: String) async throws -> String {
+        let actualID = id ?? UUID().uuidString
+
+        // Ensure the collection table exists
+        try await ensureCollectionTable(collection)
+
+        let jsonData = try Self.codableEncoder.encode(value)
+        guard let jsonString = String(data: jsonData, encoding: .utf8) else {
+            throw CobaltError.schemaSerializationError
+        }
+
+        // Atomic upsert: delete + insert in a transaction
+        try await transaction { tx in
+            _ = try await tx.delete(from: collection, where: .equals(column: "_id", value: .string(actualID)))
+            try await tx.insert(into: collection, values: [
+                "_id": .string(actualID),
+                "_data": .string(jsonString),
+                "_type": .string(String(describing: T.self)),
+                "_timestamp": .double(Date().timeIntervalSince1970)
+            ])
+        }
+
+        return actualID
+    }
+
+    /// Retrieve a Codable value by ID from a collection
+    public func retrieve<T: Codable & Sendable>(_ type: T.Type, id: String, from collection: String) async throws -> T? {
+        guard await tableExists(collection) else { return nil }
+        let rows: [Row]
+        do {
+            rows = try await select(
+                from: collection,
+                where: .equals(column: "_id", value: .string(id))
+            )
+        } catch CobaltError.tableNotFound {
+            return nil // Table dropped between exists check and select
+        }
+
+        guard let row = rows.first,
+              case .string(let jsonString) = row.values["_data"],
+              let jsonData = jsonString.data(using: .utf8) else {
+            return nil
+        }
+
+        return try Self.codableDecoder.decode(T.self, from: jsonData)
+    }
+
+    /// Retrieve all values of a type from a collection
+    public func retrieveAll<T: Codable & Sendable>(_ type: T.Type, from collection: String) async throws -> [T] {
+        guard await tableExists(collection) else { return [] }
+        let rows: [Row]
+        do {
+            rows = try await select(from: collection)
+        } catch CobaltError.tableNotFound {
+            return [] // Table dropped between exists check and select
+        }
+        let decoder = Self.codableDecoder
+        var results: [T] = []
+
+        for row in rows {
+            if case .string(let jsonString) = row.values["_data"],
+               let jsonData = jsonString.data(using: .utf8) {
+                let value = try decoder.decode(T.self, from: jsonData)
+                results.append(value)
+            }
+        }
+
+        return results
+    }
+
+    /// Retrieve a Codable value by ID (type inferred from return context)
+    public func retrieve<T: Codable & Sendable>(id: String, from collection: String) async throws -> T? {
+        try await retrieve(T.self, id: id, from: collection)
+    }
+
+    /// Retrieve all values (type inferred from return context)
+    public func retrieveAll<T: Codable & Sendable>(from collection: String) async throws -> [T] {
+        try await retrieveAll(T.self, from: collection)
+    }
+
+    /// Remove a value by ID from a collection
+    public func remove(id: String, from collection: String) async throws {
+        guard await tableExists(collection) else { return }
+        do {
+            _ = try await delete(from: collection, where: .equals(column: "_id", value: .string(id)))
+        } catch CobaltError.tableNotFound {
+            return // Table dropped between exists check and delete
+        }
+    }
+
+    /// Ensure a collection table exists with the standard schema
+    private func ensureCollectionTable(_ name: String) async throws {
+        if await tableExists(name) { return }
+        do {
+            let schema = CobaltTableSchema(name: name, columns: [
+                CobaltColumn(name: "_id", type: .string, isPrimaryKey: true, isNullable: false),
+                CobaltColumn(name: "_data", type: .string, isNullable: false),
+                CobaltColumn(name: "_type", type: .string, isNullable: false),
+                CobaltColumn(name: "_timestamp", type: .double, isNullable: false),
+            ])
+            try await createTable(schema)
+        } catch CobaltError.tableAlreadyExists {
+            // Another concurrent call created the table between our check and create
+        }
+    }
+}
