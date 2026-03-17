@@ -84,6 +84,32 @@ public final class ColumnIndex: @unchecked Sendable {
         }
     }
 
+    /// Rebuild the index from scratch: extract all existing entries, merge with new pairs,
+    /// clear the B-tree, and bulkLoad everything. O(n) vs O(n log n) for insertBatch.
+    /// Use when the batch of new entries is large relative to existing index size.
+    public func rebuildWithAdditionalPairs(_ newPairs: [(key: DBValue, row: Row)]) async throws {
+        // Extract all existing entries from the B-tree
+        let existing = try await btree.searchRangeKeyed(from: nil, to: nil)
+
+        // Clear the B-tree and nodeStore state
+        btree.clear()
+
+        // Reset bloom filter and hash set
+        _mutable.withWriteLock { s in
+            s.bloomFilter = BloomFilter(expectedElements: max(existing.count + newPairs.count, 10000), falsePositiveRate: 0.001)
+            s.keyHashSet.removeAll(keepingCapacity: true)
+        }
+
+        // Merge existing + new, then bulkLoad
+        var allPairs = [(key: DBValue, row: Row)]()
+        allPairs.reserveCapacity(existing.count + newPairs.count)
+        for (key, row) in existing {
+            allPairs.append((key: key, row: row))
+        }
+        allPairs.append(contentsOf: newPairs)
+        try await bulkLoad(pairs: allPairs)
+    }
+
     /// Bulk load: builds B-tree bottom-up from sorted pairs. O(n) vs O(n log n) for insertBatch.
     /// Only valid for initial population of an empty index.
     public func bulkLoad(pairs: [(key: DBValue, row: Row)]) async throws {
@@ -516,7 +542,9 @@ public final class IndexManager: IndexHook, @unchecked Sendable {
 
     /// Batch update all indexes for a set of inserted records.
     /// Groups keys per index, sorts for sequential B-tree traversal, flushes once at end.
-    public func updateIndexesBatch(records: [(Record, Row)], tableName: String) async throws {
+    /// When `existingRecordCount` is provided and the batch is > 50% of the existing index size,
+    /// rebuilds the index from scratch using O(n) bulkLoad instead of O(n log n) insertBatch.
+    public func updateIndexesBatch(records: [(Record, Row)], tableName: String, existingRecordCount: Int = 0) async throws {
         let tableIndexes: [String: ColumnIndex]? = _indexes.withLock { $0[tableName] }
         guard let tableIndexes else { return }
 
@@ -551,11 +579,14 @@ public final class IndexManager: IndexHook, @unchecked Sendable {
             }
 
             if !pairs.isEmpty {
-                // Use bulkLoad (O(n)) for empty indexes, insertBatch (O(n log n)) otherwise
                 if columnIndex.isEmpty {
+                    // Empty index: O(n) bulkLoad
                     try await columnIndex.bulkLoad(pairs: pairs)
+                } else if existingRecordCount > 0 && pairs.count > existingRecordCount / 2 {
+                    // Large batch relative to existing data: rebuild O(n) instead of insertBatch O(n log n)
+                    try await columnIndex.rebuildWithAdditionalPairs(pairs)
                 } else {
-                    // Defer flush when multiple indexes — single batch flush at end
+                    // Incremental: O(n log n) insertBatch
                     try await columnIndex.insertBatch(pairs: pairs, deferFlush: multipleIndexes)
                     if multipleIndexes { indexesToFlush.append(columnIndex) }
                 }

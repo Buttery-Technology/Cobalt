@@ -26,6 +26,13 @@ public final class BTree: @unchecked Sendable {
     /// Whether this B-tree is empty (no root node)
     public var isEmpty: Bool { rootId == nil }
 
+    /// Clear the B-tree, resetting it to an empty state. Old pages become orphaned.
+    /// Used when rebuilding an index from scratch via bulkLoad.
+    public func clear() {
+        rootId = nil
+        nodeStore.clearState()
+    }
+
     // MARK: - Insert
 
     public func insert(key: DBValue, row: Row) async throws {
