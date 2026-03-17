@@ -280,9 +280,11 @@ let users = try await db.query(User.self)
     .limit(10)
     .all()
 
-// Key-value store
-try await db.set("config:theme", value: .string("dark"))
-let theme = try await db.get("config:theme")
+// Key-value store (type-safe — infers from native Swift types)
+try await db.set("config:theme", value: "dark")
+try await db.set("config:count", value: 42)
+try await db.set("config:rate", value: 0.95)
+let theme: String? = try await db.get("config:theme", as: String.self)
 
 // Codable document store
 try await db.store(myStruct, id: "doc-1", in: "documents")
