@@ -1355,7 +1355,9 @@ public final class QueryExecutor: @unchecked Sendable {
         _ = try await storageEngine.bulkInsertRecordsBatched(serializedRecords, tableName: table, transactionContext: transactionContext)
 
         // Phase 2: Batch index updates — sorted keys for sequential B-tree traversal
-        try await indexManager.updateIndexesBatch(records: insertedPairs, tableName: table)
+        // Pass existing record count so large batches can trigger O(n) index rebuild via bulkLoad
+        let preInsertCount = (planner.registry.getTableInfo(name: table)?.recordCount ?? rowCount) - rowCount
+        try await indexManager.updateIndexesBatch(records: insertedPairs, tableName: table, existingRecordCount: max(preInsertCount, 0))
         invalidateResultCache(forTable: table)
     }
 
@@ -1696,31 +1698,27 @@ public final class QueryExecutor: @unchecked Sendable {
             }
             if let matchingRIDs {
 
-            let idxSchema = storageEngine.getTableSchema(table)
-            if idxSchema != nil {
-                // Single-pass: delete from pages AND collect raw data for index removal
-                let (deleted, rawData) = try await storageEngine.deleteByRIDs(matchingRIDs, tableName: table, transactionContext: transactionContext)
+            // Single-pass: delete from pages AND collect raw data for index removal
+            let (deleted, rawData) = try await storageEngine.deleteByRIDs(matchingRIDs, tableName: table, transactionContext: transactionContext)
 
-                // Remove from indexes using collected raw data
-                if !rawData.isEmpty {
-                    try await indexManager.removeFromIndexesBatchRaw(records: rawData, tableName: table, schema: idxSchema!)
-                    invalidateResultCache(forTable: table)
+            // Remove from indexes using collected raw data
+            if !rawData.isEmpty {
+                let idxSchema = storageEngine.getTableSchema(table)
+                if let idxSchema {
+                    try await indexManager.removeFromIndexesBatchRaw(records: rawData, tableName: table, schema: idxSchema)
+                } else {
+                    // Fallback: deserialize raw data to Rows for index removal (no schema available)
+                    let rowRecords: [(id: UInt64, row: Row)] = rawData.compactMap { (id, data) in
+                        guard let row = Row.fromBytesAuto(data, schema: nil) else { return nil }
+                        return (id: id, row: row)
+                    }
+                    if !rowRecords.isEmpty {
+                        try await indexManager.removeFromIndexesBatch(records: rowRecords, tableName: table)
+                    }
                 }
-                return deleted
+                invalidateResultCache(forTable: table)
             }
-
-            // Fallback: original Row-based path (index already filtered — skip condition re-eval)
-            let fullRecords = try await storageEngine.getRecordsByIDsWithPages(matchingRIDs, tableName: table, transactionContext: transactionContext)
-            var matchingForDelete: [(id: UInt64, pageID: Int, row: Row?)] = []
-            for (record, row, recordPageID) in fullRecords {
-                matchingForDelete.append((id: record.id, pageID: recordPageID, row: row))
-            }
-            if !matchingForDelete.isEmpty {
-                try await storageEngine.deleteRecordsBatch(matchingForDelete, tableName: table, transactionContext: transactionContext)
-                let modifiedPages = Set(matchingForDelete.map { $0.pageID })
-                invalidateResultCache(forTable: table, modifiedPages: modifiedPages)
-            }
-            return matchingForDelete.count
+            return deleted
         }
         }
 
@@ -2086,8 +2084,10 @@ public final class QueryExecutor: @unchecked Sendable {
             processRecordData(recordData)
         }
 
+        // Two-pass aggregate scan: first try zero-copy mmap for all pages,
+        // then batch-load any pages that couldn't be served from mmap.
+        var fallbackPageIDs = [Int]()
         for pageID in pageIDs {
-            // Zero-copy mmap fast path: iterate records via UnsafeRawBufferPointer
             if transactionContext == nil {
                 let handled = storageEngine.forEachRecordOnPageMmapUnsafe(pageID: pageID) { _, ptr in
                     processRecordUnsafe(ptr)
@@ -2095,16 +2095,31 @@ public final class QueryExecutor: @unchecked Sendable {
                 }
                 if handled { continue }
             }
+            fallbackPageIDs.append(pageID)
+        }
 
-            // Fallback: full page load (dirty pages, encrypted, overflow)
-            let page = transactionContext == nil
-                ? try await storageEngine.getPageConcurrent(pageID: pageID)
-                : try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
-            for var record in page.records {
-                if record.isOverflow {
-                    record = try await storageEngine.reassembleOverflowRecord(record)
+        if !fallbackPageIDs.isEmpty {
+            if transactionContext == nil {
+                // Batch-load all non-mmap pages in one call to avoid per-page async overhead
+                let pages = try await storageEngine.getPagesConcurrent(pageIDs: fallbackPageIDs)
+                for page in pages {
+                    for var record in page.records {
+                        if record.isOverflow {
+                            record = try await storageEngine.reassembleOverflowRecord(record)
+                        }
+                        processRecordData(record.data)
+                    }
                 }
-                processRecordData(record.data)
+            } else {
+                for pageID in fallbackPageIDs {
+                    let page = try await storageEngine.getPage(pageID: pageID, transactionContext: transactionContext)
+                    for var record in page.records {
+                        if record.isOverflow {
+                            record = try await storageEngine.reassembleOverflowRecord(record)
+                        }
+                        processRecordData(record.data)
+                    }
+                }
             }
         }
 

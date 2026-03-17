@@ -23,6 +23,18 @@ public final class PageBackedNodeStore: @unchecked Sendable {
         self.state = CobaltLock(State())
     }
 
+    /// Clear all in-memory state (node cache, page map, dirty set).
+    /// Used when rebuilding an index from scratch. Old pages become orphaned.
+    public func clearState() {
+        state.withLock { s in
+            s.nodePageMap.removeAll()
+            s.nodeCache.removeAll()
+            s.nodeCacheOrder.removeAll()
+            s.nodeCacheCounter = 0
+            s.dirtyNodes.removeAll()
+        }
+    }
+
     /// Save a B-tree node — caches in memory and marks dirty.
     /// Serialization is deferred until flushDirtyNodes() for batch I/O.
     public func saveNode(_ node: BTreeNode) async throws {
